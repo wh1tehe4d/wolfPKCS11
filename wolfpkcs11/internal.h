@@ -64,7 +64,7 @@ extern "C" {
     #ifdef WOLFPKCS11_NSS
         #define WP11_STORE_MAX_PATH 600
     #else
-        #define WP11_STORE_MAX_PATH 120
+        #define WP11_STORE_MAX_PATH 240
     #endif
 #endif
 
