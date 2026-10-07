@@ -26,6 +26,17 @@
 #include <wolfpkcs11/pkcs11.h>
 #include <wolfpkcs11/internal.h>
 
+/* Windows headers macro-rewrite CreateMutex (and friends) to CreateMutexA/W
+ * when UNICODE is defined, which collides with the CK_C_INITIALIZE_ARGS
+ * struct member names. Undef the four Win32 macros so direct field access
+ * compiles. */
+#ifdef _WIN32
+    #undef CreateMutex
+    #undef DestroyMutex
+    #undef LockMutex
+    #undef UnlockMutex
+#endif
+
 /* Function list table for PKCS#11 v2.40 */
 static CK_FUNCTION_LIST wolfpkcs11FunctionList = {
     /* Version: Major, Minor */
@@ -404,6 +415,19 @@ static CK_RV ParseNssConfigString(char *nssArgs,
 
         if (keyLen == XSTR_SIZEOF("configdir")
                 && XMEMCMP(keyStart, "configdir", keyLen) == 0) {
+            /* NSS prefixes the directory with the database type
+             * ("sql:/home/user/.pki/nssdb"); the store uses the directory. */
+            static const char* const dbTypes[] = { "sql:", "dbm:", "extern:" };
+            size_t i;
+            for (i = 0; i < sizeof(dbTypes) / sizeof(dbTypes[0]); i++) {
+                size_t typeLen = XSTRLEN(dbTypes[i]);
+                if (valueLen > typeLen &&
+                        XMEMCMP(valueStart, dbTypes[i], typeLen) == 0) {
+                    valueStart += typeLen;
+                    valueLen -= typeLen;
+                    break;
+                }
+            }
             *configdir = valueStart;
             *configdirLen = valueLen;
             /* Exit since we only support configdir */
@@ -448,7 +472,7 @@ CK_RV C_GetInterfaceList(CK_INTERFACE_PTR pInterfacesList, CK_ULONG_PTR pulCount
         return CKR_BUFFER_TOO_SMALL;
     }
 
-    memcpy(pInterfacesList, interfaces, NUM_INTERFACES * sizeof(CK_INTERFACE));
+    XMEMCPY(pInterfacesList, interfaces, NUM_INTERFACES * sizeof(CK_INTERFACE));
     *pulCount = NUM_INTERFACES;
 
     return CKR_OK;
@@ -459,38 +483,38 @@ CK_RV C_GetInterface(CK_UTF8CHAR_PTR pInterfaceName, CK_VERSION_PTR pVersion,
 {
     int i;
 
-	if (ppInterface == NULL) {
-		return CKR_ARGUMENTS_BAD;
-	}
+    if (ppInterface == NULL)
+        return CKR_ARGUMENTS_BAD;
 
-	if (pInterfaceName == NULL_PTR) {
-		/* return default interface */
-		*ppInterface = &interfaces[DEFAULT_INTERFACE];
-		return CKR_OK;
-	}
+    for (i = 0; i < NUM_INTERFACES; i++) {
+        CK_VERSION_PTR interfaceVersion =
+            (CK_VERSION_PTR)interfaces[i].pFunctionList;
 
-	for (i = 0; i < NUM_INTERFACES; i++) {
-		CK_VERSION_PTR interface_version = (CK_VERSION_PTR)interfaces[i].pFunctionList;
+        if (pInterfaceName == NULL_PTR && i != DEFAULT_INTERFACE)
+            continue;
+        if (pInterfaceName != NULL_PTR &&
+                strcmp((char*)pInterfaceName,
+                       (char*)interfaces[i].pInterfaceName) != 0) {
+            continue;
+        }
 
-		if (strcmp((char*)pInterfaceName, (char*)interfaces[i].pInterfaceName) != 0)
-			continue;
+        /* If version is not null, it must match. */
+        if (pVersion != NULL_PTR &&
+                (pVersion->major != interfaceVersion->major ||
+                 pVersion->minor != interfaceVersion->minor)) {
+            continue;
+        }
 
-		/* If version is not null, it must match */
-		if (pVersion != NULL_PTR && (pVersion->major != interface_version->major ||
-		    pVersion->minor != interface_version->minor)) {
-			continue;
-		}
+        /* If any flags are specified, the interface must support them. */
+        if ((flags & interfaces[i].flags) != flags)
+            continue;
 
-		/* If any flags specified, it must be supported by the interface */
-		if ((flags & interfaces[i].flags) != flags)
-			continue;
-
-		*ppInterface = &interfaces[i];
+        *ppInterface = &interfaces[i];
 
         return CKR_OK;
-	}
+    }
 
-	return CKR_ARGUMENTS_BAD;
+    return CKR_ARGUMENTS_BAD;
 }
 
 #endif /* defined WOLFPKCS11_PKCS11_V3_0 */
@@ -509,6 +533,19 @@ CK_RV C_Initialize(CK_VOID_PTR pInitArgs)
     WOLFPKCS11_ENTER("C_Initialize");
 
     if (args != NULL) {
+        /* PKCS#11 spec: the four mutex callbacks must be all-set or all-NULL;
+         * any partial combination is CKR_ARGUMENTS_BAD. pReserved must also
+         * be NULL. */
+        int callbacks_set =
+            (args->CreateMutex != NULL) + (args->DestroyMutex != NULL) +
+            (args->LockMutex != NULL) + (args->UnlockMutex != NULL);
+        if ((callbacks_set != 0 && callbacks_set != 4) ||
+            args->pReserved != NULL) {
+            ret = CKR_ARGUMENTS_BAD;
+            WOLFPKCS11_LEAVE("C_Initialize", ret);
+            return ret;
+        }
+
         WOLFPKCS11_MSG("Warning: C_Initialize called with arguments, but most "
                        "are ignored.");
 #if (defined(WOLFPKCS11_NSS) && !defined(WOLFPKCS11_NO_STORE))
@@ -556,9 +593,19 @@ CK_RV C_Finalize(CK_VOID_PTR pReserved)
     CK_RV ret;
     WOLFPKCS11_ENTER("C_Finalize");
 
+    if (!WP11_Library_IsInitialized()) {
+        ret = CKR_CRYPTOKI_NOT_INITIALIZED;
+        WOLFPKCS11_LEAVE("C_Finalize", ret);
+        return ret;
+    }
+    if (pReserved != NULL) {
+        ret = CKR_ARGUMENTS_BAD;
+        WOLFPKCS11_LEAVE("C_Finalize", ret);
+        return ret;
+    }
+
     WP11_Library_Final();
 
-    (void)pReserved;
     ret = CKR_OK;
     WOLFPKCS11_LEAVE("C_Finalize", ret);
     return ret;

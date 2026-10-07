@@ -1,6 +1,6 @@
 # CMakeLists.txt
 #
-# Copyright (C) 2006-2024 wolfSSL Inc.
+# Copyright (C) 2006-2026 wolfSSL Inc.
 #
 # This file is part of wolfPKCS11.
 #
@@ -32,7 +32,7 @@ if("${CMAKE_SOURCE_DIR}" STREQUAL "${CMAKE_BINARY_DIR}")
      You must delete them, or cmake will refuse to work.")
 endif()
 
-project(wolfpkcs11 VERSION 2.0.0 LANGUAGES C)
+project(wolfpkcs11 VERSION 2.1.0 LANGUAGES C)
 
 # shared library versioning
 # increment if interfaces have been removed or changed
@@ -462,6 +462,102 @@ if(WOLFPKCS11_PKCS11_V3_2)
 endif()
 
 
+# ML-DSA
+add_option("WOLFPKCS11_MLDSA"
+    "Enable wolfPKCS11 ML-DSA support (default: disabled)"
+    "no" "yes;no"
+)
+
+if(NOT WOLFPKCS11_SHA3)
+    override_cache(WOLFPKCS11_MLDSA "no")
+endif()
+
+if(WOLFPKCS11_MLDSA)
+    if(NOT WOLFPKCS11_PKCS11_V3_2)
+        message(STATUS "ML-DSA requires PKCS#11 v3.2 support — enabling WOLFPKCS11_PKCS11_V3_2 automatically")
+        override_cache(WOLFPKCS11_PKCS11_V3_2 "yes")
+        if(NOT WOLFPKCS11_PKCS11_V3_0)
+            override_cache(WOLFPKCS11_PKCS11_V3_0 "yes")
+            list(APPEND WOLFPKCS11_DEFINITIONS "-DWOLFPKCS11_PKCS11_V3_0")
+        endif()
+        list(APPEND WOLFPKCS11_DEFINITIONS "-DWOLFPKCS11_PKCS11_V3_2")
+    endif()
+    list(APPEND WOLFPKCS11_DEFINITIONS "-DWOLFPKCS11_MLDSA")
+endif()
+
+
+# ML-KEM
+add_option("WOLFPKCS11_MLKEM"
+    "Enable wolfPKCS11 ML-KEM support (default: disabled)"
+    "no" "yes;no"
+)
+
+if(NOT WOLFPKCS11_SHA3)
+    override_cache(WOLFPKCS11_MLKEM "no")
+endif()
+
+if(WOLFPKCS11_MLKEM)
+    if(NOT WOLFPKCS11_PKCS11_V3_2)
+        message(STATUS "ML-KEM requires PKCS#11 v3.2 support — enabling WOLFPKCS11_PKCS11_V3_2 automatically")
+        override_cache(WOLFPKCS11_PKCS11_V3_2 "yes")
+        if(NOT WOLFPKCS11_PKCS11_V3_0)
+            override_cache(WOLFPKCS11_PKCS11_V3_0 "yes")
+            list(APPEND WOLFPKCS11_DEFINITIONS "-DWOLFPKCS11_PKCS11_V3_0")
+        endif()
+        list(APPEND WOLFPKCS11_DEFINITIONS "-DWOLFPKCS11_PKCS11_V3_2")
+    endif()
+    list(APPEND WOLFPKCS11_DEFINITIONS "-DWOLFPKCS11_MLKEM")
+endif()
+
+# LMS/HSS (RFC 8554) verify + public-key import (default: disabled)
+add_option("WOLFPKCS11_LMS"
+    "Enable wolfPKCS11 LMS/HSS verification and public-key import (default: disabled)"
+    "no" "yes;no"
+)
+
+if(WOLFPKCS11_LMS AND NOT WOLFPKCS11_SHA256)
+    message(STATUS "LMS/HSS requires SHA-256 support (disabled); disabling WOLFPKCS11_LMS")
+    override_cache(WOLFPKCS11_LMS "no")
+endif()
+
+if(WOLFPKCS11_LMS)
+    if(NOT WOLFPKCS11_PKCS11_V3_2)
+        message(STATUS "LMS/HSS requires PKCS#11 v3.2 support — enabling WOLFPKCS11_PKCS11_V3_2 automatically")
+        override_cache(WOLFPKCS11_PKCS11_V3_2 "yes")
+        if(NOT WOLFPKCS11_PKCS11_V3_0)
+            override_cache(WOLFPKCS11_PKCS11_V3_0 "yes")
+            list(APPEND WOLFPKCS11_DEFINITIONS "-DWOLFPKCS11_PKCS11_V3_0")
+        endif()
+        list(APPEND WOLFPKCS11_DEFINITIONS "-DWOLFPKCS11_PKCS11_V3_2")
+    endif()
+    list(APPEND WOLFPKCS11_DEFINITIONS "-DWOLFPKCS11_LMS")
+endif()
+
+# XMSS/XMSS^MT (RFC 8391) verify + public-key import (default: disabled)
+add_option("WOLFPKCS11_XMSS"
+    "Enable wolfPKCS11 XMSS/XMSS^MT verification and public-key import (default: disabled)"
+    "no" "yes;no"
+)
+
+if(WOLFPKCS11_XMSS AND NOT WOLFPKCS11_SHA256)
+    message(STATUS "XMSS requires SHA-256 support (disabled); disabling WOLFPKCS11_XMSS")
+    override_cache(WOLFPKCS11_XMSS "no")
+endif()
+
+if(WOLFPKCS11_XMSS)
+    if(NOT WOLFPKCS11_PKCS11_V3_2)
+        message(STATUS "XMSS requires PKCS#11 v3.2 support — enabling WOLFPKCS11_PKCS11_V3_2 automatically")
+        override_cache(WOLFPKCS11_PKCS11_V3_2 "yes")
+        if(NOT WOLFPKCS11_PKCS11_V3_0)
+            override_cache(WOLFPKCS11_PKCS11_V3_0 "yes")
+            list(APPEND WOLFPKCS11_DEFINITIONS "-DWOLFPKCS11_PKCS11_V3_0")
+        endif()
+        list(APPEND WOLFPKCS11_DEFINITIONS "-DWOLFPKCS11_PKCS11_V3_2")
+    endif()
+    list(APPEND WOLFPKCS11_DEFINITIONS "-DWOLFPKCS11_XMSS")
+endif()
+
+
 # If wolfpkcs11/options.h exists, delete it to avoid
 # a mixup with build/wolfpkcs11/options.h.
 if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/wolfpkcs11/options.h")
@@ -673,12 +769,22 @@ if(WOLFPKCS11_TESTS)
         token_path_test
         rsa_session_persistence_test
         debug_test
-        object_id_uniqueness_test)
+        object_id_uniqueness_test
+        pkcs11_compliance_test)
 
     foreach(test_target IN LISTS WPKCS11_TEST_TARGETS)
         add_wpkcs11_test(${test_target}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/${test_target}.c)
     endforeach()
+
+    # HBS (LMS/HSS, XMSS/XMSS^MT) public-key persistence test. Only built when
+    # the feature is enabled; the test exits 77 (skip) when no token store is
+    # available, so treat that as a skip rather than a failure.
+    if(WOLFPKCS11_LMS OR WOLFPKCS11_XMSS)
+        add_wpkcs11_test(hbs_persistence_test
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/hbs_persistence_test.c)
+        set_tests_properties(hbs_persistence_test PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
 endif()
 
 if(WOLFPKCS11_EXAMPLES)
@@ -897,4 +1003,6 @@ if(WOLFPKCS11_INSTALL)
             DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/wolfpkcs11
             FILES_MATCHING PATTERN "*.h"
             REGEX ${EXCLUDED_HEADERS_REGEX} EXCLUDE)
+    install(FILES ${OPTION_FILE}
+            DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/wolfpkcs11)
 endif()

@@ -9,6 +9,7 @@ on:
 jobs:
   get_current_wolfssl_versions:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     outputs:
       wolfssl_versions: ${{ steps.json.outputs.wolfssl_versions }}
     steps:
@@ -22,6 +23,7 @@ jobs:
 
   get_current_wolftpm_versions:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     outputs:
       wolftpm_versions: ${{ steps.json.outputs.wolftpm_versions }}
     steps:
@@ -47,7 +49,7 @@ jobs:
       id: cache-wolfssl
       with:
         path: build-dir/
-        key: wolfssl-${{ matrix.wolfssl_version }}
+        key: wolfssl-${{ matrix.wolfssl_version }}-tpm
         lookup-only: true
 
     - name: debug
@@ -60,7 +62,7 @@ jobs:
         repository: wolfssl/wolfssl
         ref: ${{ matrix.wolfssl_version }}
         path: wolfssl/
-        configure: --enable-all CPPFLAGS=-DWC_RSA_DIRECT
+        configure: --enable-all --disable-anon --disable-nginx CPPFLAGS=-DWC_RSA_DIRECT
         check: false
         install: true 
 
@@ -79,14 +81,14 @@ jobs:
       id: cache-wolftpm
       with:
         path: build-dir/
-        key: wolftpm-${{ matrix.wolftpm_version }}
+        key: wolftpm-${{ matrix.wolftpm_version }}-tpm
         lookup-only: true
 
     - name: Checking cache for wolfssl
       uses: actions/cache@v4
       with:
         path: build-dir/
-        key: wolfssl-${{ matrix.wolfssl_version }}
+        key: wolfssl-${{ matrix.wolfssl_version }}-tpm
         fail-on-cache-miss: true
 
     - name: debug
@@ -118,6 +120,7 @@ jobs:
 
   tpm2-store-test:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: [build_wolfssl, build_wolftpm, get_current_wolfssl_versions, get_current_wolftpm_versions]
     strategy:
       matrix:
@@ -133,14 +136,14 @@ jobs:
       uses: actions/cache@v4
       with:
         path: build-dir/
-        key: wolfssl-${{ matrix.wolfssl_version }}
+        key: wolfssl-${{ matrix.wolfssl_version }}-tpm
         fail-on-cache-miss: true
 
     - name: Checking cache for wolftpm
       uses: actions/cache@v4
       with:
         path: build-dir/
-        key: wolftpm-${{ matrix.wolftpm_version }}
+        key: wolftpm-${{ matrix.wolftpm_version }}-tpm
         fail-on-cache-miss: true
 
     - name: Restore wolfTPM examples from cache

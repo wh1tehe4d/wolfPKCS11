@@ -1,6 +1,6 @@
 /* crypto.c
  *
- * Copyright (C) 2006-2025 wolfSSL Inc.
+ * Copyright (C) 2006-2026 wolfSSL Inc.
  *
  * This file is part of wolfPKCS11.
  *
@@ -31,16 +31,41 @@
 #include <wolfssl/wolfcrypt/settings.h>
 #include <wolfssl/wolfcrypt/error-crypt.h>
 #include <wolfssl/wolfcrypt/asn.h>
+#include <wolfssl/wolfcrypt/random.h>
 
 #include <wolfpkcs11/pkcs11.h>
 #include <wolfpkcs11/internal.h>
+
+#include <limits.h>
 
 #define ATTR_TYPE_ULONG        0
 #define ATTR_TYPE_BOOL         1
 #define ATTR_TYPE_DATA         2
 #define ATTR_TYPE_DATE         3
 
+/* Maximum number of random bytes generated per call to
+ * WP11_Slot_GenerateRandom(). A CK_ULONG request larger than this is split
+ * into several calls so that (a) the full buffer is filled rather than the
+ * length being silently truncated when cast to the int the lower layer takes,
+ * and (b) the RNG lock is not held for the duration of one huge request.
+ * wc_RNG_GenerateBlock() rejects any single request larger than
+ * RNG_MAX_BLOCK_LEN, so the chunk must not exceed it. */
+#define WOLFPKCS11_RNG_MAX_GEN  ((CK_ULONG)RNG_MAX_BLOCK_LEN)
+
 #define PRF_KEY_SIZE            48
+
+/* Check that a CK_ULONG value fits in word32 with room for overhead such as
+ * authentication tags, key wrap blocks, or padding. On LP64 platforms CK_ULONG
+ * is 64-bit but wolfCrypt functions use word32/int for lengths. */
+#define CK_ULONG_MAX_OVERHEAD  ((CK_ULONG)64)
+#define CK_ULONG_FITS_WORD32(v) \
+    ((v) <= (CK_ULONG)0xFFFFFFFF - CK_ULONG_MAX_OVERHEAD)
+
+/* RFC 5869 limits HKDF-Expand output to 255 * HashLen octets. Cap the
+ * requested output length to the largest such value across supported digests
+ * so an oversized request does not drive a large allocation and zeroization
+ * before wolfCrypt enforces the per-digest limit. */
+#define WP11_MAX_HKDF_OUTPUT   (255 * WC_MAX_DIGEST_SIZE)
 
 #define CHECK_KEYTYPE(kt) \
    (kt == CKK_RSA || kt == CKK_EC || kt == CKK_DH || \
@@ -87,6 +112,17 @@ static CK_ATTRIBUTE_TYPE ecKeyParams[] = {
 #define EC_KEY_PARAMS_CNT     (sizeof(ecKeyParams)/sizeof(*ecKeyParams))
 #endif
 
+#ifdef WOLFPKCS11_MLDSA
+/* ML-DSA key data attributes. */
+static CK_ATTRIBUTE_TYPE mldsaKeyParams[] = {
+    CKA_PARAMETER_SET,
+    CKA_SEED,
+    CKA_VALUE
+};
+/* Count of ML-DSA key data attributes. */
+#define MLDSA_KEY_PARAMS_CNT   (sizeof(mldsaKeyParams)/sizeof(*mldsaKeyParams))
+#endif
+
 #ifndef NO_DH
 /* DH key data attributes. */
 static CK_ATTRIBUTE_TYPE dhKeyParams[] = {
@@ -96,6 +132,42 @@ static CK_ATTRIBUTE_TYPE dhKeyParams[] = {
 };
 /* Count of DH key data attributes. */
 #define DH_KEY_PARAMS_CNT     (sizeof(dhKeyParams)/sizeof(*dhKeyParams))
+#endif
+
+#ifdef WOLFPKCS11_MLKEM
+/* ML-KEM key data attributes. */
+static CK_ATTRIBUTE_TYPE mlKemKeyParams[] = {
+    CKA_PARAMETER_SET,
+    CKA_SEED,
+    CKA_VALUE
+};
+/* Count of ML-KEM key data attributes. */
+#define MLKEM_KEY_PARAMS_CNT  (sizeof(mlKemKeyParams)/sizeof(*mlKemKeyParams))
+#endif
+
+#ifdef WOLFPKCS11_LMS
+/* HSS public-key attributes (PKCS#11 v3.3 HSS profile). data[0..2] are the
+ * optional CK_ULONG parameters CKA_HSS_LEVELS, CKA_HSS_LMS_TYPE and
+ * CKA_HSS_LMOTS_TYPE (validated against the key when supplied; otherwise
+ * self-derived from it); data[3] = raw RFC 8554 public key. */
+static CK_ATTRIBUTE_TYPE hssKeyParams[] = {
+    CKA_HSS_LEVELS,
+    CKA_HSS_LMS_TYPE,
+    CKA_HSS_LMOTS_TYPE,
+    CKA_VALUE
+};
+#define HSS_KEY_PARAMS_CNT     (sizeof(hssKeyParams)/sizeof(*hssKeyParams))
+#endif
+
+#ifdef WOLFPKCS11_XMSS
+/* XMSS/XMSS^MT key data attributes. data[0] = optional CKA_PARAMETER_SET
+ * (the OID as a CK_ULONG; when supplied it is validated against the OID in the
+ * public key and a mismatch is rejected), data[1] = raw XMSS public key. */
+static CK_ATTRIBUTE_TYPE xmssKeyParams[] = {
+    CKA_PARAMETER_SET,
+    CKA_VALUE
+};
+#define XMSS_KEY_PARAMS_CNT    (sizeof(xmssKeyParams)/sizeof(*xmssKeyParams))
 #endif
 
 /* Secret key data attributes. */
@@ -137,16 +209,51 @@ static CK_ATTRIBUTE_TYPE trustParams[] = {
 #define TRUST_PARAMS_CNT    (sizeof(trustParams)/sizeof(*trustParams))
 #endif
 
-/* Identify maximum count for stack array. */
-#ifndef NO_RSA
-#define OBJ_MAX_PARAMS        RSA_KEY_PARAMS_CNT
-#elif defined(HAVE_ECC)
-#define OBJ_MAX_PARAMS        EC_KEY_PARAMS_CNT
-#elif !defined(NO_DH)
-#define OBJ_MAX_PARAMS        DH_KEY_PARAMS_CNT
-#else
-#define OBJ_MAX_PARAMS        SECRET_KEY_PARAMS_CNT
+/* The SetAttributeValue stack arrays data[]/len[] must hold the largest
+ * attribute set of any enabled key or object type (see the cnt assignments in
+ * SetAttributeValue). Default the optional counts to zero so the maximum below
+ * is well defined in every build: a token with RSA disabled but LMS enabled
+ * still needs room for the four HSS slots, for example. */
+#ifndef RSA_KEY_PARAMS_CNT
+#define RSA_KEY_PARAMS_CNT     0
 #endif
+#ifndef EC_KEY_PARAMS_CNT
+#define EC_KEY_PARAMS_CNT      0
+#endif
+#ifndef MLDSA_KEY_PARAMS_CNT
+#define MLDSA_KEY_PARAMS_CNT   0
+#endif
+#ifndef DH_KEY_PARAMS_CNT
+#define DH_KEY_PARAMS_CNT      0
+#endif
+#ifndef MLKEM_KEY_PARAMS_CNT
+#define MLKEM_KEY_PARAMS_CNT   0
+#endif
+#ifndef HSS_KEY_PARAMS_CNT
+#define HSS_KEY_PARAMS_CNT     0
+#endif
+#ifndef XMSS_KEY_PARAMS_CNT
+#define XMSS_KEY_PARAMS_CNT    0
+#endif
+#ifndef TRUST_PARAMS_CNT
+#define TRUST_PARAMS_CNT       0
+#endif
+
+/* Compile-time maximum of two attribute counts. */
+#define WP11_PARAMS_MAX(a, b)  ((a) > (b) ? (a) : (b))
+
+/* Identify maximum count for stack array. */
+#define OBJ_MAX_PARAMS                                                    \
+    WP11_PARAMS_MAX(RSA_KEY_PARAMS_CNT,                                   \
+    WP11_PARAMS_MAX(EC_KEY_PARAMS_CNT,                                    \
+    WP11_PARAMS_MAX(MLDSA_KEY_PARAMS_CNT,                                 \
+    WP11_PARAMS_MAX(DH_KEY_PARAMS_CNT,                                    \
+    WP11_PARAMS_MAX(MLKEM_KEY_PARAMS_CNT,                                 \
+    WP11_PARAMS_MAX(HSS_KEY_PARAMS_CNT,                                   \
+    WP11_PARAMS_MAX(XMSS_KEY_PARAMS_CNT,                                  \
+    WP11_PARAMS_MAX(SECRET_KEY_PARAMS_CNT,                                \
+    WP11_PARAMS_MAX(DATA_PARAMS_CNT,                                      \
+    WP11_PARAMS_MAX(CERT_PARAMS_CNT, TRUST_PARAMS_CNT))))))))))
 
 typedef struct AttributeType {
     CK_ATTRIBUTE_TYPE attr;            /* Crypto-Ki attribute                 */
@@ -159,6 +266,7 @@ static AttributeType attrType[] = {
     { CKA_TOKEN,                       ATTR_TYPE_DATA  },
     { CKA_PRIVATE,                     ATTR_TYPE_BOOL  },
     { CKA_LABEL,                       ATTR_TYPE_DATA  },
+    { CKA_UNIQUE_ID,                   ATTR_TYPE_DATA  },
     { CKA_APPLICATION,                 ATTR_TYPE_DATA  },
     { CKA_VALUE,                       ATTR_TYPE_DATA  },
     { CKA_OBJECT_ID,                   ATTR_TYPE_DATA  },
@@ -224,6 +332,16 @@ static AttributeType attrType[] = {
     { CKA_HASH_OF_ISSUER_PUBLIC_KEY,   ATTR_TYPE_DATA  },
     { CKA_NAME_HASH_ALGORITHM,         ATTR_TYPE_ULONG },
     { CKA_CHECK_VALUE,                 ATTR_TYPE_DATA  },
+    { CKA_PARAMETER_SET,               ATTR_TYPE_ULONG },
+    { CKA_SEED,                        ATTR_TYPE_DATA  },
+    { CKA_ENCAPSULATE,                 ATTR_TYPE_BOOL  },
+    { CKA_DECAPSULATE,                 ATTR_TYPE_BOOL  },
+    { CKA_HSS_LEVELS,                  ATTR_TYPE_ULONG },
+    { CKA_HSS_LMS_TYPE,                ATTR_TYPE_ULONG },
+    { CKA_HSS_LMOTS_TYPE,              ATTR_TYPE_ULONG },
+    { CKA_HSS_LMS_TYPES,               ATTR_TYPE_DATA  },
+    { CKA_HSS_LMOTS_TYPES,             ATTR_TYPE_DATA  },
+    { CKA_HSS_KEYS_REMAINING,          ATTR_TYPE_ULONG },
 #ifdef WOLFPKCS11_NSS
     { CKA_CERT_SHA1_HASH,              ATTR_TYPE_DATA  },
     { CKA_CERT_MD5_HASH,               ATTR_TYPE_DATA  },
@@ -242,6 +360,16 @@ static AttributeType attrType[] = {
 };
 /* Count of elements in attribute type list. */
 #define ATTR_TYPE_SIZE     (sizeof(attrType) / sizeof(*attrType))
+
+static int IsKnownAttrType(CK_ATTRIBUTE_TYPE type)
+{
+    int j;
+    for (j = 0; j < (int)ATTR_TYPE_SIZE; j++) {
+        if (attrType[j].attr == type)
+            return 1;
+    }
+    return 0;
+}
 
 /**
  * Find the attribute type in the template.
@@ -278,6 +406,89 @@ static CK_RV FindValidAttributeType(CK_ATTRIBUTE* pTemplate, CK_ULONG ulCount,
         return CKR_ATTRIBUTE_VALUE_INVALID;
     }
 
+    return CKR_OK;
+}
+
+/* Sentinel for CheckPrivateLogin: callers that legitimately have no implicit
+ * class (C_CreateObject, C_UnwrapKey - both require CKA_CLASS in template per
+ * spec) pass this so the helper falls back to template inspection only. */
+#define WP11_NO_IMPLICIT_CLASS ((CK_OBJECT_CLASS)~(CK_OBJECT_CLASS)0)
+
+/* Per PKCS#11 v3.0 sec 5.1 Table 16: creating, generating, or unwrapping an
+ * object whose effective CKA_PRIVATE is CK_TRUE on a session that is not
+ * logged in as the user must return CKR_USER_NOT_LOGGED_IN. Empty-PIN tokens
+ * treat public sessions as logged-in (matches the find-time filter in
+ * WP11_Session_Find) so this gate must mirror that.
+ *
+ * `implicitClass` lets callers whose object class is implied by the API
+ * itself (C_GenerateKey always creates a CKO_SECRET_KEY, C_GenerateKeyPair
+ * produces CKO_PUBLIC_KEY/CKO_PRIVATE_KEY) supply that class even when the
+ * template omits CKA_CLASS. Without this, the spec-default
+ * CKA_PRIVATE=CK_TRUE would not be inferred for templates like
+ * `{CKA_VALUE_LEN, CKA_KEY_TYPE}` and a public session could silently
+ * generate a private key. An explicit CKA_PRIVATE attribute in the template
+ * still wins over the class-derived default.
+ *
+ * Gated by WOLFPKCS11_LEGACY_PRIVATE_FALSE_DEFAULT so the class-based
+ * inference matches the legacy default in SetAttributeDefaults. */
+static CK_RV CheckPrivateLogin(WP11_Session* session,
+                               CK_ATTRIBUTE_PTR pTemplate, CK_ULONG ulCount,
+                               CK_OBJECT_CLASS implicitClass)
+{
+    CK_ATTRIBUTE* attr = NULL;
+    CK_BBOOL isPrivate = CK_FALSE;
+    WP11_Slot* slot;
+
+    if (session == NULL)
+        return CKR_OK;
+
+    if (pTemplate != NULL && ulCount > 0)
+        FindAttributeType(pTemplate, ulCount, CKA_PRIVATE, &attr);
+
+    if (attr != NULL && attr->pValue != NULL &&
+            attr->ulValueLen == sizeof(CK_BBOOL)) {
+        isPrivate = *(CK_BBOOL*)attr->pValue;
+    }
+    else {
+#ifndef WOLFPKCS11_LEGACY_PRIVATE_FALSE_DEFAULT
+        CK_OBJECT_CLASS objClass = implicitClass;
+        CK_ATTRIBUTE* classAttr = NULL;
+        if (pTemplate != NULL && ulCount > 0)
+            FindAttributeType(pTemplate, ulCount, CKA_CLASS, &classAttr);
+        if (classAttr != NULL && classAttr->pValue != NULL &&
+                classAttr->ulValueLen == sizeof(CK_OBJECT_CLASS)) {
+            objClass = *(CK_OBJECT_CLASS*)classAttr->pValue;
+        }
+        if (objClass == CKO_PRIVATE_KEY || objClass == CKO_SECRET_KEY)
+            isPrivate = CK_TRUE;
+#endif
+    }
+
+    if (!isPrivate)
+        return CKR_OK;
+
+    slot = WP11_Session_GetSlot(session);
+    if (slot == NULL)
+        return CKR_OK;
+    /* Fresh / unprovisioned tokens (no user PIN initialized) have nothing to
+     * log in as, and the existing find-time private-object filter
+     * (src/internal.c) likewise bypasses on Has_Empty_Pin. Mirror both:
+     * an unset user PIN is treated as "no protection required" so callers
+     * that pre-date C_InitToken / C_InitPIN keep working. After the token
+     * is provisioned with a non-empty user PIN, the gate engages. */
+    if (!WP11_Slot_IsTokenUserPinInitialized(slot))
+        return CKR_OK;
+    if (WP11_Slot_Has_Empty_Pin(slot))
+        return CKR_OK;
+#ifdef WOLFPKCS11_NSS
+    /* NSS operates as an internal crypto module and has separate private
+     * object semantics. Preserve its existing any-login behavior; F-8650
+     * applies to the standard PKCS#11 session model. */
+    if (!WP11_Slot_IsLoggedIn(slot))
+#else
+    if (!WP11_Slot_IsUserLoggedIn(slot))
+#endif
+        return CKR_USER_NOT_LOGGED_IN;
     return CKR_OK;
 }
 
@@ -344,7 +555,8 @@ static CK_RV CheckAttributes(CK_ATTRIBUTE* pTemplate, CK_ULONG ulCount, int set)
     return CKR_OK;
 }
 
-static int CheckOpSupported(WP11_Object* obj, CK_ATTRIBUTE_TYPE op)
+static int CheckOpSupportedRv(WP11_Object* obj, CK_ATTRIBUTE_TYPE op,
+                              CK_RV errRv)
 {
     CK_BBOOL haveOp = 0;
     CK_ULONG dataLen = sizeof(haveOp);
@@ -353,9 +565,16 @@ static int CheckOpSupported(WP11_Object* obj, CK_ATTRIBUTE_TYPE op)
         return ret;
     if (!haveOp) {
         WOLFPKCS11_MSG("Operation not supported by object");
-        return CKR_KEY_TYPE_INCONSISTENT;
+        return (int)errRv;
     }
     return CKR_OK;
+}
+
+static int CheckOpSupported(WP11_Object* obj, CK_ATTRIBUTE_TYPE op)
+{
+    /* Usage-attribute denial is CKR_KEY_FUNCTION_NOT_PERMITTED; a key-type
+     * mismatch is handled separately by the per-mechanism checks. */
+    return CheckOpSupportedRv(obj, op, CKR_KEY_FUNCTION_NOT_PERMITTED);
 }
 
 static CK_RV SetInitialStates(WP11_Object* key)
@@ -410,6 +629,29 @@ static CK_RV SetIfNotFound(WP11_Object* obj, CK_ATTRIBUTE_TYPE type,
     return ret;
 }
 
+/* NSS uses wolfPKCS11 as its internal crypto module and relies on the
+ * historical permissive behavior: it reads key material directly via
+ * C_GetAttributeValue, derives from ephemeral keys without CKA_DERIVE, and
+ * uses multi-purpose RSA keys. Selecting NSS support therefore enables all of
+ * the "reverting" macros below, so the secure-default and enforcement
+ * hardening (F-4063, F-4064, F-4533, F-5519, F-5520) applies only to non-NSS
+ * builds. The hardening can still be toggled independently in non-NSS builds
+ * via the individual WOLFPKCS11_LEGACY_* macros. */
+#ifdef WOLFPKCS11_NSS
+    #ifndef WP11_NSS_PERMISSIVE_KEY_DEFAULTS
+        #define WP11_NSS_PERMISSIVE_KEY_DEFAULTS        /* F-4063, F-4064 */
+    #endif
+    #ifndef WOLFPKCS11_LEGACY_EXTRACTABLE_TRUE_DEFAULT
+        #define WOLFPKCS11_LEGACY_EXTRACTABLE_TRUE_DEFAULT  /* F-5519 */
+    #endif
+    #ifndef WOLFPKCS11_LEGACY_RSA_USAGE_DEFAULT
+        #define WOLFPKCS11_LEGACY_RSA_USAGE_DEFAULT     /* F-5520 */
+    #endif
+    #ifndef WOLFPKCS11_LEGACY_DERIVE_NO_INHERIT
+        #define WOLFPKCS11_LEGACY_DERIVE_NO_INHERIT     /* F-4533 */
+    #endif
+#endif
+
 static CK_RV SetAttributeDefaults(WP11_Object* obj, CK_OBJECT_CLASS keyType,
                                   CK_ATTRIBUTE_PTR pTemplate,
                                   CK_ULONG ulCount)
@@ -419,7 +661,14 @@ static CK_RV SetAttributeDefaults(WP11_Object* obj, CK_OBJECT_CLASS keyType,
     CK_BBOOL falseVal = CK_FALSE;
     CK_BBOOL encrypt = CK_TRUE;
     CK_BBOOL recover = CK_TRUE;
+    /* PKCS#11 v2.40 sec 4.4.1: CKA_WRAP and CKA_UNWRAP default to CK_FALSE.
+     * The pre-fix default (CK_TRUE) silently made every secret/RSA key a
+     * wrapping key, violating least-privilege (Fenrir 2774). */
+#ifdef WOLFPKCS11_LEGACY_WRAP_TRUE_DEFAULT
     CK_BBOOL wrap = CK_TRUE;
+#else
+    CK_BBOOL wrap = CK_FALSE;
+#endif
     CK_BBOOL derive = (keyType == CKO_PUBLIC_KEY ? CK_FALSE : CK_TRUE);
     CK_BBOOL verify = CK_TRUE;
     CK_BBOOL sign = CK_FALSE;
@@ -455,11 +704,36 @@ static CK_RV SetAttributeDefaults(WP11_Object* obj, CK_OBJECT_CLASS keyType,
             wrap = CK_FALSE;
             sign = CK_TRUE;
             break;
+        case CKK_ML_DSA:
+            derive = CK_FALSE;
+            verify = CK_TRUE;
+            encrypt = CK_FALSE;
+            recover = CK_FALSE;
+            wrap = CK_FALSE;
+            sign = CK_TRUE;
+            break;
+        case CKK_ML_KEM:
+            derive = CK_FALSE;
+            verify = CK_FALSE;
+            encrypt = CK_FALSE;
+            recover = CK_FALSE;
+            wrap = CK_FALSE;
+            sign = CK_FALSE;
+            break;
     }
 
     /* Defaults if not set */
     switch (keyType) {
         case CKO_PUBLIC_KEY:
+#ifndef WOLFPKCS11_LEGACY_PRIVATE_FALSE_DEFAULT
+            /* Spec default: public keys are CKA_PRIVATE=FALSE (this is also
+             * what the historical implementation produced, but make it
+             * explicit so the default is stable when the macro toggles
+             * private/secret keys below). */
+            if (ret == CKR_OK)
+                ret = SetIfNotFound(obj, CKA_PRIVATE, falseVal, pTemplate,
+                                    ulCount);
+#endif
             if (ret == CKR_OK)
                 ret = SetIfNotFound(obj, CKA_ENCRYPT, encrypt, pTemplate,
                                     ulCount);
@@ -474,11 +748,33 @@ static CK_RV SetAttributeDefaults(WP11_Object* obj, CK_OBJECT_CLASS keyType,
             if (ret == CKR_OK)
                 ret = SetIfNotFound(obj, CKA_DERIVE, derive, pTemplate,
                                     ulCount);
+#ifdef WOLFPKCS11_MLKEM
+            if (ret == CKR_OK && type == CKK_ML_KEM)
+                ret = SetIfNotFound(obj, CKA_ENCAPSULATE, trueVal, pTemplate,
+                                    ulCount);
+#endif
             break;
         case CKO_SECRET_KEY:
+#ifndef WOLFPKCS11_LEGACY_PRIVATE_FALSE_DEFAULT
+            /* PKCS#11 v2.40 sec 4.4.1: secret keys default to
+             * CKA_PRIVATE=CK_TRUE (Fenrir 2370). */
+            if (ret == CKR_OK)
+                ret = SetIfNotFound(obj, CKA_PRIVATE, trueVal, pTemplate,
+                                    ulCount);
+#endif
+            /* F-4063: default secret keys to CKA_SENSITIVE=CK_TRUE. */
+#ifndef WP11_NSS_PERMISSIVE_KEY_DEFAULTS
+            if (ret == CKR_OK)
+                ret = SetIfNotFound(obj, CKA_SENSITIVE, trueVal, pTemplate,
+                                    ulCount);
+#endif
+            /* F-5519: default secret keys to CKA_EXTRACTABLE=CK_FALSE so they
+             * are not wrap-exportable unless the template opts in. */
+#ifdef WOLFPKCS11_LEGACY_EXTRACTABLE_TRUE_DEFAULT
             if (ret == CKR_OK)
                 ret = SetIfNotFound(obj, CKA_EXTRACTABLE, trueVal, pTemplate,
                                     ulCount);
+#endif
             if (ret == CKR_OK)
                 ret = SetIfNotFound(obj, CKA_ENCRYPT, trueVal, pTemplate,
                                     ulCount);
@@ -486,16 +782,50 @@ static CK_RV SetAttributeDefaults(WP11_Object* obj, CK_OBJECT_CLASS keyType,
                 ret = SetIfNotFound(obj, CKA_DECRYPT, trueVal, pTemplate,
                                     ulCount);
             /* CKA_SIGN / CKA_VERIFY default false */
+            /* CKA_WRAP / CKA_UNWRAP defaults follow the macro-gated `wrap'
+             * (CK_TRUE under the legacy macro, CK_FALSE per spec). */
             if (ret == CKR_OK)
-                ret = SetIfNotFound(obj, CKA_WRAP, trueVal, pTemplate, ulCount);
+                ret = SetIfNotFound(obj, CKA_WRAP, wrap, pTemplate, ulCount);
             if (ret == CKR_OK)
-                ret = SetIfNotFound(obj, CKA_UNWRAP, trueVal, pTemplate,
+                ret = SetIfNotFound(obj, CKA_UNWRAP, wrap, pTemplate,
                                     ulCount);
             break;
         case CKO_PRIVATE_KEY:
+#ifndef WOLFPKCS11_LEGACY_PRIVATE_FALSE_DEFAULT
+            /* PKCS#11 v2.40 sec 4.4.1: private keys default to
+             * CKA_PRIVATE=CK_TRUE (Fenrir 2370). */
+            if (ret == CKR_OK)
+                ret = SetIfNotFound(obj, CKA_PRIVATE, trueVal, pTemplate,
+                                    ulCount);
+#endif
+            /* F-4063: default private keys to CKA_SENSITIVE=CK_TRUE and
+             * CKA_EXTRACTABLE=CK_FALSE. */
+#ifndef WP11_NSS_PERMISSIVE_KEY_DEFAULTS
+            if (ret == CKR_OK)
+                ret = SetIfNotFound(obj, CKA_SENSITIVE, trueVal, pTemplate,
+                                    ulCount);
+            if (ret == CKR_OK)
+                ret = SetIfNotFound(obj, CKA_EXTRACTABLE, falseVal, pTemplate,
+                                    ulCount);
+#else
+            /* NSS operates as the internal crypto module and needs both
+             * non-sensitive and extractable private keys to read key material
+             * directly via C_GetAttributeValue during TLS operations. */
             if (ret == CKR_OK)
                 ret = SetIfNotFound(obj, CKA_EXTRACTABLE, trueVal, pTemplate,
                                     ulCount);
+#endif
+            /* F-5520: RSA private-key usage is opt-in. A minimal template
+             * otherwise grants CKA_DECRYPT, CKA_SIGN and CKA_SIGN_RECOVER all
+             * at once, so a key intended for one purpose is silently accepted
+             * for several. Require each use to be requested explicitly. */
+#ifndef WOLFPKCS11_LEGACY_RSA_USAGE_DEFAULT
+            if (type == CKK_RSA) {
+                encrypt = CK_FALSE;  /* CKA_DECRYPT */
+                sign    = CK_FALSE;  /* CKA_SIGN */
+                recover = CK_FALSE;  /* CKA_SIGN_RECOVER */
+            }
+#endif
             if (ret == CKR_OK)
                 ret = SetIfNotFound(obj, CKA_DECRYPT, encrypt, pTemplate,
                                     ulCount);
@@ -509,6 +839,11 @@ static CK_RV SetAttributeDefaults(WP11_Object* obj, CK_OBJECT_CLASS keyType,
             if (ret == CKR_OK)
                 ret = SetIfNotFound(obj, CKA_DERIVE, derive, pTemplate,
                                     ulCount);
+#ifdef WOLFPKCS11_MLKEM
+            if (ret == CKR_OK && type == CKK_ML_KEM)
+                ret = SetIfNotFound(obj, CKA_DECAPSULATE, trueVal, pTemplate,
+                                    ulCount);
+#endif
             break;
     }
 
@@ -553,6 +888,7 @@ static CK_RV SetAttributeValue(WP11_Session* session, WP11_Object* obj,
     int i, j;
     unsigned char* data[OBJ_MAX_PARAMS] = { 0, };
     CK_ULONG len[OBJ_MAX_PARAMS] = { 0, };
+    int present[OBJ_MAX_PARAMS] = { 0, };
     CK_ATTRIBUTE_TYPE* attrs = NULL;
     int cnt;
     CK_BBOOL attrsFound = 0;
@@ -560,16 +896,33 @@ static CK_RV SetAttributeValue(WP11_Session* session, WP11_Object* obj,
     CK_OBJECT_CLASS objClass;
     CK_BBOOL getVar;
     CK_ULONG getVarLen = 1;
+    byte roCur[sizeof(CK_ULONG)];
+    CK_ULONG roCurLen;
 
     if (pTemplate == NULL)
         return CKR_ARGUMENTS_BAD;
-    if (!WP11_Session_IsRW(session))
+    /* Only require R/W session for token objects */
+    if (!WP11_Session_IsRW(session) && WP11_Object_OnToken(obj))
         return CKR_SESSION_READ_ONLY;
+
+    /* CKA_MODIFIABLE enforcement (Fenrir 1343) lives in C_SetAttributeValue,
+     * not this shared helper - C_CopyObject also funnels through here with
+     * newObject=FALSE after the new object has just inherited the source
+     * object's modifiable flag via WP11_Object_Copy, and copy semantics are
+     * governed by CKA_COPYABLE (already checked separately), not
+     * CKA_MODIFIABLE. */
 
     rv = CheckAttributes(pTemplate, ulCount, 1);
     if (rv != CKR_OK)
         return rv;
 
+    /* CKA_UNIQUE_ID is generated and owned by the token; a caller may never
+     * supply or change it. Reject before any setter runs so a mixed template
+     * fails without mutating another attribute. */
+    for (i = 0; i < (int)ulCount; i++) {
+        if (pTemplate[i].type == CKA_UNIQUE_ID)
+            return CKR_ATTRIBUTE_READ_ONLY;
+    }
 
     type = WP11_Object_GetType(obj);
     objClass = WP11_Object_GetClass(obj);
@@ -602,10 +955,35 @@ static CK_RV SetAttributeValue(WP11_Session* session, WP11_Object* obj,
                 cnt = EC_KEY_PARAMS_CNT;
                 break;
         #endif
+        #ifdef WOLFPKCS11_MLDSA
+            case CKK_ML_DSA:
+                attrs = mldsaKeyParams;
+                cnt = MLDSA_KEY_PARAMS_CNT;
+                break;
+        #endif
         #ifndef NO_DH
             case CKK_DH:
                 attrs = dhKeyParams;
                 cnt = DH_KEY_PARAMS_CNT;
+                break;
+        #endif
+        #ifdef WOLFPKCS11_MLKEM
+            case CKK_ML_KEM:
+                attrs = mlKemKeyParams;
+                cnt = MLKEM_KEY_PARAMS_CNT;
+                break;
+        #endif
+        #ifdef WOLFPKCS11_LMS
+            case CKK_HSS:
+                attrs = hssKeyParams;
+                cnt = HSS_KEY_PARAMS_CNT;
+                break;
+        #endif
+        #ifdef WOLFPKCS11_XMSS
+            case CKK_XMSS:
+            case CKK_XMSSMT:
+                attrs = xmssKeyParams;
+                cnt = XMSS_KEY_PARAMS_CNT;
                 break;
         #endif
         #ifdef WOLFPKCS11_HKDF
@@ -628,6 +1006,7 @@ static CK_RV SetAttributeValue(WP11_Session* session, WP11_Object* obj,
         for (j = 0; j < (int)ulCount; j++) {
             if (attrs[i] == pTemplate[j].type) {
                 attrsFound = 1;
+                present[i] = 1;
                 data[i] = (unsigned char*)pTemplate[j].pValue;
                 if (data[i] == NULL) {
                     /* For CKO_DATA, values can be NULL */
@@ -650,7 +1029,7 @@ static CK_RV SetAttributeValue(WP11_Session* session, WP11_Object* obj,
         }
 #endif
         else if (objClass == CKO_DATA) {
-            ret = WP11_Object_DataObject(obj, data, len);
+            ret = WP11_Object_DataObject(obj, data, len, present);
         }
         else {
             /* Set the value and length of key specific attributes
@@ -667,9 +1046,44 @@ static CK_RV SetAttributeValue(WP11_Session* session, WP11_Object* obj,
                     ret = WP11_Object_SetEcKey(obj, data, len);
                     break;
         #endif
+        #ifdef WOLFPKCS11_MLDSA
+                case CKK_ML_DSA:
+                    ret = WP11_Object_SetMldsaKey(obj, data, len);
+                    break;
+        #endif
         #ifndef NO_DH
                 case CKK_DH:
                     ret = WP11_Object_SetDhKey(obj, data, len);
+                    break;
+        #endif
+        #ifdef WOLFPKCS11_MLKEM
+                case CKK_ML_KEM:
+                    ret = WP11_Object_SetMlKemKey(obj, data, len);
+                    break;
+        #endif
+        #ifdef WOLFPKCS11_LMS
+                case CKK_HSS:
+                    ret = WP11_Object_SetHssKey(obj, data, len);
+                    /* Importing parses the caller-supplied public key, so any
+                     * failure other than out-of-memory means the CKA_VALUE or a
+                     * parameter attribute is bad (wrong length, unknown LMS/LMOTS
+                     * type, unparsable header), not an internal fault. MEMORY_E
+                     * falls through to CKR_DEVICE_MEMORY below. */
+                    if (ret != 0 && ret != MEMORY_E) {
+                        return CKR_ATTRIBUTE_VALUE_INVALID;
+                    }
+                    break;
+        #endif
+        #ifdef WOLFPKCS11_XMSS
+                case CKK_XMSS:
+                case CKK_XMSSMT:
+                    ret = WP11_Object_SetXmssKey(obj, data, len);
+                    /* As for HSS: any non-memory import failure is a bad
+                     * attribute value (truncated key, unknown/invalid OID,
+                     * unparsable header), not an internal fault. */
+                    if (ret != 0 && ret != MEMORY_E) {
+                        return CKR_ATTRIBUTE_VALUE_INVALID;
+                    }
                     break;
         #endif
         #ifndef NO_AES
@@ -703,6 +1117,64 @@ static CK_RV SetAttributeValue(WP11_Session* session, WP11_Object* obj,
 
             if ((getVar == CK_TRUE) && (*(CK_BBOOL*)attr->pValue == CK_FALSE))
                 return CKR_ATTRIBUTE_READ_ONLY;
+        }
+        /* Cannot change extractable from false to true */
+        if (!newObject && attr->type == CKA_EXTRACTABLE) {
+            getVarLen = sizeof(getVar);
+            rv = WP11_Object_GetAttr(obj, CKA_EXTRACTABLE, &getVar,
+                                     &getVarLen);
+            if (rv != CKR_OK)
+                return rv;
+
+            if ((getVar == CK_FALSE) && (*(CK_BBOOL*)attr->pValue == CK_TRUE))
+                return CKR_ATTRIBUTE_READ_ONLY;
+        }
+        /* PKCS#11 v2.40 sec 4.4.1: once CKA_COPYABLE/CKA_DESTROYABLE has been
+         * set to CK_FALSE it cannot be set back to CK_TRUE. Read the stored
+         * flag bit directly so the check is independent of the GetAttr view
+         * (which the legacy macro may override). */
+        if (!newObject && attr->type == CKA_COPYABLE) {
+            if (attr->pValue == NULL ||
+                    attr->ulValueLen != sizeof(CK_BBOOL))
+                return CKR_ATTRIBUTE_VALUE_INVALID;
+            if (!WP11_Object_IsCopyable(obj) &&
+                    *(CK_BBOOL*)attr->pValue == CK_TRUE)
+                return CKR_ATTRIBUTE_READ_ONLY;
+        }
+        if (!newObject && attr->type == CKA_DESTROYABLE) {
+            if (attr->pValue == NULL ||
+                    attr->ulValueLen != sizeof(CK_BBOOL))
+                return CKR_ATTRIBUTE_VALUE_INVALID;
+            if (!WP11_Object_IsDestroyable(obj) &&
+                    *(CK_BBOOL*)attr->pValue == CK_TRUE)
+                return CKR_ATTRIBUTE_READ_ONLY;
+        }
+        /* PKCS#11 v2.40 sec 4.5: only an SO session may set CKA_TRUSTED to
+         * CK_TRUE. A regular-user session must not forge trust and bypass the
+         * CKA_WRAP_WITH_TRUSTED export gate enforced by C_WrapKey. Not
+         * qualified with !newObject so it also stops C_CreateObject /
+         * C_GenerateKey from minting a trusted key. CheckAttributes above has
+         * already validated CKA_TRUSTED as a well-formed CK_BBOOL. */
+        if (attr->type == CKA_TRUSTED &&
+                *(CK_BBOOL*)attr->pValue == CK_TRUE &&
+                WP11_Session_GetState(session) != WP11_APP_STATE_RW_SO) {
+            return CKR_ATTRIBUTE_READ_ONLY;
+        }
+        /* These class/identity and generated-state attributes are read-only
+         * once the object exists; reject a change. Setting the current value
+         * is a no-op. */
+        if (!newObject && (attr->type == CKA_CLASS ||
+                           attr->type == CKA_KEY_TYPE ||
+                           attr->type == CKA_LOCAL ||
+                           attr->type == CKA_KEY_GEN_MECHANISM ||
+                           attr->type == CKA_ALWAYS_SENSITIVE ||
+                           attr->type == CKA_NEVER_EXTRACTABLE)) {
+            roCurLen = sizeof(roCur);
+            if (WP11_Object_GetAttr(obj, attr->type, roCur, &roCurLen) == 0 &&
+                (attr->pValue == NULL || attr->ulValueLen != roCurLen ||
+                 XMEMCMP(attr->pValue, roCur, roCurLen) != 0)) {
+                return CKR_ATTRIBUTE_READ_ONLY;
+            }
         }
         ret = WP11_Object_SetAttr(obj, attr->type, (byte*)attr->pValue,
                                                               attr->ulValueLen);
@@ -747,15 +1219,21 @@ static CK_RV NewObject(WP11_Session* session, CK_KEY_TYPE keyType,
         return CKR_FUNCTION_FAILED;
 
     ret = WP11_Object_SetClass(obj, keyClass);
-    if (ret != 0)
+    if (ret != 0) {
+        WP11_Object_Free(obj);
         return CKR_FUNCTION_FAILED;
+    }
 
     /* Now that object class is set, allocate type-specific data */
     ret = wp11_Object_AllocateTypeData(obj);
-    if (ret == MEMORY_E)
+    if (ret == MEMORY_E) {
+        WP11_Object_Free(obj);
         return CKR_DEVICE_MEMORY;
-    if (ret != 0)
+    }
+    if (ret != 0) {
+        WP11_Object_Free(obj);
         return CKR_FUNCTION_FAILED;
+    }
 
     rv = SetAttributeValue(session, obj, pTemplate, ulCount, CK_TRUE);
     if (rv != CKR_OK) {
@@ -878,7 +1356,7 @@ static CK_RV AddRSAPrivateKeyObject(WP11_Session* session,
         WP11_Object* pubKeyObject = NULL;
         CK_ATTRIBUTE* attr = NULL;
         CK_BBOOL trueVal = CK_TRUE;
-        CK_BBOOL falseVal = CK_TRUE;
+        CK_BBOOL falseVal = CK_FALSE;
 
         CK_OBJECT_HANDLE hPub;
 
@@ -932,8 +1410,7 @@ static CK_RV AddRSAPrivateKeyObject(WP11_Session* session,
 err_out:
     if (rv != CKR_OK) {
         if (*phKey != CK_INVALID_HANDLE) {
-            /* ignore return value, logged in function */
-            (void)WP11_Session_RemoveObject(session, privKeyObject);
+            WP11_Session_RemoveObject(session, privKeyObject);
             *phKey = CK_INVALID_HANDLE;
         }
         if (privKeyObject != NULL) {
@@ -1026,10 +1503,44 @@ static CK_RV CreateObject(WP11_Session* session, CK_ATTRIBUTE_PTR pTemplate,
             return CKR_ATTRIBUTE_VALUE_INVALID;
         objType = *(CK_ULONG*)attr->pValue;
 
-        if (objType != CKK_RSA && objType != CKK_EC && objType != CKK_DH &&
-            objType != CKK_AES && objType != CKK_HKDF &&
-            objType != CKK_GENERIC_SECRET) {
-            return CKR_ATTRIBUTE_VALUE_INVALID;
+        /* Only accept key types whose feature is compiled in. CKA_KEY_TYPE for
+         * a disabled type is rejected here with CKR_ATTRIBUTE_VALUE_INVALID
+         * rather than reaching the SetAttributeValue key-type switch and
+         * returning the less appropriate CKR_OBJECT_HANDLE_INVALID. The cases
+         * mirror that switch. CKK_GENERIC_SECRET is always available. */
+        switch (objType) {
+            case CKK_GENERIC_SECRET:
+        #ifndef NO_RSA
+            case CKK_RSA:
+        #endif
+        #ifdef HAVE_ECC
+            case CKK_EC:
+        #endif
+        #ifndef NO_DH
+            case CKK_DH:
+        #endif
+        #ifndef NO_AES
+            case CKK_AES:
+        #endif
+        #ifdef WOLFPKCS11_HKDF
+            case CKK_HKDF:
+        #endif
+        #ifdef WOLFPKCS11_MLDSA
+            case CKK_ML_DSA:
+        #endif
+        #ifdef WOLFPKCS11_MLKEM
+            case CKK_ML_KEM:
+        #endif
+        #ifdef WOLFPKCS11_LMS
+            case CKK_HSS:
+        #endif
+        #ifdef WOLFPKCS11_XMSS
+            case CKK_XMSS:
+            case CKK_XMSSMT:
+        #endif
+                break;
+            default:
+                return CKR_ATTRIBUTE_VALUE_INVALID;
         }
     }
 
@@ -1062,6 +1573,7 @@ CK_RV C_CreateObject(CK_SESSION_HANDLE hSession, CK_ATTRIBUTE_PTR pTemplate,
     CK_RV rv;
     WP11_Session* session;
     WP11_Object* object;
+    CK_ATTRIBUTE* classAttr = NULL;
 
     WOLFPKCS11_ENTER("C_CreateObject");
     #ifdef DEBUG_WOLFPKCS11
@@ -1085,8 +1597,37 @@ CK_RV C_CreateObject(CK_SESSION_HANDLE hSession, CK_ATTRIBUTE_PTR pTemplate,
         WOLFPKCS11_LEAVE("C_CreateObject", rv);
         return rv;
     }
+    /* Only require R/W session for token objects */
     if (!WP11_Session_IsRW(session)) {
-        rv = CKR_SESSION_READ_ONLY;
+        CK_ATTRIBUTE* tokenAttr = NULL;
+        FindAttributeType(pTemplate, ulCount, CKA_TOKEN, &tokenAttr);
+        if (tokenAttr != NULL) {
+            if (tokenAttr->pValue == NULL ||
+                tokenAttr->ulValueLen != sizeof(CK_BBOOL)) {
+                rv = CKR_ATTRIBUTE_VALUE_INVALID;
+                WOLFPKCS11_LEAVE("C_CreateObject", rv);
+                return rv;
+            }
+            if (*(CK_BBOOL*)tokenAttr->pValue == CK_TRUE) {
+                rv = CKR_SESSION_READ_ONLY;
+                WOLFPKCS11_LEAVE("C_CreateObject", rv);
+                return rv;
+            }
+        }
+    }
+
+    /* C_CreateObject requires CKA_CLASS; there is no API-implied object class
+     * as there is for derive/unwrap. */
+    FindAttributeType(pTemplate, ulCount, CKA_CLASS, &classAttr);
+    if (classAttr == NULL) {
+        rv = CKR_TEMPLATE_INCOMPLETE;
+        WOLFPKCS11_LEAVE("C_CreateObject", rv);
+        return rv;
+    }
+
+    rv = CheckPrivateLogin(session, pTemplate, ulCount,
+                           WP11_NO_IMPLICIT_CLASS);
+    if (rv != CKR_OK) {
         WOLFPKCS11_LEAVE("C_CreateObject", rv);
         return rv;
     }
@@ -1098,8 +1639,7 @@ CK_RV C_CreateObject(CK_SESSION_HANDLE hSession, CK_ATTRIBUTE_PTR pTemplate,
     }
     rv = AddObject(session, object, pTemplate, ulCount, phObject);
     if (rv != CKR_OK) {
-        /* ignore return value, logged in function */
-        (void)WP11_Session_RemoveObject(session, object);
+        WP11_Session_RemoveObject(session, object);
         WP11_Object_Free(object);
     }
 
@@ -1167,18 +1707,11 @@ CK_RV C_CopyObject(CK_SESSION_HANDLE hSession, CK_OBJECT_HANDLE hObject,
         WOLFPKCS11_LEAVE("C_CopyObject", rv);
         return rv;
     }
-    if (!WP11_Session_IsRW(session)) {
-        rv = CKR_SESSION_READ_ONLY;
-        WOLFPKCS11_LEAVE("C_CopyObject", rv);
-        return rv;
-    }
     if (pTemplate == NULL && ulCount > 0) {
         rv = CKR_ARGUMENTS_BAD;
         WOLFPKCS11_LEAVE("C_CopyObject", rv);
         return rv;
     }
-
-
 
     /* Need key type and whether object is to be on the token to create a new
      * object. Get the object type from original object and where to store
@@ -1187,8 +1720,51 @@ CK_RV C_CopyObject(CK_SESSION_HANDLE hSession, CK_OBJECT_HANDLE hObject,
     ret = WP11_Object_Find(session, hObject, &obj);
     if (ret != 0)
         return CKR_OBJECT_HANDLE_INVALID;
+
+    /* Only require R/W session for token objects. The copy inherits the
+     * source object's CKA_TOKEN unless the template overrides it. */
+    if (!WP11_Session_IsRW(session)) {
+        int willBeOnToken = WP11_Object_OnToken(obj);
+        CK_ATTRIBUTE* tokenAttr = NULL;
+        FindAttributeType(pTemplate, ulCount, CKA_TOKEN, &tokenAttr);
+        if (tokenAttr != NULL && tokenAttr->pValue != NULL &&
+            tokenAttr->ulValueLen == sizeof(CK_BBOOL)) {
+            willBeOnToken = *(CK_BBOOL*)tokenAttr->pValue;
+        }
+        if (willBeOnToken) {
+            rv = CKR_SESSION_READ_ONLY;
+            WOLFPKCS11_LEAVE("C_CopyObject", rv);
+            return rv;
+        }
+    }
+
+    /* Reject copy of objects whose CKA_COPYABLE has been explicitly set to
+     * CK_FALSE. Read the underlying flag bit directly so this gate is not
+     * affected by WOLFPKCS11_LEGACY_COPYABLE_FALSE_DEFAULT (which only
+     * changes the C_GetAttributeValue view). */
+    if (!WP11_Object_IsCopyable(obj)) {
+        rv = CKR_ACTION_PROHIBITED;
+        WOLFPKCS11_LEAVE("C_CopyObject", rv);
+        return rv;
+    }
+
+    /* Creating a private object requires an authenticated user session. The
+     * copy template can set CKA_PRIVATE=CK_TRUE, so gate it like
+     * C_CreateObject. The copy's default CKA_PRIVATE is inherited from the
+     * source object, whose own login requirement was already enforced by
+     * WP11_Object_Find above, so only an explicit template override is checked
+     * here (WP11_NO_IMPLICIT_CLASS = template inspection only). */
+    rv = CheckPrivateLogin(session, pTemplate, ulCount, WP11_NO_IMPLICIT_CLASS);
+    if (rv != CKR_OK) {
+        WOLFPKCS11_LEAVE("C_CopyObject", rv);
+        return rv;
+    }
+
     keyType = WP11_Object_GetType(obj);
 
+    /* The copy inherits the source's CKA_TOKEN (PKCS#11 v2.40 4.6.2) unless
+     * the template overrides it below. */
+    onToken = WP11_Object_OnToken(obj);
     FindAttributeType(pTemplate, ulCount, CKA_TOKEN, &attr);
     if (attr != NULL) {
         if (attr->pValue == NULL)
@@ -1206,21 +1782,29 @@ CK_RV C_CopyObject(CK_SESSION_HANDLE hSession, CK_OBJECT_HANDLE hObject,
 
     /* Set the object class from the original object */
     ret = WP11_Object_SetClass(newObj, WP11_Object_GetClass(obj));
-    if (ret != 0)
+    if (ret != 0) {
+        WP11_Object_Free(newObj);
         return CKR_FUNCTION_FAILED;
+    }
 
     /* Now that object class is set, allocate type-specific data */
     ret = wp11_Object_AllocateTypeData(newObj);
-    if (ret == MEMORY_E)
+    if (ret == MEMORY_E) {
+        WP11_Object_Free(newObj);
         return CKR_DEVICE_MEMORY;
-    if (ret != 0)
+    }
+    if (ret != 0) {
+        WP11_Object_Free(newObj);
         return CKR_FUNCTION_FAILED;
+    }
 
     /* copy all the attributes from the original object to the new object */
-    rv = WP11_Object_Copy(obj, newObj);
-    if (rv != CKR_OK) {
+    ret = WP11_Object_Copy(obj, newObj);
+    if (ret != 0) {
         WP11_Object_Free(newObj);
-        return rv;
+        if (ret == MEMORY_E)
+            return CKR_DEVICE_MEMORY;
+        return CKR_FUNCTION_FAILED;
     }
 
     if (pTemplate != NULL) {
@@ -1257,6 +1841,7 @@ CK_RV C_DestroyObject(CK_SESSION_HANDLE hSession,
                       CK_OBJECT_HANDLE hObject)
 {
     int ret;
+    int onToken;
     CK_RV rv;
     WP11_Session* session;
     WP11_Object* obj = NULL;
@@ -1278,11 +1863,6 @@ CK_RV C_DestroyObject(CK_SESSION_HANDLE hSession,
         WOLFPKCS11_LEAVE("C_DestroyObject", rv);
         return rv;
     }
-    if (!WP11_Session_IsRW(session)) {
-        rv = CKR_SESSION_READ_ONLY;
-        WOLFPKCS11_LEAVE("C_DestroyObject", rv);
-        return rv;
-    }
 
     ret = WP11_Object_Find(session, hObject, &obj);
     if (ret != 0) {
@@ -1290,10 +1870,47 @@ CK_RV C_DestroyObject(CK_SESSION_HANDLE hSession,
         WOLFPKCS11_LEAVE("C_DestroyObject", rv);
         return rv;
     }
+    /* Derive onToken from the handle, not the object: it stays valid even if a
+     * concurrent destroy of the same handle frees the object out from under
+     * us, and it lets WP11_Session_RemoveObjectByHandle unlink token objects
+     * using pointer identity alone. */
+    onToken = WP11_Object_HandleOnToken(hObject);
 
-    rv = WP11_Session_RemoveObject(session, obj);
+    /* Only require R/W session for token objects */
+    if (!WP11_Session_IsRW(session) && onToken) {
+        rv = CKR_SESSION_READ_ONLY;
+        WOLFPKCS11_LEAVE("C_DestroyObject", rv);
+        return rv;
+    }
+
+    /* Remove and reject-if-not-destroyable in one locked step. The
+     * CKA_DESTROYABLE check is performed inside WP11_Session_RemoveObjectByHandle,
+     * once the object is confirmed still linked (and therefore alive), so it
+     * cannot race a concurrent free of the same handle. */
+    ret = WP11_Session_RemoveObjectByHandle(session, obj, onToken,
+                                            1 /* checkDestroyable */);
+    if (ret == WP11_OBJECT_ALREADY_REMOVED) {
+        /* Another thread destroyed this object first (a concurrent
+         * C_DestroyObject on the same shared token-object handle). That thread
+         * owns the free; do not touch the object again. */
+        rv = CKR_OBJECT_HANDLE_INVALID;
+        WOLFPKCS11_LEAVE("C_DestroyObject", rv);
+        return rv;
+    }
+    if (ret == WP11_OBJECT_NOT_DESTROYABLE) {
+        /* CKA_DESTROYABLE is CK_FALSE; object left in place. */
+        rv = CKR_ACTION_PROHIBITED;
+        WOLFPKCS11_LEAVE("C_DestroyObject", rv);
+        return rv;
+    }
+    /* Drop any active-operation reference to this object before freeing it so a
+     * pending operation cannot use freed memory. */
+    WP11_Slot_ClearActiveObject(WP11_Session_GetSlot(session), obj);
     WP11_Object_Free(obj);
 
+    /* The object was unlinked; a negative status means persisting the token
+     * afterwards failed. Surface it rather than reporting success. */
+    rv = (ret < 0) ? CKR_FUNCTION_FAILED : CKR_OK;
     WOLFPKCS11_LEAVE("C_DestroyObject", rv);
     return rv;
 }
@@ -1420,35 +2037,38 @@ CK_RV C_GetAttributeValue(CK_SESSION_HANDLE hSession,
         return rv;
     }
 
-    /* Check the value and lengths of attributes based on data type. */
-    rv = CheckAttributes(pTemplate, ulCount, 0);
-    if (rv != CKR_OK) {
-        WOLFPKCS11_LEAVE("C_GetAttributeValue", rv);
-        return rv;
-    }
-
+    rv = CKR_OK;
     for (i = 0; i < (int)ulCount; i++) {
         attr = &pTemplate[i];
+
+        if (!IsKnownAttrType(attr->type)) {
+            attr->ulValueLen = (CK_ULONG)-1;
+            if (rv == CKR_OK)
+                rv = CKR_ATTRIBUTE_TYPE_INVALID;
+            continue;
+        }
 
         ret = WP11_Object_GetAttr(obj, attr->type, (byte*)attr->pValue,
                                                              &attr->ulValueLen);
         if (ret == BAD_FUNC_ARG) {
-            rv = CKR_ATTRIBUTE_TYPE_INVALID;
-            WOLFPKCS11_LEAVE("C_GetAttributeValue", rv);
-            return rv;
-        }
-        else if (ret == BUFFER_E) {
-            rv = CKR_BUFFER_TOO_SMALL;
-            WOLFPKCS11_LEAVE("C_GetAttributeValue", rv);
-            return rv;
+            attr->ulValueLen = (CK_ULONG)-1;
+            if (rv == CKR_OK)
+                rv = CKR_ATTRIBUTE_TYPE_INVALID;
         }
         else if (ret == NOT_AVAILABLE_E) {
-            rv = CK_UNAVAILABLE_INFORMATION;
-            WOLFPKCS11_LEAVE("C_GetAttributeValue", rv);
-            return rv;
+            attr->ulValueLen = (CK_ULONG)-1;
+            if (rv == CKR_OK)
+                rv = CK_UNAVAILABLE_INFORMATION;
         }
-        else if (ret == CKR_ATTRIBUTE_SENSITIVE)
-            rv = ret;
+        else if (ret == BUFFER_E) {
+            if (rv == CKR_OK)
+                rv = CKR_BUFFER_TOO_SMALL;
+        }
+        else if (ret == CKR_ATTRIBUTE_SENSITIVE) {
+            attr->ulValueLen = (CK_ULONG)-1;
+            if (rv == CKR_OK)
+                rv = ret;
+        }
         else if (ret != 0) {
             rv = CKR_FUNCTION_FAILED;
             WOLFPKCS11_LEAVE("C_GetAttributeValue", rv);
@@ -1514,15 +2134,27 @@ CK_RV C_SetAttributeValue(CK_SESSION_HANDLE hSession,
         WOLFPKCS11_LEAVE("C_SetAttributeValue", rv);
         return rv;
     }
-    if (!WP11_Session_IsRW(session)) {
+
+    ret = WP11_Object_Find(session, hObject, &obj);
+    if (ret != 0) {
+        rv = CKR_OBJECT_HANDLE_INVALID;
+        WOLFPKCS11_LEAVE("C_SetAttributeValue", rv);
+        return rv;
+    }
+
+    /* Only require R/W session for token objects */
+    if (!WP11_Session_IsRW(session) && WP11_Object_OnToken(obj)) {
         rv = CKR_SESSION_READ_ONLY;
         WOLFPKCS11_LEAVE("C_SetAttributeValue", rv);
         return rv;
     }
 
-    ret = WP11_Object_Find(session, hObject, &obj);
-    if (ret != 0) {
-        rv = CKR_OBJECT_HANDLE_INVALID;
+    /* PKCS#11 v2.40 sec 4.4.1: an object with CKA_MODIFIABLE=CK_FALSE must
+     * reject all attribute changes (Fenrir 1343). Gate only the public
+     * entry point - C_CopyObject also uses SetAttributeValue with
+     * newObject=FALSE but is governed by CKA_COPYABLE, not CKA_MODIFIABLE. */
+    if (!WP11_Object_IsModifiable(obj)) {
+        rv = CKR_ACTION_PROHIBITED;
         WOLFPKCS11_LEAVE("C_SetAttributeValue", rv);
         return rv;
     }
@@ -1534,7 +2166,7 @@ CK_RV C_SetAttributeValue(CK_SESSION_HANDLE hSession,
 
 /**
  * Initialize the finding of an object associated with the session.
- * All matching objects are found, up to a limit, by this call.
+ * All matching objects are found by this call.
  *
  * @param  hSession   [in]  Handle of session.
  * @param  pTemplate  [in]  Template of attributes match against object.
@@ -1554,6 +2186,7 @@ CK_RV C_FindObjectsInit(CK_SESSION_HANDLE hSession,
     CK_RV rv;
     WP11_Session* session;
     CK_ATTRIBUTE* attr;
+    int ret;
     int onToken = 1;
 
     WOLFPKCS11_ENTER("C_FindObjectsInit");
@@ -1573,14 +2206,15 @@ CK_RV C_FindObjectsInit(CK_SESSION_HANDLE hSession,
         WOLFPKCS11_LEAVE("C_FindObjectsInit", rv);
         return rv;
     }
-    if (pTemplate == NULL) {
+    if (pTemplate == NULL && ulCount != 0) {
         rv = CKR_ARGUMENTS_BAD;
         WOLFPKCS11_LEAVE("C_FindObjectsInit", rv);
         return rv;
     }
 
-    if (WP11_Session_FindInit(session) != 0) {
-        rv = CKR_OPERATION_ACTIVE;
+    ret = WP11_Session_FindInit(session);
+    if (ret != 0) {
+        rv = ret == MEMORY_E ? CKR_HOST_MEMORY : CKR_OPERATION_ACTIVE;
         WOLFPKCS11_LEAVE("C_FindObjectsInit", rv);
         return rv;
     }
@@ -1588,11 +2222,13 @@ CK_RV C_FindObjectsInit(CK_SESSION_HANDLE hSession,
     FindAttributeType(pTemplate, ulCount, CKA_TOKEN, &attr);
     if (attr != NULL) {
         if (attr->pValue == NULL) {
+            WP11_Session_FindFinal(session);
             rv = CKR_ATTRIBUTE_VALUE_INVALID;
             WOLFPKCS11_LEAVE("C_FindObjectsInit", rv);
             return rv;
         }
         if (attr->ulValueLen != sizeof(CK_BBOOL)) {
+            WP11_Session_FindFinal(session);
             rv = CKR_ATTRIBUTE_VALUE_INVALID;
             WOLFPKCS11_LEAVE("C_FindObjectsInit", rv);
             return rv;
@@ -1600,7 +2236,13 @@ CK_RV C_FindObjectsInit(CK_SESSION_HANDLE hSession,
         onToken = *(CK_BBOOL*)attr->pValue;
     }
 
-    WP11_Session_Find(session, onToken, pTemplate, ulCount);
+    ret = WP11_Session_Find(session, onToken, pTemplate, ulCount);
+    if (ret != 0) {
+        WP11_Session_FindFinal(session);
+        rv = ret == MEMORY_E ? CKR_HOST_MEMORY : CKR_FUNCTION_FAILED;
+        WOLFPKCS11_LEAVE("C_FindObjectsInit", rv);
+        return rv;
+    }
 
     rv = CKR_OK;
     WOLFPKCS11_LEAVE("C_FindObjectsInit", rv);
@@ -1654,6 +2296,12 @@ CK_RV C_FindObjects(CK_SESSION_HANDLE hSession,
         return rv;
     }
 
+    if (!WP11_Session_IsFindActive(session)) {
+        rv = CKR_OPERATION_NOT_INITIALIZED;
+        WOLFPKCS11_LEAVE("C_FindObjects", rv);
+        return rv;
+    }
+
     for (i = 0; i < (int)ulMaxObjectCount; i++) {
         if (WP11_Session_FindGet(session, &handle) == FIND_NO_MORE_E)
             break;
@@ -1694,6 +2342,12 @@ CK_RV C_FindObjectsFinal(CK_SESSION_HANDLE hSession)
     }
     if (WP11_Session_Get(hSession, &session) != 0) {
         rv = CKR_SESSION_HANDLE_INVALID;
+        WOLFPKCS11_LEAVE("C_FindObjectsFinal", rv);
+        return rv;
+    }
+
+    if (!WP11_Session_IsFindActive(session)) {
+        rv = CKR_OPERATION_NOT_INITIALIZED;
         WOLFPKCS11_LEAVE("C_FindObjectsFinal", rv);
         return rv;
     }
@@ -1751,6 +2405,12 @@ static CK_RV EncryptInit(CK_SESSION_HANDLE hSession,
         ret = CheckOpSupported(obj, CKA_ENCRYPT);
         if (ret != CKR_OK)
             return ret;
+    }
+
+    if (WP11_Session_IsOpCategoryActive(session, WP11_OP_ENCRYPT)) {
+        rv = CKR_OPERATION_ACTIVE;
+        WOLFPKCS11_LEAVE("C_EncryptInit", rv);
+        return rv;
     }
 
     type = WP11_Object_GetType(obj);
@@ -2028,7 +2688,7 @@ CK_RV C_Encrypt(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pData,
                 CK_ULONG_PTR pulEncryptedDataLen)
 {
     CK_RV rv;
-    int ret;
+    int ret = 0;
     WP11_Session* session;
     WP11_Object* obj = NULL;
     word32 encDataLen;
@@ -2081,7 +2741,7 @@ CK_RV C_Encrypt(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pData,
                                                  &encDataLen, obj,
                                                  WP11_Session_GetSlot(session));
             if (ret < 0)
-                return CKR_FUNCTION_FAILED;
+                break;
             *pulEncryptedDataLen = encDataLen;
             break;
         case CKM_RSA_PKCS:
@@ -2100,7 +2760,7 @@ CK_RV C_Encrypt(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pData,
                                                pEncryptedData, &encDataLen, obj,
                                                WP11_Session_GetSlot(session));
             if (ret < 0)
-                return CKR_FUNCTION_FAILED;
+                break;
             *pulEncryptedDataLen = encDataLen;
             break;
     #ifndef WC_NO_RSA_OAEP
@@ -2122,7 +2782,7 @@ CK_RV C_Encrypt(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pData,
                                                pEncryptedData, &encDataLen, obj,
                                                session);
             if (ret < 0)
-                return CKR_FUNCTION_FAILED;
+                break;
             *pulEncryptedDataLen = encDataLen;
             break;
     #endif
@@ -2132,6 +2792,10 @@ CK_RV C_Encrypt(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pData,
         case CKM_AES_CBC:
             if (!WP11_Session_IsOpInitialized(session, WP11_INIT_AES_CBC_ENC))
                 return CKR_OPERATION_NOT_INITIALIZED;
+            if (!CK_ULONG_FITS_WORD32(ulDataLen)) {
+                WP11_Session_SetOpInitialized(session, 0);
+                return CKR_DATA_LEN_RANGE;
+            }
 
             encDataLen = (word32)ulDataLen;
             if (pEncryptedData == NULL) {
@@ -2144,7 +2808,7 @@ CK_RV C_Encrypt(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pData,
             ret = WP11_AesCbc_Encrypt(pData, (int)ulDataLen, pEncryptedData,
                                                           &encDataLen, session);
             if (ret < 0)
-                return CKR_FUNCTION_FAILED;
+                break;
             *pulEncryptedDataLen = encDataLen;
             break;
         case CKM_AES_CBC_PAD:
@@ -2152,10 +2816,19 @@ CK_RV C_Encrypt(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pData,
                                                    WP11_INIT_AES_CBC_PAD_ENC)) {
                 return CKR_OPERATION_NOT_INITIALIZED;
             }
+            if (!CK_ULONG_FITS_WORD32(ulDataLen)) {
+                WP11_Session_SetOpInitialized(session, 0);
+                return CKR_DATA_LEN_RANGE;
+            }
+            /* Ensure padded result fits in word32 */
+            if (ulDataLen > (CK_ULONG)(0xFFFFFFFF - AES_BLOCK_SIZE)) {
+                WP11_Session_SetOpInitialized(session, 0);
+                return CKR_DATA_LEN_RANGE;
+            }
 
-            /* PKCS#5 pad makes the output a multiple of 16 */
-            encDataLen = (word32)((ulDataLen + AES_BLOCK_SIZE - 1) /
-                        AES_BLOCK_SIZE) * AES_BLOCK_SIZE;
+            /* PKCS#7 padding always adds at least 1 byte */
+            encDataLen = (word32)((ulDataLen / AES_BLOCK_SIZE) + 1) *
+                        AES_BLOCK_SIZE;
             if (pEncryptedData == NULL) {
                 *pulEncryptedDataLen = encDataLen;
                 return CKR_OK;
@@ -2166,7 +2839,7 @@ CK_RV C_Encrypt(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pData,
             ret = WP11_AesCbcPad_Encrypt(pData, (int)ulDataLen, pEncryptedData,
                                                           &encDataLen, session);
             if (ret < 0)
-                return CKR_FUNCTION_FAILED;
+                break;
             *pulEncryptedDataLen = encDataLen;
             break;
     #endif
@@ -2185,8 +2858,10 @@ CK_RV C_Encrypt(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pData,
             encDataLen = (word32)*pulEncryptedDataLen;
             ret = WP11_AesCtr_Do(pData, (word32)ulDataLen, pEncryptedData,
                                  &encDataLen, session);
+            if (ret == WP11_CTR_OVERFLOW_E)
+                return CKR_DATA_LEN_RANGE;
             if (ret != 0)
-                return CKR_FUNCTION_FAILED;
+                break;
             *pulEncryptedDataLen = encDataLen;
             break;
     #endif
@@ -2194,6 +2869,10 @@ CK_RV C_Encrypt(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pData,
         case CKM_AES_GCM:
             if (!WP11_Session_IsOpInitialized(session, WP11_INIT_AES_GCM_ENC))
                 return CKR_OPERATION_NOT_INITIALIZED;
+            if (!CK_ULONG_FITS_WORD32(ulDataLen)) {
+                WP11_Session_SetOpInitialized(session, 0);
+                return CKR_DATA_LEN_RANGE;
+            }
 
             encDataLen = (word32)ulDataLen +
                                             WP11_AesGcm_GetTagBits(session) / 8;
@@ -2207,7 +2886,7 @@ CK_RV C_Encrypt(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pData,
             ret = WP11_AesGcm_Encrypt(pData, (int)ulDataLen, pEncryptedData,
                                                      &encDataLen, obj, session);
             if (ret < 0)
-                return CKR_FUNCTION_FAILED;
+                break;
             *pulEncryptedDataLen = encDataLen;
             break;
     #endif
@@ -2215,6 +2894,10 @@ CK_RV C_Encrypt(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pData,
         case CKM_AES_CCM:
             if (!WP11_Session_IsOpInitialized(session, WP11_INIT_AES_CCM_ENC))
                 return CKR_OPERATION_NOT_INITIALIZED;
+            if (!CK_ULONG_FITS_WORD32(ulDataLen)) {
+                WP11_Session_SetOpInitialized(session, 0);
+                return CKR_DATA_LEN_RANGE;
+            }
 
             encDataLen = (word32)ulDataLen +
                                             WP11_AesCcm_GetMacLen(session);
@@ -2228,7 +2911,7 @@ CK_RV C_Encrypt(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pData,
             ret = WP11_AesCcm_Encrypt(pData, (int)ulDataLen, pEncryptedData,
                                       &encDataLen, obj, session);
             if (ret < 0)
-                return CKR_FUNCTION_FAILED;
+                break;
             *pulEncryptedDataLen = encDataLen;
             break;
     #endif
@@ -2236,6 +2919,10 @@ CK_RV C_Encrypt(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pData,
         case CKM_AES_ECB:
             if (!WP11_Session_IsOpInitialized(session, WP11_INIT_AES_ECB_ENC))
                 return CKR_OPERATION_NOT_INITIALIZED;
+            if (!CK_ULONG_FITS_WORD32(ulDataLen)) {
+                WP11_Session_SetOpInitialized(session, 0);
+                return CKR_DATA_LEN_RANGE;
+            }
 
             encDataLen = (word32)ulDataLen;
             if (pEncryptedData == NULL) {
@@ -2248,7 +2935,7 @@ CK_RV C_Encrypt(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pData,
             ret = WP11_AesEcb_Encrypt(pData, (int)ulDataLen, pEncryptedData,
                                       &encDataLen, obj, session);
             if (ret < 0)
-                return CKR_FUNCTION_FAILED;
+                break;
             *pulEncryptedDataLen = encDataLen;
             break;
     #endif
@@ -2268,7 +2955,7 @@ CK_RV C_Encrypt(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pData,
             ret = WP11_AesCts_Encrypt(pData, (int)ulDataLen, pEncryptedData,
                                                           &encDataLen, session);
             if (ret < 0)
-                return CKR_FUNCTION_FAILED;
+                break;
             *pulEncryptedDataLen = encDataLen;
             break;
     #endif
@@ -2276,6 +2963,10 @@ CK_RV C_Encrypt(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pData,
         case CKM_AES_KEY_WRAP:
             if (!WP11_Session_IsOpInitialized(session, WP11_INIT_AES_KEYWRAP_ENC))
                 return CKR_OPERATION_NOT_INITIALIZED;
+            if (!CK_ULONG_FITS_WORD32(ulDataLen)) {
+                WP11_Session_SetOpInitialized(session, 0);
+                return CKR_DATA_LEN_RANGE;
+            }
 
             /* AES Key Wrap adds 8 bytes for the integrity check value */
             encDataLen = (word32)(ulDataLen + KEYWRAP_BLOCK_SIZE);
@@ -2289,38 +2980,35 @@ CK_RV C_Encrypt(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pData,
             ret = WP11_AesKeyWrap_Encrypt(pData, (word32)ulDataLen,
                                           pEncryptedData, &encDataLen, session);
             if (ret != 0)
-                return CKR_FUNCTION_FAILED;
+                break;
             *pulEncryptedDataLen = encDataLen;
             break;
         case CKM_AES_KEY_WRAP_PAD: {
-            byte* paddedData = NULL;
-            byte padding = KEYWRAP_BLOCK_SIZE - (ulDataLen % KEYWRAP_BLOCK_SIZE);
+            word32 padded;
 
             if (!WP11_Session_IsOpInitialized(session, WP11_INIT_AES_KEYWRAP_ENC))
                 return CKR_OPERATION_NOT_INITIALIZED;
+            if (!CK_ULONG_FITS_WORD32(ulDataLen) || ulDataLen == 0) {
+                WP11_Session_SetOpInitialized(session, 0);
+                return CKR_DATA_LEN_RANGE;
+            }
 
-            /* AES Key Wrap Pad adds up to 16 bytes for the integrity check
-             * value and padding */
-            encDataLen = (word32)(ulDataLen + KEYWRAP_BLOCK_SIZE + padding);
+            /* RFC 5649: round the input up to a multiple of 8 then add the
+             * 8-byte AIV. Aligned inputs are not over-padded. */
+            padded = ((word32)ulDataLen + KEYWRAP_BLOCK_SIZE - 1) &
+                     ~(word32)(KEYWRAP_BLOCK_SIZE - 1);
+            encDataLen = padded + KEYWRAP_BLOCK_SIZE;
             if (pEncryptedData == NULL) {
                 *pulEncryptedDataLen = encDataLen;
                 return CKR_OK;
             }
             if (encDataLen > (word32)*pulEncryptedDataLen)
                 return CKR_BUFFER_TOO_SMALL;
-            paddedData = (byte*)XMALLOC(ulDataLen + padding, NULL,
-                                        DYNAMIC_TYPE_TMP_BUFFER);
-            if (paddedData == NULL)
-                return CKR_DEVICE_MEMORY;
-            XMEMCPY(paddedData, pData, ulDataLen);
-            XMEMSET(paddedData + ulDataLen, padding, padding);
 
-            ret = WP11_AesKeyWrap_Encrypt(paddedData, (word32)ulDataLen + padding,
+            ret = WP11_AesKeyWrapPad_Encrypt(pData, (word32)ulDataLen,
                                           pEncryptedData, &encDataLen, session);
-            XMEMSET(paddedData, 0, ulDataLen + padding);
-            XFREE(paddedData, NULL, DYNAMIC_TYPE_TMP_BUFFER);
             if (ret != 0)
-                return CKR_FUNCTION_FAILED;
+                break;
             *pulEncryptedDataLen = encDataLen;
             break;
         }
@@ -2331,9 +3019,13 @@ CK_RV C_Encrypt(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pData,
             (void)encDataLen;
             (void)ulDataLen;
             (void)pEncryptedData;
+            WP11_Session_SetOpInitialized(session, 0);
             return CKR_MECHANISM_INVALID;
     }
 
+    WP11_Session_SetOpInitialized(session, 0);
+    if (ret != 0)
+        return CKR_FUNCTION_FAILED;
     return CKR_OK;
 }
 
@@ -2406,6 +3098,10 @@ CK_RV C_EncryptUpdate(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pPart,
                 WOLFPKCS11_LEAVE("C_EncryptUpdate", rv);
                 return rv;
             }
+            if (!CK_ULONG_FITS_WORD32(ulPartLen)) {
+                WP11_Session_SetOpInitialized(session, 0);
+                return CKR_DATA_LEN_RANGE;
+            }
 
             encPartLen = (word32)ulPartLen + WP11_AesCbc_PartLen(session);
             encPartLen &= ~0xf;
@@ -2425,6 +3121,7 @@ CK_RV C_EncryptUpdate(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pPart,
                                                     pEncryptedPart, &encPartLen,
                                                     session);
             if (ret < 0) {
+                WP11_Session_SetOpInitialized(session, 0);
                 rv = CKR_FUNCTION_FAILED;
                 WOLFPKCS11_LEAVE("C_EncryptUpdate", rv);
                 return rv;
@@ -2435,6 +3132,10 @@ CK_RV C_EncryptUpdate(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pPart,
             if (!WP11_Session_IsOpInitialized(session,
                                                    WP11_INIT_AES_CBC_PAD_ENC)) {
                 return CKR_OPERATION_NOT_INITIALIZED;
+            }
+            if (!CK_ULONG_FITS_WORD32(ulPartLen)) {
+                WP11_Session_SetOpInitialized(session, 0);
+                return CKR_DATA_LEN_RANGE;
             }
 
             encPartLen = (word32)ulPartLen + WP11_AesCbc_PartLen(session);
@@ -2448,8 +3149,10 @@ CK_RV C_EncryptUpdate(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pPart,
 
             ret = WP11_AesCbcPad_EncryptUpdate(pPart, (int)ulPartLen,
                                           pEncryptedPart, &encPartLen, session);
-            if (ret < 0)
+            if (ret < 0) {
+                WP11_Session_SetOpInitialized(session, 0);
                 return CKR_FUNCTION_FAILED;
+            }
             *pulEncryptedPartLen = encPartLen;
             break;
     #endif
@@ -2468,8 +3171,14 @@ CK_RV C_EncryptUpdate(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pPart,
             encPartLen = (word32)*pulEncryptedPartLen;
             ret = WP11_AesCtr_Update(pPart, (int)ulPartLen, pEncryptedPart,
                                      &encPartLen, session);
-            if (ret < 0)
+            if (ret == WP11_CTR_OVERFLOW_E) {
+                WP11_AesCtr_Final(session);
+                return CKR_DATA_LEN_RANGE;
+            }
+            if (ret < 0) {
+                WP11_Session_SetOpInitialized(session, 0);
                 return CKR_FUNCTION_FAILED;
+            }
             *pulEncryptedPartLen = encPartLen;
             break;
     #endif
@@ -2489,8 +3198,10 @@ CK_RV C_EncryptUpdate(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pPart,
             ret = WP11_AesGcm_EncryptUpdate(pPart, (int)ulPartLen,
                                                pEncryptedPart, &encPartLen, obj,
                                                session);
-            if (ret < 0)
+            if (ret < 0) {
+                WP11_Session_SetOpInitialized(session, 0);
                 return CKR_FUNCTION_FAILED;
+            }
             *pulEncryptedPartLen = encPartLen;
             break;
     #endif
@@ -2509,8 +3220,10 @@ CK_RV C_EncryptUpdate(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pPart,
                                           pEncryptedPart, &encPartLen, session);
             if (ret == BUFFER_E)
                 return CKR_BUFFER_TOO_SMALL;
-            if (ret < 0)
+            if (ret < 0) {
+                WP11_Session_SetOpInitialized(session, 0);
                 return CKR_FUNCTION_FAILED;
+            }
             *pulEncryptedPartLen = encPartLen;
             break;
     #endif
@@ -2520,6 +3233,7 @@ CK_RV C_EncryptUpdate(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pPart,
             (void)ret;
             (void)ulPartLen;
             (void)pEncryptedPart;
+            WP11_Session_SetOpInitialized(session, 0);
             rv = CKR_MECHANISM_INVALID;
             WOLFPKCS11_LEAVE("C_EncryptUpdate", rv);
             return rv;
@@ -2592,6 +3306,7 @@ CK_RV C_EncryptFinal(CK_SESSION_HANDLE hSession,
             encPartLen = WP11_AesCbc_PartLen(session);
             if (encPartLen != 0) {
                 WP11_AesCbc_EncryptFinal(session);
+                WP11_Session_SetOpInitialized(session, 0);
                 return CKR_DATA_LEN_RANGE;
             }
             *pulLastEncryptedPartLen = 0;
@@ -2599,8 +3314,10 @@ CK_RV C_EncryptFinal(CK_SESSION_HANDLE hSession,
                 return CKR_OK;
 
             ret = WP11_AesCbc_EncryptFinal(session);
-            if (ret < 0)
+            if (ret < 0) {
+                WP11_Session_SetOpInitialized(session, 0);
                 return CKR_FUNCTION_FAILED;
+            }
             break;
         case CKM_AES_CBC_PAD:
             if (!WP11_Session_IsOpInitialized(session,
@@ -2618,8 +3335,10 @@ CK_RV C_EncryptFinal(CK_SESSION_HANDLE hSession,
 
             ret = WP11_AesCbcPad_EncryptFinal(pLastEncryptedPart, &encPartLen,
                                                                        session);
-            if (ret < 0)
+            if (ret < 0) {
+                WP11_Session_SetOpInitialized(session, 0);
                 return CKR_FUNCTION_FAILED;
+            }
             break;
     #endif
     #ifdef HAVE_AESCTR
@@ -2633,8 +3352,10 @@ CK_RV C_EncryptFinal(CK_SESSION_HANDLE hSession,
             }
 
             ret = WP11_AesCtr_Final(session);
-            if (ret < 0)
+            if (ret < 0) {
+                WP11_Session_SetOpInitialized(session, 0);
                 return CKR_FUNCTION_FAILED;
+            }
             *pulLastEncryptedPartLen = 0;
             break;
     #endif
@@ -2652,9 +3373,11 @@ CK_RV C_EncryptFinal(CK_SESSION_HANDLE hSession,
                 return CKR_BUFFER_TOO_SMALL;
 
             ret = WP11_AesGcm_EncryptFinal(pLastEncryptedPart, &encPartLen,
-                                                                       session);
-            if (ret < 0)
+                                                                  obj, session);
+            if (ret < 0) {
+                WP11_Session_SetOpInitialized(session, 0);
                 return CKR_FUNCTION_FAILED;
+            }
             *pulLastEncryptedPartLen = encPartLen;
             break;
     #endif
@@ -2673,8 +3396,10 @@ CK_RV C_EncryptFinal(CK_SESSION_HANDLE hSession,
                                            session);
             if (ret == BUFFER_E)
                 return CKR_BUFFER_TOO_SMALL;
-            if (ret < 0)
+            if (ret < 0) {
+                WP11_Session_SetOpInitialized(session, 0);
                 return CKR_FUNCTION_FAILED;
+            }
             *pulLastEncryptedPartLen = encPartLen;
             break;
     #endif
@@ -2683,9 +3408,11 @@ CK_RV C_EncryptFinal(CK_SESSION_HANDLE hSession,
             (void)encPartLen;
             (void)ret;
             (void)pLastEncryptedPart;
+            WP11_Session_SetOpInitialized(session, 0);
             return CKR_MECHANISM_INVALID;
     }
 
+    WP11_Session_SetOpInitialized(session, 0);
     return CKR_OK;
 }
 
@@ -2725,6 +3452,12 @@ static CK_RV DecryptInit(CK_SESSION_HANDLE hSession,
         ret = CheckOpSupported(obj, CKA_DECRYPT);
         if (ret != CKR_OK)
             return ret;
+    }
+
+    if (WP11_Session_IsOpCategoryActive(session, WP11_OP_DECRYPT)) {
+        rv = CKR_OPERATION_ACTIVE;
+        WOLFPKCS11_LEAVE("C_DecryptInit", rv);
+        return rv;
     }
 
     type = WP11_Object_GetType(obj);
@@ -2994,7 +3727,7 @@ CK_RV C_Decrypt(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pEncryptedData,
                 CK_ULONG ulEncryptedDataLen, CK_BYTE_PTR pData,
                 CK_ULONG_PTR pulDataLen)
 {
-    int ret;
+    int ret = 0;
     WP11_Session* session;
     WP11_Object* obj = NULL;
     word32 decDataLen;
@@ -3042,7 +3775,7 @@ CK_RV C_Decrypt(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pEncryptedData,
                                                  &decDataLen, obj,
                                                  WP11_Session_GetSlot(session));
             if (ret < 0)
-                return CKR_ENCRYPTED_DATA_INVALID;
+                break;
             *pulDataLen = decDataLen;
             break;
         case CKM_RSA_PKCS:
@@ -3062,7 +3795,7 @@ CK_RV C_Decrypt(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pEncryptedData,
                                                  &decDataLen, obj,
                                                  WP11_Session_GetSlot(session));
             if (ret < 0)
-                return CKR_ENCRYPTED_DATA_INVALID;
+                break;
             *pulDataLen = decDataLen;
             break;
     #ifndef WC_NO_RSA_OAEP
@@ -3084,7 +3817,7 @@ CK_RV C_Decrypt(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pEncryptedData,
                                                  (int)ulEncryptedDataLen, pData,
                                                  &decDataLen, obj, session);
             if (ret < 0)
-                return CKR_ENCRYPTED_DATA_INVALID;
+                break;
             *pulDataLen = decDataLen;
             break;
     #endif
@@ -3094,6 +3827,10 @@ CK_RV C_Decrypt(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pEncryptedData,
         case CKM_AES_CBC:
             if (!WP11_Session_IsOpInitialized(session, WP11_INIT_AES_CBC_DEC))
                 return CKR_OPERATION_NOT_INITIALIZED;
+            if (!CK_ULONG_FITS_WORD32(ulEncryptedDataLen)) {
+                WP11_Session_SetOpInitialized(session, 0);
+                return CKR_DATA_LEN_RANGE;
+            }
 
             decDataLen = (word32)ulEncryptedDataLen;
             if (pData == NULL) {
@@ -3106,7 +3843,7 @@ CK_RV C_Decrypt(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pEncryptedData,
             ret = WP11_AesCbc_Decrypt(pEncryptedData, (int)ulEncryptedDataLen,
                                               pData, &decDataLen, session);
             if (ret < 0)
-                return CKR_ENCRYPTED_DATA_INVALID;
+                break;
             *pulDataLen = decDataLen;
             break;
         case CKM_AES_CBC_PAD:
@@ -3114,18 +3851,41 @@ CK_RV C_Decrypt(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pEncryptedData,
                                                    WP11_INIT_AES_CBC_PAD_DEC)) {
                 return CKR_OPERATION_NOT_INITIALIZED;
             }
+            if (!CK_ULONG_FITS_WORD32(ulEncryptedDataLen)) {
+                WP11_Session_SetOpInitialized(session, 0);
+                return CKR_DATA_LEN_RANGE;
+            }
 
             decDataLen = (word32)ulEncryptedDataLen;
             if (pData == NULL) {
-                *pulDataLen = decDataLen - 1;
+                /* decDataLen could be zero on an empty/invalid query; guard
+                 * the underflow even though the decrypt itself would also
+                 * reject it. */
+                *pulDataLen = (decDataLen > 0) ? decDataLen - 1 : 0;
                 return CKR_OK;
             }
+            /* Ciphertext must be at least one full block. */
+            if (decDataLen < AES_BLOCK_SIZE) {
+                return CKR_ENCRYPTED_DATA_LEN_RANGE;
+            }
 
+            /* The actual plaintext size isn't known until padding is stripped,
+             * so pass the caller's real buffer capacity (*pulDataLen) as the
+             * output size. WP11_AesCbcPad_Decrypt validates each write against
+             * this capacity and returns BUFFER_E (mapped to
+             * CKR_BUFFER_TOO_SMALL below) rather than overflowing a buffer
+             * that is too small for the recovered plaintext. */
+            decDataLen = (word32)*pulDataLen;
             ret = WP11_AesCbcPad_Decrypt(pEncryptedData,
                                                  (int)ulEncryptedDataLen, pData,
                                                  &decDataLen, session);
+            if (ret == BUFFER_E) {
+                /* Report required size; operation stays active for retry. */
+                *pulDataLen = decDataLen;
+                return CKR_BUFFER_TOO_SMALL;
+            }
             if (ret < 0)
-                return CKR_ENCRYPTED_DATA_INVALID;
+                break;
             *pulDataLen = decDataLen;
             break;
     #endif
@@ -3144,8 +3904,10 @@ CK_RV C_Decrypt(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pEncryptedData,
             decDataLen = (word32)*pulDataLen;
             ret = WP11_AesCtr_Do(pEncryptedData,
                     (word32)ulEncryptedDataLen, pData, &decDataLen, session);
+            if (ret == WP11_CTR_OVERFLOW_E)
+                return CKR_DATA_LEN_RANGE;
             if (ret != 0)
-                return CKR_ENCRYPTED_DATA_INVALID;
+                break;
             *pulDataLen = decDataLen;
             break;
     #endif
@@ -3154,6 +3916,10 @@ CK_RV C_Decrypt(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pEncryptedData,
             if (!WP11_Session_IsOpInitialized(session, WP11_INIT_AES_GCM_DEC))
                 return CKR_OPERATION_NOT_INITIALIZED;
 
+            if (ulEncryptedDataLen < (CK_ULONG)WP11_AesGcm_GetTagBits(session) / 8) {
+                WP11_Session_SetOpInitialized(session, 0);
+                return CKR_ENCRYPTED_DATA_LEN_RANGE;
+            }
             decDataLen = (word32)ulEncryptedDataLen -
                                             WP11_AesGcm_GetTagBits(session) / 8;
             if (pData == NULL) {
@@ -3166,7 +3932,7 @@ CK_RV C_Decrypt(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pEncryptedData,
             ret = WP11_AesGcm_Decrypt(pEncryptedData, (int)ulEncryptedDataLen,
                                               pData, &decDataLen, obj, session);
             if (ret < 0)
-                return CKR_ENCRYPTED_DATA_INVALID;
+                break;
             *pulDataLen = decDataLen;
             break;
     #endif
@@ -3175,6 +3941,10 @@ CK_RV C_Decrypt(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pEncryptedData,
             if (!WP11_Session_IsOpInitialized(session, WP11_INIT_AES_CCM_DEC))
                 return CKR_OPERATION_NOT_INITIALIZED;
 
+            if (ulEncryptedDataLen < (CK_ULONG)WP11_AesCcm_GetMacLen(session)) {
+                WP11_Session_SetOpInitialized(session, 0);
+                return CKR_ENCRYPTED_DATA_LEN_RANGE;
+            }
             decDataLen = (word32)ulEncryptedDataLen -
                                             WP11_AesCcm_GetMacLen(session);
             if (pData == NULL) {
@@ -3187,7 +3957,7 @@ CK_RV C_Decrypt(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pEncryptedData,
             ret = WP11_AesCcm_Decrypt(pEncryptedData, (int)ulEncryptedDataLen,
                                       pData, &decDataLen, obj, session);
             if (ret < 0)
-                return CKR_ENCRYPTED_DATA_INVALID;
+                break;
             *pulDataLen = decDataLen;
             break;
     #endif
@@ -3195,6 +3965,10 @@ CK_RV C_Decrypt(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pEncryptedData,
         case CKM_AES_ECB:
             if (!WP11_Session_IsOpInitialized(session, WP11_INIT_AES_ECB_DEC))
                 return CKR_OPERATION_NOT_INITIALIZED;
+            if (!CK_ULONG_FITS_WORD32(ulEncryptedDataLen)) {
+                WP11_Session_SetOpInitialized(session, 0);
+                return CKR_DATA_LEN_RANGE;
+            }
 
             decDataLen = (word32)ulEncryptedDataLen;
             if (pData == NULL) {
@@ -3207,7 +3981,7 @@ CK_RV C_Decrypt(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pEncryptedData,
             ret = WP11_AesEcb_Decrypt(pEncryptedData, (int)ulEncryptedDataLen,
                                       pData, &decDataLen, obj, session);
             if (ret < 0)
-                return CKR_ENCRYPTED_DATA_INVALID;
+                break;
             *pulDataLen = decDataLen;
             break;
     #endif
@@ -3229,19 +4003,21 @@ CK_RV C_Decrypt(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pEncryptedData,
             if (ret == BUFFER_E)
                 return CKR_BUFFER_TOO_SMALL;
             if (ret < 0)
-                return CKR_ENCRYPTED_DATA_INVALID;
+                break;
             *pulDataLen = decDataLen;
             break;
     #endif
     #ifdef HAVE_AES_KEYWRAP
         case CKM_AES_KEY_WRAP:
-        case CKM_AES_KEY_WRAP_PAD:
             if (!WP11_Session_IsOpInitialized(session, WP11_INIT_AES_KEYWRAP_DEC))
                 return CKR_OPERATION_NOT_INITIALIZED;
 
-            /* AES Key Wrap unwrapping reduces the size by 8 bytes (the
-             * integrity check value). If using padding then its even smaller
-             * but we can't know the final size without decrypting first. */
+            /* AES Key Wrap ciphertext is at least two semiblocks: one data
+             * semiblock plus the 8-byte integrity check value. */
+            if (ulEncryptedDataLen < 2 * KEYWRAP_BLOCK_SIZE) {
+                WP11_Session_SetOpInitialized(session, 0);
+                return CKR_ENCRYPTED_DATA_LEN_RANGE;
+            }
             decDataLen = (word32)(ulEncryptedDataLen - KEYWRAP_BLOCK_SIZE);
             if (pData == NULL) {
                 *pulDataLen = decDataLen;
@@ -3253,18 +4029,42 @@ CK_RV C_Decrypt(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pEncryptedData,
             ret = WP11_AesKeyWrap_Decrypt(pEncryptedData,
                     (word32)ulEncryptedDataLen, pData, &decDataLen, session);
             if (ret != 0)
-                return CKR_ENCRYPTED_DATA_INVALID;
-            if (mechanism == CKM_AES_KEY_WRAP_PAD) {
-                int i;
-                byte padValue = pData[decDataLen - 1];
-                if (padValue > KEYWRAP_BLOCK_SIZE || padValue > decDataLen)
-                    return CKR_ENCRYPTED_DATA_LEN_RANGE;
-                for (i = 0; i < padValue; i++) {
-                    if (pData[decDataLen - 1 - i] != padValue)
-                        return CKR_ENCRYPTED_DATA_INVALID;
-                }
-                decDataLen -= padValue;
+                break;
+            *pulDataLen = decDataLen;
+            break;
+        case CKM_AES_KEY_WRAP_PAD:
+            if (!WP11_Session_IsOpInitialized(session, WP11_INIT_AES_KEYWRAP_DEC))
+                return CKR_OPERATION_NOT_INITIALIZED;
+
+            /* RFC 5649 ciphertext is at least two semiblocks and a multiple of
+             * 8. The recovered length is encoded in the AIV and is known only
+             * after unwrapping; the upper bound is ciphertext - 8. */
+            if (ulEncryptedDataLen < 2 * KEYWRAP_BLOCK_SIZE ||
+                (ulEncryptedDataLen % KEYWRAP_BLOCK_SIZE) != 0) {
+                WP11_Session_SetOpInitialized(session, 0);
+                return CKR_ENCRYPTED_DATA_LEN_RANGE;
             }
+            decDataLen = (word32)(ulEncryptedDataLen - KEYWRAP_BLOCK_SIZE);
+            if (pData == NULL) {
+                /* Exact length is known only after unwrapping; report the
+                 * ciphertext - 8 upper bound for the length query. */
+                *pulDataLen = decDataLen;
+                return CKR_OK;
+            }
+
+            /* The recovered length is not known until the AIV is decoded, so
+             * do not pre-reject against the upper bound. Unwrap into the caller
+             * buffer; if it does not fit, the unwrap reports the exact required
+             * size via decDataLen. */
+            decDataLen = (word32)*pulDataLen;
+            ret = WP11_AesKeyWrapPad_Decrypt(pEncryptedData,
+                    (word32)ulEncryptedDataLen, pData, &decDataLen, session);
+            if (ret == BUFFER_E) {
+                *pulDataLen = decDataLen;
+                return CKR_BUFFER_TOO_SMALL;
+            }
+            if (ret != 0)
+                break;
             *pulDataLen = decDataLen;
             break;
     #endif
@@ -3274,9 +4074,13 @@ CK_RV C_Decrypt(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pEncryptedData,
             (void)ret;
             (void)ulEncryptedDataLen;
             (void)pData;
+            WP11_Session_SetOpInitialized(session, 0);
             return CKR_MECHANISM_INVALID;
     }
 
+    WP11_Session_SetOpInitialized(session, 0);
+    if (ret != 0)
+        return CKR_ENCRYPTED_DATA_INVALID;
     return CKR_OK;
 }
 
@@ -3342,6 +4146,10 @@ CK_RV C_DecryptUpdate(CK_SESSION_HANDLE hSession,
         case CKM_AES_CBC:
             if (!WP11_Session_IsOpInitialized(session, WP11_INIT_AES_CBC_DEC))
                 return CKR_OPERATION_NOT_INITIALIZED;
+            if (!CK_ULONG_FITS_WORD32(ulEncryptedPartLen)) {
+                WP11_Session_SetOpInitialized(session, 0);
+                return CKR_DATA_LEN_RANGE;
+            }
 
             decPartLen = (word32)ulEncryptedPartLen +
                                                    WP11_AesCbc_PartLen(session);
@@ -3356,14 +4164,20 @@ CK_RV C_DecryptUpdate(CK_SESSION_HANDLE hSession,
             ret = WP11_AesCbc_DecryptUpdate(pEncryptedPart,
                                                  (int)ulEncryptedPartLen, pPart,
                                                  &decPartLen, session);
-            if (ret < 0)
+            if (ret < 0) {
+                WP11_Session_SetOpInitialized(session, 0);
                 return CKR_FUNCTION_FAILED;
+            }
             *pulPartLen = decPartLen;
             break;
         case CKM_AES_CBC_PAD:
             if (!WP11_Session_IsOpInitialized(session,
                                                    WP11_INIT_AES_CBC_PAD_DEC)) {
                 return CKR_OPERATION_NOT_INITIALIZED;
+            }
+            if (!CK_ULONG_FITS_WORD32(ulEncryptedPartLen)) {
+                WP11_Session_SetOpInitialized(session, 0);
+                return CKR_DATA_LEN_RANGE;
             }
 
             decPartLen = (word32)ulEncryptedPartLen +
@@ -3383,8 +4197,15 @@ CK_RV C_DecryptUpdate(CK_SESSION_HANDLE hSession,
             ret = WP11_AesCbcPad_DecryptUpdate(pEncryptedPart,
                                                  (int)ulEncryptedPartLen, pPart,
                                                  &decPartLen, session);
-            if (ret < 0)
+            if (ret == BUFFER_E) {
+                /* Report required size; operation stays active for retry. */
+                *pulPartLen = decPartLen;
+                return CKR_BUFFER_TOO_SMALL;
+            }
+            if (ret < 0) {
+                WP11_Session_SetOpInitialized(session, 0);
                 return CKR_FUNCTION_FAILED;
+            }
             *pulPartLen = decPartLen;
             break;
     #endif
@@ -3403,8 +4224,14 @@ CK_RV C_DecryptUpdate(CK_SESSION_HANDLE hSession,
             decPartLen = (word32)*pulPartLen;
             ret = WP11_AesCtr_Update(pEncryptedPart, (word32)ulEncryptedPartLen,
                                      pPart, &decPartLen, session);
-            if (ret < 0)
+            if (ret == WP11_CTR_OVERFLOW_E) {
+                WP11_AesCtr_Final(session);
+                return CKR_DATA_LEN_RANGE;
+            }
+            if (ret < 0) {
+                WP11_Session_SetOpInitialized(session, 0);
                 return CKR_FUNCTION_FAILED;
+            }
             *pulPartLen = decPartLen;
             break;
     #endif
@@ -3419,8 +4246,10 @@ CK_RV C_DecryptUpdate(CK_SESSION_HANDLE hSession,
 
             ret = WP11_AesGcm_DecryptUpdate(pEncryptedPart,
                                               (int)ulEncryptedPartLen, session);
-            if (ret < 0)
+            if (ret < 0) {
+                WP11_Session_SetOpInitialized(session, 0);
                 return CKR_FUNCTION_FAILED;
+            }
             break;
     #endif
     #ifdef HAVE_AESCTS
@@ -3438,8 +4267,10 @@ CK_RV C_DecryptUpdate(CK_SESSION_HANDLE hSession,
                     (word32)ulEncryptedPartLen, pPart, &decPartLen, session);
             if (ret == BUFFER_E)
                 return CKR_BUFFER_TOO_SMALL;
-            if (ret < 0)
+            if (ret < 0) {
+                WP11_Session_SetOpInitialized(session, 0);
                 return CKR_FUNCTION_FAILED;
+            }
             *pulPartLen = decPartLen;
             break;
     #endif
@@ -3449,6 +4280,7 @@ CK_RV C_DecryptUpdate(CK_SESSION_HANDLE hSession,
             (void)ret;
             (void)ulEncryptedPartLen;
             (void)pPart;
+            WP11_Session_SetOpInitialized(session, 0);
             return CKR_MECHANISM_INVALID;
     }
 
@@ -3516,6 +4348,7 @@ CK_RV C_DecryptFinal(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pLastPart,
             decPartLen = WP11_AesCbc_PartLen(session);
             if (decPartLen != 0) {
                 WP11_AesCbc_DecryptFinal(session);
+                WP11_Session_SetOpInitialized(session, 0);
                 return CKR_DATA_LEN_RANGE;
             }
             *pulLastPartLen = 0;
@@ -3523,8 +4356,10 @@ CK_RV C_DecryptFinal(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pLastPart,
                 return CKR_OK;
 
             ret = WP11_AesCbc_DecryptFinal(session);
-            if (ret < 0)
+            if (ret < 0) {
+                WP11_Session_SetOpInitialized(session, 0);
                 return CKR_FUNCTION_FAILED;
+            }
             break;
         case CKM_AES_CBC_PAD:
             if (!WP11_Session_IsOpInitialized(session,
@@ -3535,15 +4370,31 @@ CK_RV C_DecryptFinal(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pLastPart,
             decPartLen = WP11_AesCbc_PartLen(session);
             if (decPartLen != 16) {
                 WP11_AesCbc_DecryptFinal(session);
+                WP11_Session_SetOpInitialized(session, 0);
                 return CKR_DATA_LEN_RANGE;
             }
-            *pulLastPartLen = 15;
-            if (pLastPart == NULL)
+            if (pLastPart == NULL) {
+                /* Size query: report the maximum possible unpadded size. */
+                *pulLastPartLen = AES_BLOCK_SIZE - 1;
                 return CKR_OK;
+            }
 
+            /* Pass the caller's buffer capacity so WP11_AesCbcPad_DecryptFinal
+             * can enforce it. Cap to the block size, which already exceeds the
+             * 0..15 byte unpadded output, to avoid truncating a large
+             * CK_ULONG. */
+            decPartLen = (*pulLastPartLen < (CK_ULONG)AES_BLOCK_SIZE) ?
+                         (word32)*pulLastPartLen : (word32)AES_BLOCK_SIZE;
             ret = WP11_AesCbcPad_DecryptFinal(pLastPart, &decPartLen, session);
-            if (ret < 0)
+            if (ret == BUFFER_E) {
+                /* Report required size; operation stays active for retry. */
+                *pulLastPartLen = decPartLen;
+                return CKR_BUFFER_TOO_SMALL;
+            }
+            if (ret < 0) {
+                WP11_Session_SetOpInitialized(session, 0);
                 return CKR_FUNCTION_FAILED;
+            }
             *pulLastPartLen = decPartLen;
             break;
     #endif
@@ -3558,8 +4409,10 @@ CK_RV C_DecryptFinal(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pLastPart,
             }
 
             ret = WP11_AesCtr_Final(session);
-            if (ret < 0)
+            if (ret < 0) {
+                WP11_Session_SetOpInitialized(session, 0);
                 return CKR_FUNCTION_FAILED;
+            }
             *pulLastPartLen = 0;
             break;
     #endif
@@ -3568,6 +4421,11 @@ CK_RV C_DecryptFinal(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pLastPart,
             if (!WP11_Session_IsOpInitialized(session, WP11_INIT_AES_GCM_DEC))
                 return CKR_OPERATION_NOT_INITIALIZED;
 
+            if (WP11_AesGcm_EncDataLen(session) <
+                                       WP11_AesGcm_GetTagBits(session) / 8) {
+                WP11_Session_SetOpInitialized(session, 0);
+                return CKR_ENCRYPTED_DATA_LEN_RANGE;
+            }
             decPartLen = WP11_AesGcm_EncDataLen(session) -
                                             WP11_AesGcm_GetTagBits(session) / 8;
             if (pLastPart == NULL) {
@@ -3579,8 +4437,10 @@ CK_RV C_DecryptFinal(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pLastPart,
 
             ret = WP11_AesGcm_DecryptFinal(pLastPart, &decPartLen, obj,
                                                                        session);
-            if (ret < 0)
+            if (ret < 0) {
+                WP11_Session_SetOpInitialized(session, 0);
                 return CKR_FUNCTION_FAILED;
+            }
             *pulLastPartLen = decPartLen;
             break;
     #endif
@@ -3598,8 +4458,10 @@ CK_RV C_DecryptFinal(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pLastPart,
             ret = WP11_AesCts_DecryptFinal(pLastPart, &decPartLen, session);
             if (ret == BUFFER_E)
                 return CKR_BUFFER_TOO_SMALL;
-            if (ret < 0)
+            if (ret < 0) {
+                WP11_Session_SetOpInitialized(session, 0);
                 return CKR_FUNCTION_FAILED;
+            }
             *pulLastPartLen = decPartLen;
             break;
     #endif
@@ -3608,9 +4470,11 @@ CK_RV C_DecryptFinal(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pLastPart,
             (void)decPartLen;
             (void)ret;
             (void)pLastPart;
+            WP11_Session_SetOpInitialized(session, 0);
             return CKR_MECHANISM_INVALID;
     }
 
+    WP11_Session_SetOpInitialized(session, 0);
     return CKR_OK;
 }
 
@@ -3663,6 +4527,11 @@ CK_RV C_DigestInit(CK_SESSION_HANDLE hSession,
         WOLFPKCS11_LEAVE("C_DigestInit", rv);
         return rv;
     }
+    if (WP11_Session_IsOpCategoryActive(session, WP11_OP_DIGEST)) {
+        rv = CKR_OPERATION_ACTIVE;
+        WOLFPKCS11_LEAVE("C_DigestInit", rv);
+        return rv;
+    }
     init = WP11_INIT_DIGEST;
     ret = WP11_Digest_Init(pMechanism->mechanism, session);
 
@@ -3671,7 +4540,10 @@ CK_RV C_DigestInit(CK_SESSION_HANDLE hSession,
         WP11_Session_SetOpInitialized(session, init);
     }
 
-    rv = ret;
+    if (ret != 0 && ret != (int)CKR_MECHANISM_INVALID)
+        rv = CKR_FUNCTION_FAILED;
+    else
+        rv = ret;
     WOLFPKCS11_LEAVE("C_DigestInit", rv);
     return rv;
 }
@@ -3724,7 +4596,13 @@ CK_RV C_Digest(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pData,
                              session);
     *pulDigestLen = hashLen;
 
-    return ret;
+    if (ret != BUFFER_E && (pDigest != NULL || ret != 0))
+        WP11_Session_SetOpInitialized(session, 0);
+    if (ret == BUFFER_E)
+        return CKR_BUFFER_TOO_SMALL;
+    if (ret != 0)
+        return CKR_FUNCTION_FAILED;
+    return CKR_OK;
 }
 
 /**
@@ -3768,7 +4646,11 @@ CK_RV C_DigestUpdate(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pPart,
 
     ret = WP11_Digest_Update(pPart, (word32)ulPartLen, session);
 
-    return ret;
+    if (ret < 0) {
+        WP11_Session_SetOpInitialized(session, 0);
+        return CKR_FUNCTION_FAILED;
+    }
+    return CKR_OK;
 }
 
 /**
@@ -3804,14 +4686,29 @@ CK_RV C_DigestKey(CK_SESSION_HANDLE hSession, CK_OBJECT_HANDLE hKey)
     }
     if (WP11_Session_Get(hSession, &session) != 0)
         return CKR_SESSION_HANDLE_INVALID;
+    if (!WP11_Session_IsOpInitialized(session, WP11_INIT_DIGEST))
+        return CKR_OPERATION_NOT_INITIALIZED;
 
     ret = WP11_Object_Find(session, hKey, &obj);
-    if (ret != 0)
+    if (ret != 0) {
+        WP11_Session_SetOpInitialized(session, 0);
         return CKR_OBJECT_HANDLE_INVALID;
+    }
 
     ret = WP11_Digest_Key(obj, session);
 
-    return ret;
+    if (ret < 0) {
+        WP11_Session_SetOpInitialized(session, 0);
+        return CKR_FUNCTION_FAILED;
+    }
+    if (ret > 0) {
+        /* Positive return is a CK_RV (e.g. CKR_FUNCTION_NOT_SUPPORTED on
+         * WOLFPKCS11_NO_STORE builds). Pass it through but still terminate
+         * the digest operation so the session is not left active. */
+        WP11_Session_SetOpInitialized(session, 0);
+        return (CK_RV)ret;
+    }
+    return CKR_OK;
 }
 
 /**
@@ -3859,7 +4756,13 @@ CK_RV C_DigestFinal(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pDigest,
     ret = WP11_Digest_Final(pDigest, &hashLen, session);
     *pulDigestLen = hashLen;
 
-    return ret;
+    if (ret != BUFFER_E && (pDigest != NULL || ret != 0))
+        WP11_Session_SetOpInitialized(session, 0);
+    if (ret == BUFFER_E)
+        return CKR_BUFFER_TOO_SMALL;
+    if (ret != 0)
+        return CKR_FUNCTION_FAILED;
+    return CKR_OK;
 }
 
 #ifdef WOLFSSL_HAVE_PRF
@@ -4046,6 +4949,11 @@ CK_RV C_SignInit(CK_SESSION_HANDLE hSession, CK_MECHANISM_PTR pMechanism,
             return CKR_MECHANISM_PARAM_INVALID;
         }
 
+        if (WP11_Session_IsOpCategoryActive(session, WP11_OP_SIGN)) {
+            rv = CKR_OPERATION_ACTIVE;
+            WOLFPKCS11_LEAVE("C_SignInit", rv);
+            return rv;
+        }
         /* The private key is pre-provisioned so no object to set. */
         init = WP11_INIT_ECDSA_SIGN;
         WP11_Session_SetMechanism(session, pMechanism->mechanism);
@@ -4062,6 +4970,12 @@ CK_RV C_SignInit(CK_SESSION_HANDLE hSession, CK_MECHANISM_PTR pMechanism,
     ret = CheckOpSupported(obj, CKA_SIGN);
     if (ret != CKR_OK)
         return ret;
+
+    if (WP11_Session_IsOpCategoryActive(session, WP11_OP_SIGN)) {
+        rv = CKR_OPERATION_ACTIVE;
+        WOLFPKCS11_LEAVE("C_SignInit", rv);
+        return rv;
+    }
 
     type = WP11_Object_GetType(obj);
     init = GetInitValue(pMechanism->mechanism);
@@ -4161,6 +5075,46 @@ CK_RV C_SignInit(CK_SESSION_HANDLE hSession, CK_MECHANISM_PTR pMechanism,
             }
             init = (int)(WP11_INIT_ECDSA_SIGN |
                ((pMechanism->mechanism - CKM_ECDSA) << WP11_INIT_DIGEST_SHIFT));
+            break;
+#endif
+#ifdef WOLFPKCS11_MLDSA
+        case CKM_ML_DSA:
+            if (type != CKK_ML_DSA)
+                return CKR_KEY_TYPE_INCONSISTENT;
+            if ((pMechanism->pParameter != NULL) &&
+                (pMechanism->ulParameterLen !=
+                                            sizeof(CK_SIGN_ADDITIONAL_CONTEXT)))
+                return CKR_MECHANISM_PARAM_INVALID;
+            if ((pMechanism->pParameter == NULL) &&
+                                              (pMechanism->ulParameterLen != 0))
+                return CKR_MECHANISM_PARAM_INVALID;
+
+            ret = WP11_Session_SetMldsaParams(session,
+                                              pMechanism->pParameter,
+                                              pMechanism->ulParameterLen);
+            if (ret != 0)
+                return CKR_MECHANISM_PARAM_INVALID;
+
+            init |= WP11_INIT_MLDSA_SIGN;
+            break;
+        case CKM_HASH_ML_DSA:
+            if (type != CKK_ML_DSA)
+                return CKR_KEY_TYPE_INCONSISTENT;
+            if ((pMechanism->pParameter != NULL) &&
+                (pMechanism->ulParameterLen !=
+                                       sizeof(CK_HASH_SIGN_ADDITIONAL_CONTEXT)))
+                return CKR_MECHANISM_PARAM_INVALID;
+            if ((pMechanism->pParameter == NULL) &&
+                                              (pMechanism->ulParameterLen != 0))
+                return CKR_MECHANISM_PARAM_INVALID;
+
+            ret = WP11_Session_SetMldsaParams(session,
+                                              pMechanism->pParameter,
+                                              pMechanism->ulParameterLen);
+            if (ret != 0)
+                return CKR_MECHANISM_PARAM_INVALID;
+
+            init |= WP11_INIT_MLDSA_SIGN;
             break;
 #endif
 #ifndef NO_HMAC
@@ -4398,11 +5352,14 @@ CK_RV C_Sign(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pData,
                 if (wc_Hash(hash_type, pData, (word32)ulDataLen,
                             digest, sizeof(digest)) != 0 ||
                         (dataSz = wc_HashGetDigestSize(hash_type)) < 0) {
-                    return CKR_FUNCTION_FAILED;
+                    ret = -1;
+                    break;
                 }
                 oid = wc_HashGetOID(hash_type);
-                if (oid < 0)
-                    return CKR_FUNCTION_FAILED;
+                if (oid < 0) {
+                    ret = -1;
+                    break;
+                }
 
                 ret = wc_EncodeSignature(digest, digest, dataSz, oid);
 
@@ -4411,7 +5368,8 @@ CK_RV C_Sign(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pData,
                     dataSz = ret;
                 }
                 else {
-                    return CKR_FUNCTION_FAILED;
+                    ret = -1;
+                    break;
                 }
             }
 
@@ -4463,7 +5421,8 @@ CK_RV C_Sign(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pData,
                 if (wc_Hash(hash_type, pData, (word32)ulDataLen,
                         digest, sizeof(digest)) != 0 ||
                         (dataSz = wc_HashGetDigestSize(hash_type)) < 0) {
-                    return CKR_FUNCTION_FAILED;
+                    ret = -1;
+                    break;
                 }
                 data = digest;
             }
@@ -4514,7 +5473,8 @@ CK_RV C_Sign(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pData,
                 if (wc_Hash(hash_type, pData, (word32)ulDataLen, digest,
                         sizeof(digest)) != 0 ||
                         (dataSz = wc_HashGetDigestSize(hash_type)) < 0) {
-                    return CKR_FUNCTION_FAILED;
+                    ret = -1;
+                    break;
                 }
                 data = digest;
             }
@@ -4524,6 +5484,25 @@ CK_RV C_Sign(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pData,
             *pulSignatureLen = sigLen;
             break;
         }
+#endif
+#ifdef WOLFPKCS11_MLDSA
+        case CKM_ML_DSA:
+        case CKM_HASH_ML_DSA:
+            if (!WP11_Session_IsOpInitialized(session, WP11_INIT_MLDSA_SIGN))
+                return CKR_OPERATION_NOT_INITIALIZED;
+
+            sigLen = WP11_Mldsa_SigLen(obj);
+            if (pSignature == NULL) {
+                *pulSignatureLen = sigLen;
+                return CKR_OK;
+            }
+            if (sigLen > (word32)*pulSignatureLen)
+                return CKR_BUFFER_TOO_SMALL;
+
+            ret = WP11_Mldsa_Sign(pData, (int)ulDataLen, pSignature,
+                                  &sigLen, obj, session);
+            *pulSignatureLen = sigLen;
+            break;
 #endif
 #ifndef NO_HMAC
     #ifndef NO_MD5
@@ -4620,8 +5599,10 @@ CK_RV C_Sign(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pData,
             (void)sigLen;
             (void)ulDataLen;
             (void)pSignature;
+            WP11_Session_SetOpInitialized(session, 0);
             return CKR_MECHANISM_INVALID;
     }
+    WP11_Session_SetOpInitialized(session, 0);
     if (ret < 0)
         return CKR_FUNCTION_FAILED;
 
@@ -4735,16 +5716,23 @@ CK_RV C_SignUpdate(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pPart,
 #endif
             if (!WP11_Session_IsOpInitialized(session, WP11_INIT_TLS_MAC_SIGN))
                 return CKR_OPERATION_NOT_INITIALIZED;
+            if (!CK_ULONG_FITS_WORD32(ulPartLen)) {
+                WP11_Session_SetOpInitialized(session, 0);
+                return CKR_DATA_LEN_RANGE;
+            }
 
             ret = WP11_Session_UpdateData(session, pPart, (word32)ulPartLen);
             break;
 #endif
         default:
             (void)ulPartLen;
+            WP11_Session_SetOpInitialized(session, 0);
             return CKR_MECHANISM_INVALID;
     }
-    if (ret < 0)
+    if (ret < 0) {
+        WP11_Session_SetOpInitialized(session, 0);
         return CKR_FUNCTION_FAILED;
+    }
 
     return CKR_OK;
 }
@@ -4882,12 +5870,19 @@ CK_RV C_SignFinal(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pSignature,
             if (!WP11_Session_IsOpInitialized(session, WP11_INIT_TLS_MAC_SIGN))
                 return CKR_OPERATION_NOT_INITIALIZED;
 
+            if (pSignature == NULL) {
+                *pulSignatureLen = (CK_ULONG)WP11_TLS_MAC_get_len(session);
+                return CKR_OK;
+            }
+
             WP11_Session_GetData(session, &data, &dataLen);
             ret = (int)C_Sign(hSession, data, dataLen, pSignature,
                 pulSignatureLen);
             WP11_Session_FreeData(session);
-            if (ret != CKR_OK)
+            if (ret != CKR_OK) {
+                WP11_Session_SetOpInitialized(session, 0);
                 return ret;
+            }
 
             break;
         }
@@ -4895,8 +5890,10 @@ CK_RV C_SignFinal(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pSignature,
         default:
             (void)sigLen;
             (void)pSignature;
+            WP11_Session_SetOpInitialized(session, 0);
             return CKR_MECHANISM_INVALID;
     }
+    WP11_Session_SetOpInitialized(session, 0);
     if (ret < 0)
         return CKR_FUNCTION_FAILED;
 
@@ -5078,6 +6075,12 @@ CK_RV C_VerifyInit(CK_SESSION_HANDLE hSession,
     if (ret != CKR_OK)
         return ret;
 
+    if (WP11_Session_IsOpCategoryActive(session, WP11_OP_VERIFY)) {
+        rv = CKR_OPERATION_ACTIVE;
+        WOLFPKCS11_LEAVE("C_VerifyInit", rv);
+        return rv;
+    }
+
     type = WP11_Object_GetType(obj);
     init = GetInitValue(pMechanism->mechanism);
     switch (pMechanism->mechanism) {
@@ -5176,6 +6179,74 @@ CK_RV C_VerifyInit(CK_SESSION_HANDLE hSession,
             }
             init = (int)(WP11_INIT_ECDSA_VERIFY |
                ((pMechanism->mechanism - CKM_ECDSA) << WP11_INIT_DIGEST_SHIFT));
+            break;
+#endif
+#ifdef WOLFPKCS11_MLDSA
+        case CKM_ML_DSA:
+            if (type != CKK_ML_DSA)
+                return CKR_KEY_TYPE_INCONSISTENT;
+            if ((pMechanism->pParameter != NULL) &&
+                (pMechanism->ulParameterLen !=
+                                            sizeof(CK_SIGN_ADDITIONAL_CONTEXT)))
+                return CKR_MECHANISM_PARAM_INVALID;
+            if ((pMechanism->pParameter == NULL) &&
+                                              (pMechanism->ulParameterLen != 0))
+                return CKR_MECHANISM_PARAM_INVALID;
+
+            ret = WP11_Session_SetMldsaParams(session,
+                                              pMechanism->pParameter,
+                                              pMechanism->ulParameterLen);
+            if (ret != 0)
+                return CKR_MECHANISM_PARAM_INVALID;
+
+            init |= WP11_INIT_MLDSA_VERIFY;
+            break;
+        case CKM_HASH_ML_DSA:
+            if (type != CKK_ML_DSA)
+                return CKR_KEY_TYPE_INCONSISTENT;
+            if ((pMechanism->pParameter != NULL) &&
+                (pMechanism->ulParameterLen !=
+                                       sizeof(CK_HASH_SIGN_ADDITIONAL_CONTEXT)))
+                return CKR_MECHANISM_PARAM_INVALID;
+            if ((pMechanism->pParameter == NULL) &&
+                                              (pMechanism->ulParameterLen != 0))
+                return CKR_MECHANISM_PARAM_INVALID;
+
+            ret = WP11_Session_SetMldsaParams(session,
+                                              pMechanism->pParameter,
+                                              pMechanism->ulParameterLen);
+            if (ret != 0)
+                return CKR_MECHANISM_PARAM_INVALID;
+
+            init |= WP11_INIT_MLDSA_VERIFY;
+            break;
+#endif
+#ifdef WOLFPKCS11_LMS
+        case CKM_HSS:
+            if (type != CKK_HSS)
+                return CKR_KEY_TYPE_INCONSISTENT;
+            if (pMechanism->pParameter != NULL ||
+                    pMechanism->ulParameterLen != 0)
+                return CKR_MECHANISM_PARAM_INVALID;
+            init |= WP11_INIT_HSS_VERIFY;
+            break;
+#endif
+#ifdef WOLFPKCS11_XMSS
+        case CKM_XMSS:
+            if (type != CKK_XMSS)
+                return CKR_KEY_TYPE_INCONSISTENT;
+            if (pMechanism->pParameter != NULL ||
+                    pMechanism->ulParameterLen != 0)
+                return CKR_MECHANISM_PARAM_INVALID;
+            init |= WP11_INIT_XMSS_VERIFY;
+            break;
+        case CKM_XMSSMT:
+            if (type != CKK_XMSSMT)
+                return CKR_KEY_TYPE_INCONSISTENT;
+            if (pMechanism->pParameter != NULL ||
+                    pMechanism->ulParameterLen != 0)
+                return CKR_MECHANISM_PARAM_INVALID;
+            init |= WP11_INIT_XMSS_VERIFY;
             break;
 #endif
 #ifndef NO_HMAC
@@ -5389,11 +6460,14 @@ CK_RV C_Verify(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pData,
                 if (wc_Hash(hash_type, pData, (word32)ulDataLen, digest,
                         sizeof(digest)) != 0 ||
                         (dataSz = wc_HashGetDigestSize(hash_type)) < 0) {
-                    return CKR_FUNCTION_FAILED;
+                    ret = -1;
+                    break;
                 }
                 oid = wc_HashGetOID(hash_type);
-                if (oid < 0)
-                    return CKR_FUNCTION_FAILED;
+                if (oid < 0) {
+                    ret = -1;
+                    break;
+                }
 
                 ret = wc_EncodeSignature(digest, digest, dataSz, oid);
 
@@ -5402,7 +6476,8 @@ CK_RV C_Verify(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pData,
                     dataSz = ret;
                 }
                 else {
-                    return CKR_FUNCTION_FAILED;
+                    ret = -1;
+                    break;
                 }
             }
 
@@ -5443,7 +6518,8 @@ CK_RV C_Verify(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pData,
                 if (wc_Hash(hash_type, pData, (word32)ulDataLen, digest,
                         sizeof(digest)) != 0 ||
                         (dataSz = wc_HashGetDigestSize(hash_type)) < 0) {
-                    return CKR_FUNCTION_FAILED;
+                    ret = -1;
+                    break;
                 }
                 data = digest;
             }
@@ -5485,7 +6561,8 @@ CK_RV C_Verify(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pData,
                 if (wc_Hash(hash_type, pData, (word32)ulDataLen, digest,
                         sizeof(digest)) != 0 ||
                         (dataSz = wc_HashGetDigestSize(hash_type)) < 0) {
-                    return CKR_FUNCTION_FAILED;
+                    ret = -1;
+                    break;
                 }
                 data = digest;
             }
@@ -5494,6 +6571,35 @@ CK_RV C_Verify(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pData,
                                  (word32)dataSz, &stat, obj);
             break;
         }
+#endif
+#ifdef WOLFPKCS11_MLDSA
+        case CKM_ML_DSA:
+        case CKM_HASH_ML_DSA:
+            if (!WP11_Session_IsOpInitialized(session, WP11_INIT_MLDSA_VERIFY))
+                return CKR_OPERATION_NOT_INITIALIZED;
+
+            ret = WP11_Mldsa_Verify(pSignature, (int)ulSignatureLen, pData,
+                                    (int)ulDataLen, &stat, obj, session);
+            break;
+#endif
+#ifdef WOLFPKCS11_LMS
+        case CKM_HSS:
+            if (!WP11_Session_IsOpInitialized(session, WP11_INIT_HSS_VERIFY))
+                return CKR_OPERATION_NOT_INITIALIZED;
+
+            ret = WP11_Hss_Verify(pSignature, (word32)ulSignatureLen, pData,
+                                  (word32)ulDataLen, &stat, obj);
+            break;
+#endif
+#ifdef WOLFPKCS11_XMSS
+        case CKM_XMSS:
+        case CKM_XMSSMT:
+            if (!WP11_Session_IsOpInitialized(session, WP11_INIT_XMSS_VERIFY))
+                return CKR_OPERATION_NOT_INITIALIZED;
+
+            ret = WP11_Xmss_Verify(pSignature, (word32)ulSignatureLen, pData,
+                                   (word32)ulDataLen, &stat, obj);
+            break;
 #endif
 #ifndef NO_HMAC
     #ifndef NO_MD5
@@ -5567,11 +6673,13 @@ CK_RV C_Verify(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pData,
         default:
             (void)ulDataLen;
             (void)ulSignatureLen;
+            WP11_Session_SetOpInitialized(session, 0);
             return CKR_MECHANISM_INVALID;
     }
+    WP11_Session_SetOpInitialized(session, 0);
     if (ret < 0)
         return CKR_FUNCTION_FAILED;
-    if (!stat)
+    if (ret != 0 || !stat)
         return CKR_SIGNATURE_INVALID;
 
     return CKR_OK;
@@ -5685,10 +6793,13 @@ CK_RV C_VerifyUpdate(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pPart,
 #endif
         default:
             (void)ulPartLen;
+            WP11_Session_SetOpInitialized(session, 0);
             return CKR_MECHANISM_INVALID;
     }
-    if (ret < 0)
+    if (ret < 0) {
+        WP11_Session_SetOpInitialized(session, 0);
         return CKR_FUNCTION_FAILED;
+    }
 
     return CKR_OK;
 }
@@ -5805,11 +6916,13 @@ CK_RV C_VerifyFinal(CK_SESSION_HANDLE hSession,
 #endif
         default:
             (void)ulSignatureLen;
+            WP11_Session_SetOpInitialized(session, 0);
             return CKR_MECHANISM_INVALID;
     }
+    WP11_Session_SetOpInitialized(session, 0);
     if (ret < 0)
         return CKR_FUNCTION_FAILED;
-    if (!stat)
+    if (ret != 0 || !stat)
         return CKR_SIGNATURE_INVALID;
 
     return CKR_OK;
@@ -5882,25 +6995,33 @@ CK_RV C_VerifyRecoverInit(CK_SESSION_HANDLE hSession,
     }
 
     ret = WP11_Object_Find(session, hKey, &obj);
-    if (ret != CKR_OK)
-        return ret;
+    if (ret != 0) {
+        rv = CKR_OBJECT_HANDLE_INVALID;
+        WOLFPKCS11_LEAVE("C_VerifyRecoverInit", rv);
+        return rv;
+    }
 
     if (WP11_Object_GetClass(obj) != CKO_PUBLIC_KEY) {
-        return CKR_KEY_HANDLE_INVALID;
+        return CKR_KEY_TYPE_INCONSISTENT;
     }
 
     if (WP11_Object_GetType(obj) != CKK_RSA) {
         return CKR_KEY_TYPE_INCONSISTENT;
     }
 
-    ret = CheckOpSupported(obj, CKA_VERIFY);
+    ret = CheckOpSupported(obj, CKA_VERIFY_RECOVER);
     if (ret != CKR_OK)
         return ret;
+
+    if (WP11_Session_IsOpCategoryActive(session, WP11_OP_VERIFY)) {
+        rv = CKR_OPERATION_ACTIVE;
+        WOLFPKCS11_LEAVE("C_VerifyRecoverInit", rv);
+        return rv;
+    }
 
     WP11_Session_SetMechanism(session, pMechanism->mechanism);
     WP11_Session_SetObject(session, obj);
     WP11_Session_SetOpInitialized(session, init);
-
 
     return CKR_OK;
 }
@@ -5970,14 +7091,10 @@ CK_RV C_VerifyRecover(CK_SESSION_HANDLE hSession,
         return CKR_OPERATION_NOT_INITIALIZED;
     }
 
-    decDataLen = WP11_Rsa_KeyLen(obj);
-    if (pData == NULL) {
-        *pulDataLen = decDataLen;
-        return CKR_OK;
-    }
-    if (decDataLen > (word32)*pulDataLen)
-        return CKR_BUFFER_TOO_SMALL;
-
+    /* Validate the mechanism and that a verify-recover operation has been
+     * initialized before treating the active object as an RSA key. The active
+     * object pointer is also set by other *Init functions, so these checks must
+     * happen before WP11_Rsa_KeyLen dereferences obj as an RSA key. */
     switch (mechanism) {
         case CKM_RSA_PKCS:
             if (!WP11_Session_IsOpInitialized(session,
@@ -5992,10 +7109,28 @@ CK_RV C_VerifyRecover(CK_SESSION_HANDLE hSession,
         default:
             return CKR_MECHANISM_INVALID;
     }
+    if (WP11_Object_GetType(obj) != CKK_RSA)
+        return CKR_KEY_TYPE_INCONSISTENT;
+    if (!CK_ULONG_FITS_WORD32(ulSignatureLen))
+        return CKR_ARGUMENTS_BAD;
+
+    decDataLen = WP11_Rsa_KeyLen(obj);
+    if (pData == NULL) {
+        *pulDataLen = decDataLen;
+        return CKR_OK;
+    }
+    if (!CK_ULONG_FITS_WORD32(*pulDataLen))
+        return CKR_ARGUMENTS_BAD;
+    if (decDataLen > (word32)*pulDataLen) {
+        /* Report the required size as mandated by PKCS#11. */
+        *pulDataLen = decDataLen;
+        return CKR_BUFFER_TOO_SMALL;
+    }
 
     ret = WP11_Rsa_Verify_Recover(mechanism, pSignature, (word32)ulSignatureLen,
                                   pData, pulDataLen, obj);
 
+    WP11_Session_SetOpInitialized(session, 0);
     if (ret != CKR_OK) {
         return ret;
     }
@@ -6055,7 +7190,7 @@ CK_RV C_DigestEncryptUpdate(CK_SESSION_HANDLE hSession,
 
     (void)pEncryptedPart;
 
-    rv = CKR_OPERATION_NOT_INITIALIZED;
+    rv = CKR_FUNCTION_NOT_SUPPORTED;
     WOLFPKCS11_LEAVE("C_DigestEncryptUpdate", rv);
     return rv;
 }
@@ -6111,7 +7246,7 @@ CK_RV C_DecryptDigestUpdate(CK_SESSION_HANDLE hSession,
 
     (void)pPart;
 
-    rv = CKR_OPERATION_NOT_INITIALIZED;
+    rv = CKR_FUNCTION_NOT_SUPPORTED;
     WOLFPKCS11_LEAVE("C_DecryptDigestUpdate", rv);
     return rv;
 }
@@ -6167,7 +7302,7 @@ CK_RV C_SignEncryptUpdate(CK_SESSION_HANDLE hSession,
 
     (void)pEncryptedPart;
 
-    rv = CKR_OPERATION_NOT_INITIALIZED;
+    rv = CKR_FUNCTION_NOT_SUPPORTED;
     WOLFPKCS11_LEAVE("C_SignEncryptUpdate", rv);
     return rv;
 }
@@ -6223,7 +7358,7 @@ CK_RV C_DecryptVerifyUpdate(CK_SESSION_HANDLE hSession,
 
     (void)pPart;
 
-    rv = CKR_OPERATION_NOT_INITIALIZED;
+    rv = CKR_FUNCTION_NOT_SUPPORTED;
     WOLFPKCS11_LEAVE("C_DecryptVerifyUpdate", rv);
     return rv;
 }
@@ -6257,9 +7392,6 @@ CK_RV C_GenerateKey(CK_SESSION_HANDLE hSession,
     CK_RV rv = CKR_OK;
     WP11_Session* session = NULL;
     WP11_Object* key = NULL;
-    CK_BBOOL trueVar = CK_TRUE;
-    CK_BBOOL getVar;
-    CK_ULONG getVarLen = sizeof(CK_BBOOL);
     CK_KEY_TYPE keyType;
 
     WOLFPKCS11_ENTER("C_GenerateKey");
@@ -6281,6 +7413,33 @@ CK_RV C_GenerateKey(CK_SESSION_HANDLE hSession,
     }
     if (pMechanism == NULL || pTemplate == NULL || phKey == NULL) {
         rv = CKR_ARGUMENTS_BAD;
+        WOLFPKCS11_LEAVE("C_GenerateKey", rv);
+        return rv;
+    }
+    /* Only require R/W session for token objects */
+    if (!WP11_Session_IsRW(session)) {
+        CK_ATTRIBUTE* tokenAttr = NULL;
+        FindAttributeType(pTemplate, ulCount, CKA_TOKEN, &tokenAttr);
+        if (tokenAttr != NULL) {
+            if (tokenAttr->pValue == NULL ||
+                tokenAttr->ulValueLen != sizeof(CK_BBOOL)) {
+                rv = CKR_ATTRIBUTE_VALUE_INVALID;
+                WOLFPKCS11_LEAVE("C_GenerateKey", rv);
+                return rv;
+            }
+            if (*(CK_BBOOL*)tokenAttr->pValue == CK_TRUE) {
+                rv = CKR_SESSION_READ_ONLY;
+                WOLFPKCS11_LEAVE("C_GenerateKey", rv);
+                return rv;
+            }
+        }
+    }
+
+    /* C_GenerateKey always produces a secret key, even when the template
+     * omits CKA_CLASS - pass the implied class so the spec-default
+     * CKA_PRIVATE=CK_TRUE still gates login. */
+    rv = CheckPrivateLogin(session, pTemplate, ulCount, CKO_SECRET_KEY);
+    if (rv != CKR_OK) {
         WOLFPKCS11_LEAVE("C_GenerateKey", rv);
         return rv;
     }
@@ -6327,6 +7486,35 @@ CK_RV C_GenerateKey(CK_SESSION_HANDLE hSession,
         default:
             rv = CKR_MECHANISM_INVALID;
             break;
+    }
+
+    if (rv == CKR_OK) {
+        int idx;
+
+        /* C_GenerateKey always yields a secret key of the mechanism-implied
+         * type. Reject a template that names a different class or key type
+         * rather than letting it override the generated object. Every
+         * occurrence is checked because a later duplicate would otherwise be
+         * applied by SetAttributeValue. The count is bounded to int as
+         * elsewhere so a caller-supplied length cannot drive an over-read. */
+        for (idx = 0; idx < (int)ulCount && rv == CKR_OK; idx++) {
+            CK_ATTRIBUTE* attr = &pTemplate[idx];
+
+            if (attr->type == CKA_CLASS) {
+                if (attr->pValue == NULL ||
+                        attr->ulValueLen != sizeof(CK_OBJECT_CLASS))
+                    rv = CKR_ATTRIBUTE_VALUE_INVALID;
+                else if (*(CK_OBJECT_CLASS*)attr->pValue != CKO_SECRET_KEY)
+                    rv = CKR_TEMPLATE_INCONSISTENT;
+            }
+            else if (attr->type == CKA_KEY_TYPE) {
+                if (attr->pValue == NULL ||
+                        attr->ulValueLen != sizeof(CK_KEY_TYPE))
+                    rv = CKR_ATTRIBUTE_VALUE_INVALID;
+                else if (*(CK_KEY_TYPE*)attr->pValue != keyType)
+                    rv = CKR_TEMPLATE_INCONSISTENT;
+            }
+        }
     }
 
     if (rv == CKR_OK) {
@@ -6437,6 +7625,19 @@ CK_RV C_GenerateKey(CK_SESSION_HANDLE hSession,
             derivedKeyLen = *(CK_ULONG*)lenAttr->pValue;
             if (derivedKeyLen == 0)
                 return CKR_ATTRIBUTE_VALUE_INVALID;
+            /* WP11_PBKDF2 takes int lengths; reject caller-controlled CK_ULONG
+             * values that would silently truncate to word32 or become negative
+             * on cast to int (Fenrir F-4313 class). */
+            if (!CK_ULONG_FITS_WORD32(pwLen) ||
+                !CK_ULONG_FITS_WORD32(params->ulSaltSourceDataLen) ||
+                !CK_ULONG_FITS_WORD32(params->iterations) ||
+                !CK_ULONG_FITS_WORD32(derivedKeyLen) ||
+                pwLen > (CK_ULONG)0x7FFFFFFF ||
+                params->ulSaltSourceDataLen > (CK_ULONG)0x7FFFFFFF ||
+                params->iterations > (CK_ULONG)0x7FFFFFFF ||
+                derivedKeyLen > (CK_ULONG)0x7FFFFFFF) {
+                return CKR_MECHANISM_PARAM_INVALID;
+            }
 
             derivedKey = (CK_BYTE*)XMALLOC(derivedKeyLen, NULL,
                 DYNAMIC_TYPE_TMP_BUFFER);
@@ -6452,6 +7653,7 @@ CK_RV C_GenerateKey(CK_SESSION_HANDLE hSession,
                              hashType);
 
             if (ret != 0) {
+                wc_ForceZero(derivedKey, derivedKeyLen);
                 XFREE(derivedKey, NULL, DYNAMIC_TYPE_TMP_BUFFER);
                 return CKR_FUNCTION_FAILED;
             }
@@ -6467,17 +7669,22 @@ CK_RV C_GenerateKey(CK_SESSION_HANDLE hSession,
 
                 ret = WP11_Object_SetSecretKey(pbkdf2Key, secretKeyData, secretKeyLen);
                 if (ret == 0) {
-                    rv = AddObject(session, pbkdf2Key, pTemplate, ulCount, phKey);
-                    if (rv != CKR_OK) {
-                        WP11_Object_Free(pbkdf2Key);
-                    }
+                    WP11_Object_SetKeyGeneration(pbkdf2Key, pMechanism->mechanism);
+                    rv = SetInitialStates(pbkdf2Key);
                 } else {
-                    WP11_Object_Free(pbkdf2Key);
                     rv = CKR_FUNCTION_FAILED;
+                }
+                if (rv == CKR_OK) {
+                    rv = AddObject(session, pbkdf2Key, pTemplate, ulCount, phKey);
+                }
+                if (rv != CKR_OK) {
+                    WP11_Object_Free(pbkdf2Key);
                 }
             }
 
+            wc_ForceZero(derivedKey, derivedKeyLen);
             XFREE(derivedKey, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+
             return rv;
         }
 #ifdef WOLFPKCS11_NSS
@@ -6537,6 +7744,17 @@ CK_RV C_GenerateKey(CK_SESSION_HANDLE hSession,
                 iterationCount == 0) {
                 return CKR_MECHANISM_PARAM_INVALID;
             }
+            /* wc_PKCS12_PBKDF takes int lengths; reject CK_ULONG values that
+             * would either silently truncate to word32 or become negative on
+             * cast to int. */
+            if (!CK_ULONG_FITS_WORD32(passwordLen) ||
+                !CK_ULONG_FITS_WORD32(saltLen) ||
+                !CK_ULONG_FITS_WORD32(iterationCount) ||
+                passwordLen > (CK_ULONG)0x7FFFFFFF ||
+                saltLen > (CK_ULONG)0x7FFFFFFF ||
+                iterationCount > (CK_ULONG)0x7FFFFFFF) {
+                return CKR_MECHANISM_PARAM_INVALID;
+            }
 
             derivedKey = (CK_BYTE*)XMALLOC(derivedKeyLen, NULL, DYNAMIC_TYPE_TMP_BUFFER);
             if (derivedKey == NULL)
@@ -6547,6 +7765,7 @@ CK_RV C_GenerateKey(CK_SESSION_HANDLE hSession,
                                   (int)derivedKeyLen, hashType);
 
             if (ret != 0) {
+                wc_ForceZero(derivedKey, derivedKeyLen);
                 XFREE(derivedKey, NULL, DYNAMIC_TYPE_TMP_BUFFER);
                 return CKR_FUNCTION_FAILED;
             }
@@ -6562,17 +7781,22 @@ CK_RV C_GenerateKey(CK_SESSION_HANDLE hSession,
 
                 ret = WP11_Object_SetSecretKey(pbeKey, secretKeyData, secretKeyLen);
                 if (ret == 0) {
-                    rv = AddObject(session, pbeKey, pTemplate, ulCount, phKey);
-                    if (rv != CKR_OK) {
-                        WP11_Object_Free(pbeKey);
-                    }
+                    WP11_Object_SetKeyGeneration(pbeKey, pMechanism->mechanism);
+                    rv = SetInitialStates(pbeKey);
                 } else {
-                    WP11_Object_Free(pbeKey);
                     rv = CKR_FUNCTION_FAILED;
+                }
+                if (rv == CKR_OK) {
+                    rv = AddObject(session, pbeKey, pTemplate, ulCount, phKey);
+                }
+                if (rv != CKR_OK) {
+                    WP11_Object_Free(pbeKey);
                 }
             }
 
+            wc_ForceZero(derivedKey, derivedKeyLen);
             XFREE(derivedKey, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+
             return rv;
         }
 #endif
@@ -6600,31 +7824,19 @@ CK_RV C_GenerateKey(CK_SESSION_HANDLE hSession,
                        &key);
         if (rv == CKR_OK) {
             int ret = WP11_GenerateRandomKey(key,
-                                             WP11_Session_GetSlot(session));
+                                             WP11_Session_GetSlot(session),
+                                             pMechanism->mechanism);
             if (ret != 0) {
-                WP11_Object_Free(key);
                 rv = CKR_FUNCTION_FAILED;
             }
-            else {
-               rv = AddObject(session, key, pTemplate, ulCount, phKey);
-               if (rv != CKR_OK) {
-                   WP11_Object_Free(key);
-               }
-            }
         }
-    }
-    if (rv == CKR_OK) {
-        rv = WP11_Object_GetAttr(key, CKA_SENSITIVE, &getVar, &getVarLen);
-        if ((rv == CKR_OK) && (getVar == CK_TRUE)) {
-            rv = WP11_Object_SetAttr(key, CKA_ALWAYS_SENSITIVE, &trueVar,
-                                     sizeof(CK_BBOOL));
-        }
+        if (rv == CKR_OK)
+            rv = SetInitialStates(key);
         if (rv == CKR_OK) {
-            rv = WP11_Object_GetAttr(key, CKA_EXTRACTABLE, &getVar, &getVarLen);
-            if ((rv == CKR_OK) && (getVar == CK_FALSE)) {
-                rv = WP11_Object_SetAttr(key, CKA_NEVER_EXTRACTABLE, &trueVar,
-                                     sizeof(CK_BBOOL));
-            }
+            rv = AddObject(session, key, pTemplate, ulCount, phKey);
+        }
+        if (rv != CKR_OK && key != NULL) {
+            WP11_Object_Free(key);
         }
     }
 
@@ -6662,6 +7874,38 @@ CK_RV C_GenerateKey(CK_SESSION_HANDLE hSession,
  *          type of operation.
  *          CKR_OK on success.
  */
+/* Reject a key-pair template whose CKA_CLASS or CKA_KEY_TYPE, in any position,
+ * disagrees with the class and type the mechanism implies. */
+static CK_RV CheckGenPairAttrs(CK_ATTRIBUTE_PTR pTemplate, CK_ULONG ulCount,
+                               CK_OBJECT_CLASS expectClass,
+                               CK_KEY_TYPE expectType)
+{
+    int i;
+
+    /* Bound the count to int as elsewhere so a caller-supplied length cannot
+     * drive an over-read past the template array. */
+    for (i = 0; i < (int)ulCount; i++) {
+        CK_ATTRIBUTE* attr = &pTemplate[i];
+
+        if (attr->type == CKA_CLASS) {
+            if (attr->pValue == NULL ||
+                    attr->ulValueLen != sizeof(CK_OBJECT_CLASS))
+                return CKR_ATTRIBUTE_VALUE_INVALID;
+            if (*(CK_OBJECT_CLASS*)attr->pValue != expectClass)
+                return CKR_TEMPLATE_INCONSISTENT;
+        }
+        else if (attr->type == CKA_KEY_TYPE) {
+            if (attr->pValue == NULL ||
+                    attr->ulValueLen != sizeof(CK_KEY_TYPE))
+                return CKR_ATTRIBUTE_VALUE_INVALID;
+            if (*(CK_KEY_TYPE*)attr->pValue != expectType)
+                return CKR_TEMPLATE_INCONSISTENT;
+        }
+    }
+
+    return CKR_OK;
+}
+
 CK_RV C_GenerateKeyPair(CK_SESSION_HANDLE hSession,
                         CK_MECHANISM_PTR pMechanism,
                         CK_ATTRIBUTE_PTR pPublicKeyTemplate,
@@ -6676,6 +7920,9 @@ CK_RV C_GenerateKeyPair(CK_SESSION_HANDLE hSession,
     WP11_Session* session = NULL;
     WP11_Object* pub = NULL;
     WP11_Object* priv = NULL;
+    CK_ATTRIBUTE* reqAttr = NULL;
+    CK_KEY_TYPE pairType = 0;
+    int knownMech = 1;
 
     WOLFPKCS11_ENTER("C_GenerateKeyPair");
     #ifdef DEBUG_WOLFPKCS11
@@ -6701,6 +7948,94 @@ CK_RV C_GenerateKeyPair(CK_SESSION_HANDLE hSession,
         WOLFPKCS11_LEAVE("C_GenerateKeyPair", rv);
         return rv;
     }
+    /* Only require R/W session for token objects. Each template must be
+     * inspected independently — a public template with CKA_TOKEN=FALSE must
+     * not mask a private template requesting CKA_TOKEN=TRUE. */
+    if (!WP11_Session_IsRW(session)) {
+        CK_ATTRIBUTE_PTR tpls[2] = { pPublicKeyTemplate, pPrivateKeyTemplate };
+        CK_ULONG counts[2] = { ulPublicKeyAttributeCount,
+                                ulPrivateKeyAttributeCount };
+        int i;
+        for (i = 0; i < 2; i++) {
+            CK_ATTRIBUTE* tokenAttr = NULL;
+            FindAttributeType(tpls[i], counts[i], CKA_TOKEN, &tokenAttr);
+            if (tokenAttr == NULL)
+                continue;
+            if (tokenAttr->pValue == NULL ||
+                tokenAttr->ulValueLen != sizeof(CK_BBOOL)) {
+                rv = CKR_ATTRIBUTE_VALUE_INVALID;
+                WOLFPKCS11_LEAVE("C_GenerateKeyPair", rv);
+                return rv;
+            }
+            if (*(CK_BBOOL*)tokenAttr->pValue == CK_TRUE) {
+                rv = CKR_SESSION_READ_ONLY;
+                WOLFPKCS11_LEAVE("C_GenerateKeyPair", rv);
+                return rv;
+            }
+        }
+    }
+
+    /* Each template's API-implied class lets the helper detect the
+     * spec-default CKA_PRIVATE=CK_TRUE for the private arm even when
+     * the template omits CKA_CLASS. An explicit CKA_PRIVATE=TRUE in the
+     * public template is still flagged because the helper consults the
+     * template attribute first. */
+    rv = CheckPrivateLogin(session, pPublicKeyTemplate,
+                           ulPublicKeyAttributeCount, CKO_PUBLIC_KEY);
+    if (rv == CKR_OK) {
+        rv = CheckPrivateLogin(session, pPrivateKeyTemplate,
+                               ulPrivateKeyAttributeCount, CKO_PRIVATE_KEY);
+    }
+    if (rv != CKR_OK) {
+        WOLFPKCS11_LEAVE("C_GenerateKeyPair", rv);
+        return rv;
+    }
+
+    /* Reject a template whose class or key type contradicts the mechanism
+     * before any object is constructed. */
+    switch (pMechanism->mechanism) {
+#if !defined(NO_RSA) && defined(WOLFSSL_KEY_GEN)
+        case CKM_RSA_PKCS_KEY_PAIR_GEN:
+            pairType = CKK_RSA;
+            break;
+#endif
+#ifdef HAVE_ECC
+        case CKM_EC_KEY_PAIR_GEN:
+            pairType = CKK_EC;
+            break;
+#endif
+#ifdef WOLFPKCS11_MLDSA
+        case CKM_ML_DSA_KEY_PAIR_GEN:
+            pairType = CKK_ML_DSA;
+            break;
+#endif
+#ifdef WOLFPKCS11_MLKEM
+        case CKM_ML_KEM_KEY_PAIR_GEN:
+            pairType = CKK_ML_KEM;
+            break;
+#endif
+#ifndef NO_DH
+        case CKM_DH_PKCS_KEY_PAIR_GEN:
+            pairType = CKK_DH;
+            break;
+#endif
+        default:
+            knownMech = 0;
+            break;
+    }
+    if (knownMech) {
+        rv = CheckGenPairAttrs(pPublicKeyTemplate, ulPublicKeyAttributeCount,
+                               CKO_PUBLIC_KEY, pairType);
+        if (rv == CKR_OK) {
+            rv = CheckGenPairAttrs(pPrivateKeyTemplate,
+                                   ulPrivateKeyAttributeCount, CKO_PRIVATE_KEY,
+                                   pairType);
+        }
+        if (rv != CKR_OK) {
+            WOLFPKCS11_LEAVE("C_GenerateKeyPair", rv);
+            return rv;
+        }
+    }
 
     switch (pMechanism->mechanism) {
 #if !defined(NO_RSA) && defined(WOLFSSL_KEY_GEN)
@@ -6709,6 +8044,12 @@ CK_RV C_GenerateKeyPair(CK_SESSION_HANDLE hSession,
                                               pMechanism->ulParameterLen != 0) {
                 return CKR_MECHANISM_PARAM_INVALID;
             }
+
+            /* CKA_MODULUS_BITS is required to size the RSA key. */
+            FindAttributeType(pPublicKeyTemplate, ulPublicKeyAttributeCount,
+                              CKA_MODULUS_BITS, &reqAttr);
+            if (reqAttr == NULL)
+                return CKR_TEMPLATE_INCOMPLETE;
 
             *phPublicKey = *phPrivateKey = CK_INVALID_HANDLE;
 
@@ -6728,11 +8069,17 @@ CK_RV C_GenerateKeyPair(CK_SESSION_HANDLE hSession,
             break;
 #endif
 #ifdef HAVE_ECC
-       case CKM_EC_KEY_PAIR_GEN:
+        case CKM_EC_KEY_PAIR_GEN:
             if (pMechanism->pParameter != NULL ||
                                               pMechanism->ulParameterLen != 0) {
                 return CKR_MECHANISM_PARAM_INVALID;
             }
+
+            /* CKA_EC_PARAMS carries the curve domain parameters. */
+            FindAttributeType(pPublicKeyTemplate, ulPublicKeyAttributeCount,
+                              CKA_EC_PARAMS, &reqAttr);
+            if (reqAttr == NULL)
+                return CKR_TEMPLATE_INCOMPLETE;
 
             *phPublicKey = *phPrivateKey = CK_INVALID_HANDLE;
 
@@ -6751,12 +8098,135 @@ CK_RV C_GenerateKeyPair(CK_SESSION_HANDLE hSession,
             }
             break;
 #endif
+#ifdef WOLFPKCS11_MLDSA
+        case CKM_ML_DSA_KEY_PAIR_GEN:
+            if (pMechanism->pParameter != NULL ||
+                                              pMechanism->ulParameterLen != 0) {
+                return CKR_MECHANISM_PARAM_INVALID;
+            }
+
+            *phPublicKey = *phPrivateKey = CK_INVALID_HANDLE;
+            rv = NewObject(session, CKK_ML_DSA, CKO_PUBLIC_KEY,
+                           pPublicKeyTemplate, ulPublicKeyAttributeCount, &pub);
+            if (rv == CKR_OK) {
+                rv = NewObject(session, CKK_ML_DSA, CKO_PRIVATE_KEY,
+                               pPrivateKeyTemplate, ulPrivateKeyAttributeCount,
+                               &priv);
+            }
+            if (rv == CKR_OK) {
+                ret = WP11_Mldsa_GenerateKeyPair(pub, priv,
+                                                 WP11_Session_GetSlot(session));
+                if (ret != 0)
+                    rv = CKR_FUNCTION_FAILED;
+            }
+            break;
+#endif
+#ifdef WOLFPKCS11_MLKEM
+        case CKM_ML_KEM_KEY_PAIR_GEN:
+            if (pMechanism->pParameter != NULL ||
+                                              pMechanism->ulParameterLen != 0) {
+                return CKR_MECHANISM_PARAM_INVALID;
+            }
+
+            *phPublicKey = *phPrivateKey = CK_INVALID_HANDLE;
+
+            rv = NewObject(session, CKK_ML_KEM, CKO_PUBLIC_KEY,
+                           pPublicKeyTemplate, ulPublicKeyAttributeCount, &pub);
+            if (rv == CKR_OK) {
+                CK_ATTRIBUTE_PTR privTmplCpy = NULL;
+                if (ulPrivateKeyAttributeCount >
+                                       (ULONG_MAX / sizeof(CK_ATTRIBUTE)) - 1) {
+                    rv = CKR_ARGUMENTS_BAD;
+                }
+                else {
+                    /* Copy the CKA_PARAMETER_SET attribute from the public key
+                    * template to the private key one to properly initialize the
+                    * private key in NewObject() below. */
+                    privTmplCpy = (CK_ATTRIBUTE_PTR)XMALLOC(
+                        (ulPrivateKeyAttributeCount + 1) * sizeof(CK_ATTRIBUTE),
+                        NULL, DYNAMIC_TYPE_TMP_BUFFER);
+                    if (privTmplCpy == NULL) {
+                        rv = CKR_HOST_MEMORY;
+                    }
+                }
+                if (rv == CKR_OK) {
+                    unsigned int i;
+                    unsigned int privParamIdx =
+                                       (unsigned int)ulPrivateKeyAttributeCount;
+                    unsigned int pubParamIdx  =
+                                        (unsigned int)ulPublicKeyAttributeCount;
+                    CK_ULONG newAttrCount;
+                    /* Copy existing attributes; note any existing
+                     * CKA_PARAMETER_SET in the private template. */
+                    for (i = 0; i < ulPrivateKeyAttributeCount; i++) {
+                        privTmplCpy[i] = pPrivateKeyTemplate[i];
+                        if (pPrivateKeyTemplate[i].type == CKA_PARAMETER_SET &&
+                            privParamIdx == ulPrivateKeyAttributeCount) {
+                            privParamIdx = i;
+                        }
+                    }
+                    /* Find CKA_PARAMETER_SET in the public key template. */
+                    for (i = 0; i < ulPublicKeyAttributeCount; i++) {
+                        if (pPublicKeyTemplate[i].type == CKA_PARAMETER_SET) {
+                            pubParamIdx = i;
+                            break;
+                        }
+                    }
+                    if (pubParamIdx == ulPublicKeyAttributeCount) {
+                        /* CKA_PARAMETER_SET is not found in the public key
+                         * template */
+                        rv = CKR_TEMPLATE_INCOMPLETE;
+                    }
+                    else {
+                        /* Ensure exactly one CKA_PARAMETER_SET in the private
+                         * template: overwrite existing entry if present,
+                         * otherwise append. */
+                        if (privParamIdx < ulPrivateKeyAttributeCount) {
+                            privTmplCpy[privParamIdx].pValue =
+                                pPublicKeyTemplate[pubParamIdx].pValue;
+                            privTmplCpy[privParamIdx].ulValueLen =
+                                pPublicKeyTemplate[pubParamIdx].ulValueLen;
+                            newAttrCount = ulPrivateKeyAttributeCount;
+                        }
+                        else {
+                            privTmplCpy[ulPrivateKeyAttributeCount].type =
+                                CKA_PARAMETER_SET;
+                            privTmplCpy[ulPrivateKeyAttributeCount].pValue =
+                                pPublicKeyTemplate[pubParamIdx].pValue;
+                            privTmplCpy[ulPrivateKeyAttributeCount].ulValueLen =
+                                pPublicKeyTemplate[pubParamIdx].ulValueLen;
+                            newAttrCount = ulPrivateKeyAttributeCount + 1;
+                        }
+                        rv = NewObject(session, CKK_ML_KEM, CKO_PRIVATE_KEY,
+                                privTmplCpy, newAttrCount, &priv);
+                    }
+                }
+                XFREE(privTmplCpy, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+            }
+            if (rv == CKR_OK) {
+                ret = WP11_MlKem_GenerateKeyPair(pub, priv,
+                                                 WP11_Session_GetSlot(session));
+                if (ret != 0)
+                    rv = CKR_FUNCTION_FAILED;
+            }
+            break;
+#endif
 #ifndef NO_DH
         case CKM_DH_PKCS_KEY_PAIR_GEN:
             if (pMechanism->pParameter != NULL ||
                                               pMechanism->ulParameterLen != 0) {
                 return CKR_MECHANISM_PARAM_INVALID;
             }
+
+            /* DH needs the domain parameters CKA_PRIME and CKA_BASE. */
+            FindAttributeType(pPublicKeyTemplate, ulPublicKeyAttributeCount,
+                              CKA_PRIME, &reqAttr);
+            if (reqAttr == NULL)
+                return CKR_TEMPLATE_INCOMPLETE;
+            FindAttributeType(pPublicKeyTemplate, ulPublicKeyAttributeCount,
+                              CKA_BASE, &reqAttr);
+            if (reqAttr == NULL)
+                return CKR_TEMPLATE_INCOMPLETE;
 
             *phPublicKey = *phPrivateKey = CK_INVALID_HANDLE;
 
@@ -6816,10 +8286,16 @@ CK_RV C_GenerateKeyPair(CK_SESSION_HANDLE hSession,
         rv = SetInitialStates(priv);
     }
 
-    if (rv != CKR_OK && pub != NULL)
+    if (rv != CKR_OK && pub != NULL) {
+        if (*phPublicKey != CK_INVALID_HANDLE)
+            WP11_Session_RemoveObject(session, pub);
         WP11_Object_Free(pub);
-    if (rv != CKR_OK && priv != NULL)
+    }
+    if (rv != CKR_OK && priv != NULL) {
+        if (*phPrivateKey != CK_INVALID_HANDLE)
+            WP11_Session_RemoveObject(session, priv);
         WP11_Object_Free(priv);
+    }
 
     return rv;
 }
@@ -6838,7 +8314,15 @@ CK_RV C_GenerateKeyPair(CK_SESSION_HANDLE hSession,
  * @return  CKR_CRYPTOKI_NOT_INITIALIZED when library not initialized.
  *          CKR_SESSION_HANDLE_INVALID when session handle is not valid.
  *          CKR_ARGUMENTS_BAD when pMechanism or pulWrappedKeyLen is NULL.
- *          CKR_OBJECT_HANDLE_INVALID when a key object handle is not valid.
+ *          CKR_OBJECT_HANDLE_INVALID when hKey object handle is not valid.
+ *          CKR_WRAPPING_KEY_HANDLE_INVALID when hWrappingKey handle is not
+ *          valid.
+ *          CKR_KEY_UNEXTRACTABLE when hKey has CKA_EXTRACTABLE set to
+ *          CK_FALSE.
+ *          CKR_KEY_NOT_WRAPPABLE when hKey has CKA_WRAP_WITH_TRUSTED set to
+ *          CK_TRUE but hWrappingKey does not have CKA_TRUSTED set to CK_TRUE,
+ *          or when the key class/type combination is not supported for
+ *          wrapping.
  *          CKR_MECHANISM_INVALID when the mechanism is not supported with this
  *          type of operation.
  */
@@ -6858,6 +8342,8 @@ CK_RV C_WrapKey(CK_SESSION_HANDLE hSession,
     CK_OBJECT_CLASS keyClass = CKO_PRIVATE_KEY;
     word32 serialSize = 0;
     byte* serialBuff = NULL;
+    CK_BBOOL getVar;
+    CK_ULONG getVarLen = sizeof(CK_BBOOL);
 
     WOLFPKCS11_ENTER("C_WrapKey");
     #ifdef DEBUG_WOLFPKCS11
@@ -6882,12 +8368,17 @@ CK_RV C_WrapKey(CK_SESSION_HANDLE hSession,
         return rv;
     }
 
-    if (! WP11_Session_IsRW(session))
-        return CKR_SESSION_READ_ONLY;
-
     ret = WP11_Object_Find(session, hKey, &key);
     if (ret != 0)
         return CKR_OBJECT_HANDLE_INVALID;
+
+    ret = WP11_Object_GetAttr(key, CKA_EXTRACTABLE, &getVar, &getVarLen);
+    if (ret != 0) {
+        return CKR_KEY_NOT_WRAPPABLE;
+    }
+    if (getVar == CK_FALSE) {
+        return CKR_KEY_UNEXTRACTABLE;
+    }
 
     ret = WP11_Object_Find(session, hWrappingKey, &wrappingKey);
     if (ret != 0)
@@ -6896,6 +8387,20 @@ CK_RV C_WrapKey(CK_SESSION_HANDLE hSession,
     ret = CheckOpSupported(wrappingKey, CKA_WRAP);
     if (ret != CKR_OK)
         return ret;
+
+    /* key can only be wrapped by a trusted wrapping key */
+    getVarLen = sizeof(CK_BBOOL);
+    ret = WP11_Object_GetAttr(key, CKA_WRAP_WITH_TRUSTED,
+                                        &getVar, &getVarLen);
+    if (ret == CKR_OK && getVar == CK_TRUE) {
+        CK_BBOOL trustedVar = CK_FALSE;
+        CK_ULONG trustedVarLen = sizeof(CK_BBOOL);
+        ret = WP11_Object_GetAttr(wrappingKey, CKA_TRUSTED,
+                                        &trustedVar, &trustedVarLen);
+        if (ret != CKR_OK || trustedVar != CK_TRUE) {
+            return CKR_KEY_NOT_WRAPPABLE;
+        }
+    }
 
     wrapkeyType = WP11_Object_GetType(wrappingKey);
 
@@ -6995,6 +8500,10 @@ CK_RV C_WrapKey(CK_SESSION_HANDLE hSession,
 
                 rv = C_Encrypt(hSession, serialBuff, serialSize, pWrappedKey,
                     pulWrappedKeyLen);
+                /* C_WrapKey is single-part: a length query or a short buffer
+                 * leaves C_Encrypt's operation active, which would make the
+                 * caller's next C_WrapKey fail with CKR_OPERATION_ACTIVE. */
+                WP11_Session_SetOpInitialized(session, 0);
                 if (rv != CKR_OK)
                     goto err_out;
             }
@@ -7051,7 +8560,7 @@ CK_RV C_WrapKey(CK_SESSION_HANDLE hSession,
 err_out:
 
     if (serialBuff != NULL) {
-        XMEMSET(serialBuff, 0, serialSize);
+        wc_ForceZero(serialBuff, serialSize);
         XFREE(serialBuff, NULL, DYNAMIC_TYPE_TMP_BUFFER);
     }
 
@@ -7119,15 +8628,37 @@ CK_RV C_UnwrapKey(CK_SESSION_HANDLE hSession,
         return rv;
     }
 
-    if (!WP11_Session_IsRW(session)) {
-        rv = CKR_SESSION_READ_ONLY;
+    if (pMechanism == NULL || pWrappedKey == NULL || ulWrappedKeyLen == 0 ||
+                                           pTemplate == NULL || phKey == NULL) {
+        rv = CKR_ARGUMENTS_BAD;
         WOLFPKCS11_LEAVE("C_UnwrapKey", rv);
         return rv;
     }
 
-    if (pMechanism == NULL || pWrappedKey == NULL || ulWrappedKeyLen == 0 ||
-                                           pTemplate == NULL || phKey == NULL) {
-        rv = CKR_ARGUMENTS_BAD;
+    /* Only require R/W session for token objects */
+    if (!WP11_Session_IsRW(session)) {
+        CK_ATTRIBUTE* tokenAttr = NULL;
+        FindAttributeType(pTemplate, ulAttributeCount, CKA_TOKEN, &tokenAttr);
+        if (tokenAttr != NULL) {
+            if (tokenAttr->pValue == NULL ||
+                tokenAttr->ulValueLen != sizeof(CK_BBOOL)) {
+                rv = CKR_ATTRIBUTE_VALUE_INVALID;
+                WOLFPKCS11_LEAVE("C_UnwrapKey", rv);
+                return rv;
+            }
+            if (*(CK_BBOOL*)tokenAttr->pValue == CK_TRUE) {
+                rv = CKR_SESSION_READ_ONLY;
+                WOLFPKCS11_LEAVE("C_UnwrapKey", rv);
+                return rv;
+            }
+        }
+    }
+
+    /* C_UnwrapKey requires CKA_CLASS in the unwrapped key template per
+     * spec; no API-implied class to fall back on. */
+    rv = CheckPrivateLogin(session, pTemplate, ulAttributeCount,
+                           WP11_NO_IMPLICIT_CLASS);
+    if (rv != CKR_OK) {
         WOLFPKCS11_LEAVE("C_UnwrapKey", rv);
         return rv;
     }
@@ -7263,8 +8794,7 @@ CK_RV C_UnwrapKey(CK_SESSION_HANDLE hSession,
             }
             if (rv != CKR_OK) {
                 if (*phKey != CK_INVALID_HANDLE) {
-                    /* ignore return value, logged in function */
-                    (void)WP11_Session_RemoveObject(session, keyObj);
+                    WP11_Session_RemoveObject(session, keyObj);
                     *phKey = CK_INVALID_HANDLE;
                 }
                 if (keyObj != NULL) {
@@ -7282,7 +8812,7 @@ CK_RV C_UnwrapKey(CK_SESSION_HANDLE hSession,
 err_out:
 
     if (workBuffer != NULL) {
-        XMEMSET(workBuffer, 0, ulWrappedKeyLen);
+        wc_ForceZero(workBuffer, ulWrappedKeyLen);
         XFREE(workBuffer, NULL, DYNAMIC_TYPE_TMP_BUFFER);
     }
 
@@ -7367,15 +8897,22 @@ static int SetKeyExtract(WP11_Session* session, byte* ptr, CK_ULONG length,
         secretKeyData[1] = ptr + (length - symmKeyLen);
         secretKeyLen[1] = symmKeyLen;
         ret = WP11_Object_SetSecretKey(secret, secretKeyData, secretKeyLen);
-        if (ret != CKR_OK)
+        if (ret != CKR_OK) {
+            WP11_Object_Free(secret);
             return CKR_FUNCTION_FAILED;
+        }
         ret = (int)AddObject(session, secret, pTemplate, ulAttributeCount,
             handle);
         if (ret != CKR_OK) {
+            WP11_Object_Free(secret);
             return ret;
         }
     }
-    if ((ret == 0) && (isMac)) {
+    else {
+        WP11_Object_Free(secret);
+        return ret;
+    }
+    if (isMac) {
         ret = WP11_Object_SetAttr(secret, CKA_KEY_TYPE, (byte*)&keyType,
                                   sizeof(keyType));
         if (ret != CKR_OK)
@@ -7523,6 +9060,12 @@ CK_RV C_DeriveKey(CK_SESSION_HANDLE hSession,
     CK_ULONG symmKeyLen;
     unsigned char* secretKeyData[2] = { NULL, NULL };
     CK_ULONG secretKeyLen[2] = { 0, 0 };
+#ifndef WOLFPKCS11_LEGACY_DERIVE_NO_INHERIT
+    /* F-4533: protection attributes inherited from the base key. */
+    CK_BBOOL baseSensitive = CK_FALSE;
+    CK_BBOOL baseExtractable = CK_TRUE;
+    CK_ULONG bLen;
+#endif
 #endif
 
     WOLFPKCS11_ENTER("C_DeriveKey");
@@ -7554,16 +9097,46 @@ CK_RV C_DeriveKey(CK_SESSION_HANDLE hSession,
         WOLFPKCS11_LEAVE("C_DeriveKey", rv);
         return rv;
     }
+    /* Only require R/W session for token objects */
+    if (!WP11_Session_IsRW(session)) {
+        CK_ATTRIBUTE* tokenAttr = NULL;
+        FindAttributeType(pTemplate, ulAttributeCount, CKA_TOKEN, &tokenAttr);
+        if (tokenAttr != NULL) {
+            if (tokenAttr->pValue == NULL ||
+                tokenAttr->ulValueLen != sizeof(CK_BBOOL)) {
+                rv = CKR_ATTRIBUTE_VALUE_INVALID;
+                WOLFPKCS11_LEAVE("C_DeriveKey", rv);
+                return rv;
+            }
+            if (*(CK_BBOOL*)tokenAttr->pValue == CK_TRUE) {
+                rv = CKR_SESSION_READ_ONLY;
+                WOLFPKCS11_LEAVE("C_DeriveKey", rv);
+                return rv;
+            }
+        }
+    }
 
     ret = WP11_Object_Find(session, hBaseKey, &obj);
     if (ret != 0)
         return CKR_OBJECT_HANDLE_INVALID;
+
+    /* F-4064: spec-compliance gate - reject keys whose CKA_DERIVE is CK_FALSE.
+     * Skipped for NSS, which generates ephemeral EC keys for TLS ECDHE without
+     * setting CKA_DERIVE=CK_TRUE and relies on the historic permissive
+     * behavior (WP11_NSS_PERMISSIVE_KEY_DEFAULTS is auto-enabled for NSS). */
+#ifndef WP11_NSS_PERMISSIVE_KEY_DEFAULTS
+    ret = CheckOpSupported(obj, CKA_DERIVE);
+    if (ret != CKR_OK)
+        return ret;
+#endif
 
     switch (pMechanism->mechanism) {
 #ifdef HAVE_ECC
         case CKM_ECDH1_DERIVE: {
             CK_ECDH1_DERIVE_PARAMS* params;
 
+            if (WP11_Object_GetType(obj) != CKK_EC)
+                return CKR_KEY_TYPE_INCONSISTENT;
             if (pMechanism->pParameter == NULL)
                 return CKR_MECHANISM_PARAM_INVALID;
             if (pMechanism->ulParameterLen != sizeof(CK_ECDH1_DERIVE_PARAMS))
@@ -7596,6 +9169,12 @@ CK_RV C_DeriveKey(CK_SESSION_HANDLE hSession,
             CK_HKDF_PARAMS_PTR kdfParams;
             CK_ATTRIBUTE *lenAttr = NULL;
 
+            /* Data-derive feeds a CKO_DATA object, which has no key type.
+             * Only a key base object is checked for an HKDF-compatible type. */
+            if (WP11_Object_GetClass(obj) != CKO_DATA &&
+                WP11_Object_GetType(obj) != CKK_HKDF &&
+                WP11_Object_GetType(obj) != CKK_GENERIC_SECRET)
+                return CKR_KEY_TYPE_INCONSISTENT;
             if (pMechanism->pParameter == NULL)
                 return CKR_MECHANISM_PARAM_INVALID;
             if (pMechanism->ulParameterLen != sizeof(CK_HKDF_PARAMS))
@@ -7607,10 +9186,20 @@ CK_RV C_DeriveKey(CK_SESSION_HANDLE hSession,
             FindAttributeType(pTemplate, ulAttributeCount, CKA_VALUE_LEN,
                 &lenAttr);
             if (kdfParams->bExpand) {
-                if (!lenAttr) {
-                    return CKR_MECHANISM_PARAM_INVALID;
+                CK_ULONG reqLen;
+                if (!lenAttr || !lenAttr->pValue) {
+                    return CKR_ATTRIBUTE_VALUE_INVALID;
                 }
-                keyLen = *(word32*)lenAttr->pValue;
+                if (lenAttr->ulValueLen != sizeof(CK_ULONG)) {
+                    return CKR_ATTRIBUTE_VALUE_INVALID;
+                }
+                XMEMCPY(&reqLen, lenAttr->pValue, sizeof(CK_ULONG));
+                /* Reject zero and cap to the RFC 5869 maximum, which also
+                 * keeps the value within word32 range. */
+                if (reqLen == 0 || reqLen > WP11_MAX_HKDF_OUTPUT) {
+                    return CKR_ATTRIBUTE_VALUE_INVALID;
+                }
+                keyLen = (word32)reqLen;
             }
             else {
                 keyLen = WC_MAX_DIGEST_SIZE;
@@ -7629,6 +9218,8 @@ CK_RV C_DeriveKey(CK_SESSION_HANDLE hSession,
 #endif
 #ifndef NO_DH
         case CKM_DH_PKCS_DERIVE:
+            if (WP11_Object_GetType(obj) != CKK_DH)
+                return CKR_KEY_TYPE_INCONSISTENT;
             if (pMechanism->pParameter == NULL)
                 return CKR_MECHANISM_PARAM_INVALID;
             if (pMechanism->ulParameterLen == 0)
@@ -7651,6 +9242,8 @@ CK_RV C_DeriveKey(CK_SESSION_HANDLE hSession,
 #ifdef HAVE_AES_CBC
         case CKM_AES_CBC_ENCRYPT_DATA: {
             CK_AES_CBC_ENCRYPT_DATA_PARAMS* params;
+            if (WP11_Object_GetType(obj) != CKK_AES)
+                return CKR_KEY_TYPE_INCONSISTENT;
             if (pMechanism->pParameter == NULL)
                 return CKR_MECHANISM_PARAM_INVALID;
             if (pMechanism->ulParameterLen !=
@@ -7678,6 +9271,8 @@ CK_RV C_DeriveKey(CK_SESSION_HANDLE hSession,
         case CKM_TLS12_KEY_AND_MAC_DERIVE:
         {
             CK_TLS12_KEY_MAT_PARAMS* tlsParams = NULL;
+            if (WP11_Object_GetType(obj) != CKK_GENERIC_SECRET)
+                return CKR_KEY_TYPE_INCONSISTENT;
             if (pMechanism->pParameter == NULL)
                 return CKR_MECHANISM_PARAM_INVALID;
             if (pMechanism->ulParameterLen !=
@@ -7687,14 +9282,34 @@ CK_RV C_DeriveKey(CK_SESSION_HANDLE hSession,
             if (tlsParams->pReturnedKeyMaterial == NULL)
                 return CKR_MECHANISM_PARAM_INVALID;
 
-            keyLen = (word32)(2 * tlsParams->ulMacSizeInBits) +
-                     (word32)(2 * tlsParams->ulKeySizeInBits) +
-                     (word32)(2 * tlsParams->ulIVSizeInBits);
-            if (keyLen == 0)
-                return CKR_MECHANISM_PARAM_INVALID;
-            if ((keyLen % 8) != 0)
-                return CKR_MECHANISM_PARAM_INVALID;
-            keyLen /= 8;
+            {
+                CK_ULONG totalBits;
+                CK_ULONG a = 2 * tlsParams->ulMacSizeInBits;
+                CK_ULONG b = 2 * tlsParams->ulKeySizeInBits;
+                CK_ULONG c = 2 * tlsParams->ulIVSizeInBits;
+                /* Validate individual fields won't overflow when doubled */
+                if (tlsParams->ulMacSizeInBits > ((CK_ULONG)0xFFFFFFFF / 2) ||
+                    tlsParams->ulKeySizeInBits > ((CK_ULONG)0xFFFFFFFF / 2) ||
+                    tlsParams->ulIVSizeInBits  > ((CK_ULONG)0xFFFFFFFF / 2)) {
+                    return CKR_MECHANISM_PARAM_INVALID;
+                }
+                /* Check sum won't overflow on 32-bit */
+                if (a > (CK_ULONG)0xFFFFFFFF - b)
+                    return CKR_MECHANISM_PARAM_INVALID;
+                totalBits = a + b;
+                if (totalBits > (CK_ULONG)0xFFFFFFFF - c)
+                    return CKR_MECHANISM_PARAM_INVALID;
+                totalBits += c;
+                if (totalBits == 0)
+                    return CKR_MECHANISM_PARAM_INVALID;
+                if ((totalBits % 8) != 0)
+                    return CKR_MECHANISM_PARAM_INVALID;
+                totalBits /= 8;
+                /* On 64-bit, CK_ULONG may exceed word32 range */
+                if (totalBits > (CK_ULONG)0xFFFFFFFF)
+                    return CKR_MECHANISM_PARAM_INVALID;
+                keyLen = (word32)totalBits;
+            }
 
             derivedKey = (byte*)XMALLOC(keyLen, NULL, DYNAMIC_TYPE_TMP_BUFFER);
             if (derivedKey == NULL)
@@ -7711,7 +9326,7 @@ CK_RV C_DeriveKey(CK_SESSION_HANDLE hSession,
 
             /* Freeing here so that we don't attempt to generate a key at the
              * end of the function */
-            XMEMSET(derivedKey, 0, keyLen);
+            wc_ForceZero(derivedKey, keyLen);
             XFREE(derivedKey, NULL, DYNAMIC_TYPE_TMP_BUFFER);
             derivedKey = NULL;
 
@@ -7723,6 +9338,8 @@ CK_RV C_DeriveKey(CK_SESSION_HANDLE hSession,
         case CKM_TLS12_MASTER_KEY_DERIVE_DH:
         {
             CK_TLS12_MASTER_KEY_DERIVE_PARAMS* prfParams;
+            if (WP11_Object_GetType(obj) != CKK_GENERIC_SECRET)
+                return CKR_KEY_TYPE_INCONSISTENT;
             if (pMechanism->pParameter == NULL)
                 return CKR_MECHANISM_PARAM_INVALID;
             if (pMechanism->ulParameterLen !=
@@ -7797,7 +9414,43 @@ CK_RV C_DeriveKey(CK_SESSION_HANDLE hSession,
 #if defined(HAVE_ECC) || !defined(NO_DH) || defined(WOLFPKCS11_HKDF) || \
     (!defined(NO_AES) && defined(HAVE_AES_CBC))
     if ((ret == 0) && (derivedKey != NULL)) {
+#if (defined(HAVE_ECC) || !defined(NO_DH) || defined(WOLFPKCS11_HKDF)) && \
+    !defined(WOLFPKCS11_LEGACY_DERIVE_NO_INHERIT)
+        /* F-4533: read the base key's protection bits while `obj' still
+         * refers to it, before CreateObject reuses `obj' for the new key. */
+        bLen = sizeof(CK_BBOOL);
+        if (WP11_Object_GetAttr(obj, CKA_SENSITIVE, &baseSensitive, &bLen) != 0)
+            baseSensitive = CK_FALSE;
+        bLen = sizeof(CK_BBOOL);
+        if (WP11_Object_GetAttr(obj, CKA_EXTRACTABLE, &baseExtractable,
+                                &bLen) != 0)
+            baseExtractable = CK_TRUE;
+#endif
         rv = CreateObject(session, pTemplate, ulAttributeCount, &obj);
+        if (rv == CKR_OK) {
+            /* obj now refers to the newly created derived key. */
+#if (defined(HAVE_ECC) || !defined(NO_DH) || defined(WOLFPKCS11_HKDF)) && \
+    !defined(WOLFPKCS11_LEGACY_DERIVE_NO_INHERIT)
+            /* F-4533: PKCS#11 v3.0 5.5.5 - a derived key must be at least as
+             * protected as its base key. Force the inherited attributes after
+             * the caller template has been applied so a weaker template
+             * cannot win. */
+            if (baseSensitive == CK_TRUE) {
+                CK_BBOOL bbTrue = CK_TRUE;
+                if (WP11_Object_SetAttr(obj, CKA_SENSITIVE, &bbTrue,
+                                        sizeof(bbTrue)) != 0)
+                    rv = CKR_FUNCTION_FAILED;
+            }
+            if (rv == CKR_OK && baseExtractable == CK_FALSE) {
+                CK_BBOOL bbFalse = CK_FALSE;
+                if (WP11_Object_SetAttr(obj, CKA_EXTRACTABLE, &bbFalse,
+                                        sizeof(bbFalse)) != 0)
+                    rv = CKR_FUNCTION_FAILED;
+            }
+            if (rv != CKR_OK)
+                WP11_Object_Free(obj);
+#endif
+        }
         if (rv == CKR_OK) {
             ret = SymmKeyLen(obj, keyLen, &symmKeyLen);
             if (ret == 0) {
@@ -7808,8 +9461,10 @@ CK_RV C_DeriveKey(CK_SESSION_HANDLE hSession,
                 secretKeyLen[1] = symmKeyLen;
                 ret = WP11_Object_SetSecretKey(obj, secretKeyData,
                                                 secretKeyLen);
-                if (ret != 0)
+                if (ret != 0) {
+                    WP11_Object_Free(obj);
                     rv = CKR_FUNCTION_FAILED;
+                }
                 if (ret == 0) {
                     rv = AddObject(session, obj, pTemplate,
                                     ulAttributeCount, phKey);
@@ -7822,12 +9477,12 @@ CK_RV C_DeriveKey(CK_SESSION_HANDLE hSession,
         }
     }
 
-    if (rv == CKR_OK) {
+    if ((rv == CKR_OK) && (derivedKey != NULL)) {
         rv = SetInitialStates(obj);
     }
 
     if (derivedKey != NULL) {
-        XMEMSET(derivedKey, 0, keyLen);
+        wc_ForceZero(derivedKey, keyLen);
         XFREE(derivedKey, NULL, DYNAMIC_TYPE_TMP_BUFFER);
     }
 #endif
@@ -7874,6 +9529,16 @@ CK_RV C_SeedRandom(CK_SESSION_HANDLE hSession, CK_BYTE_PTR pSeed,
         return rv;
     }
     if (pSeed == NULL) {
+        rv = CKR_ARGUMENTS_BAD;
+        WOLFPKCS11_LEAVE("C_SeedRandom", rv);
+        return rv;
+    }
+
+    /* The seed is passed to the RNG as a one-shot nonce whose length is an
+     * int; a length that does not fit cannot be honoured without truncation
+     * (and repeatedly re-seeding would discard, not accumulate, entropy), so
+     * reject it rather than silently using a truncated length. */
+    if (ulSeedLen > (CK_ULONG)INT_MAX) {
         rv = CKR_ARGUMENTS_BAD;
         WOLFPKCS11_LEAVE("C_SeedRandom", rv);
         return rv;
@@ -7942,7 +9607,22 @@ CK_RV C_GenerateRandom(CK_SESSION_HANDLE hSession,
     }
 
     slot = WP11_Session_GetSlot(session);
-    ret = WP11_Slot_GenerateRandom(slot, pRandomData, (int)ulRandomLen);
+    /* ulRandomLen is a CK_ULONG which may exceed the range of the int taken by
+     * WP11_Slot_GenerateRandom(). Generate in bounded chunks so the entire
+     * requested buffer is filled instead of silently truncating the length. */
+    ret = 0;
+    {
+        CK_ULONG offset = 0;
+        while (offset < ulRandomLen) {
+            CK_ULONG remaining = ulRandomLen - offset;
+            int chunk = (remaining > WOLFPKCS11_RNG_MAX_GEN) ?
+                (int)WOLFPKCS11_RNG_MAX_GEN : (int)remaining;
+            ret = WP11_Slot_GenerateRandom(slot, pRandomData + offset, chunk);
+            if (ret != 0)
+                break;
+            offset += (CK_ULONG)chunk;
+        }
+    }
     if (ret == MEMORY_E) {
         rv = CKR_DEVICE_MEMORY;
         WOLFPKCS11_LEAVE("C_GenerateRandom", rv);
@@ -8309,14 +9989,146 @@ CK_RV C_MessageVerifyFinal(CK_SESSION_HANDLE hSession)
 
 #if defined (WOLFPKCS11_PKCS11_V3_2)
 
+#ifdef WOLFPKCS11_MLKEM
+/*
+ * PKCS#11 v3.0 sec 5.1: an object whose effective CKA_PRIVATE is CK_TRUE must
+ * not be created on a session that is not logged in as the user. Empty-PIN
+ * tokens treat public sessions as logged in (mirrors the find-time gate in
+ * WP11_Object_Find). Returns CKR_USER_NOT_LOGGED_IN when the template asks for
+ * a private object on a public session, otherwise CKR_OK.
+ *
+ * Only used by C_EncapsulateKey / C_DecapsulateKey, which are themselves
+ * compiled out without WOLFPKCS11_MLKEM; guard the definition the same way to
+ * avoid an unused-function error under -Werror.
+ */
+static CK_RV CheckPrivateObjectLogin(WP11_Session* session,
+                                     CK_ATTRIBUTE_PTR pTemplate,
+                                     CK_ULONG ulAttributeCount)
+{
+    CK_ATTRIBUTE* privAttr = NULL;
+
+    FindAttributeType(pTemplate, ulAttributeCount, CKA_PRIVATE, &privAttr);
+    if (privAttr != NULL && privAttr->pValue != NULL &&
+            privAttr->ulValueLen == sizeof(CK_BBOOL) &&
+            *(CK_BBOOL*)privAttr->pValue == CK_TRUE) {
+        WP11_Slot* slot = WP11_Session_GetSlot(session);
+        if (!WP11_Slot_Has_Empty_Pin(slot) && !WP11_Slot_IsLoggedIn(slot)) {
+            return CKR_USER_NOT_LOGGED_IN;
+        }
+    }
+
+    return CKR_OK;
+}
+#endif /* WOLFPKCS11_MLKEM */
+
 CK_RV C_EncapsulateKey(CK_SESSION_HANDLE hSession, CK_MECHANISM_PTR pMechanism,
                        CK_OBJECT_HANDLE hPublicKey, CK_ATTRIBUTE_PTR pTemplate,
-                       CK_ULONG ulAttributeCount, CK_OBJECT_HANDLE_PTR phKey,
-                       CK_BYTE_PTR pCiphertext, CK_ULONG_PTR pulCiphertextLen)
+                       CK_ULONG ulAttributeCount, CK_BYTE_PTR pCiphertext,
+                       CK_ULONG_PTR pulCiphertextLen, CK_OBJECT_HANDLE_PTR phKey)
 {
+#ifdef WOLFPKCS11_MLKEM
+    int ret;
+    CK_RV rv = CKR_OK;
+    WP11_Session* session;
+    WP11_Object* pubObj = NULL;
+    WP11_Object* secretObj = NULL;
+    byte* derivedKey = NULL;
+    word32 keyLen = 0;
+    unsigned char* secretKeyData[2] = { NULL, NULL };
+    CK_ULONG secretKeyLen[2] = { 0, 0 };
+#endif
+
     if (!WP11_Library_IsInitialized())
         return CKR_CRYPTOKI_NOT_INITIALIZED;
+#ifdef WOLFPKCS11_MLKEM
+    if (WP11_Session_Get(hSession, &session) != 0)
+        return CKR_SESSION_HANDLE_INVALID;
+    if (pMechanism == NULL || pTemplate == NULL || phKey == NULL ||
+        pulCiphertextLen == NULL)
+        return CKR_ARGUMENTS_BAD;
 
+    ret = WP11_Object_Find(session, hPublicKey, &pubObj);
+    if (ret != 0)
+        return CKR_OBJECT_HANDLE_INVALID;
+    if (WP11_Object_GetClass(pubObj) != CKO_PUBLIC_KEY)
+        return CKR_KEY_HANDLE_INVALID;
+
+    ret = CheckOpSupportedRv(pubObj, CKA_ENCAPSULATE,
+                             CKR_KEY_FUNCTION_NOT_PERMITTED);
+    if (ret != CKR_OK)
+        return (CK_RV)ret;
+
+    /* Only require R/W session for token objects */
+    if (!WP11_Session_IsRW(session)) {
+        CK_ATTRIBUTE* tokenAttr = NULL;
+        FindAttributeType(pTemplate, ulAttributeCount, CKA_TOKEN, &tokenAttr);
+        if (tokenAttr != NULL) {
+            if (tokenAttr->pValue == NULL ||
+                tokenAttr->ulValueLen != sizeof(CK_BBOOL)) {
+                rv = CKR_ATTRIBUTE_VALUE_INVALID;
+                return rv;
+            }
+            if (*(CK_BBOOL*)tokenAttr->pValue == CK_TRUE) {
+                rv = CKR_SESSION_READ_ONLY;
+                return rv;
+            }
+        }
+    }
+
+    switch (pMechanism->mechanism) {
+        case CKM_ML_KEM:
+            if (pMechanism->pParameter != NULL ||
+                pMechanism->ulParameterLen != 0) {
+                return CKR_MECHANISM_PARAM_INVALID;
+            }
+            ret = WP11_MlKem_Encapsulate(pubObj, &derivedKey, &keyLen,
+                                         pCiphertext, pulCiphertextLen);
+            if (ret < 0)
+                rv = CKR_FUNCTION_FAILED;
+            else if (ret > 0)
+                rv = (CK_RV)ret;
+            break;
+        default:
+            return CKR_MECHANISM_INVALID;
+    }
+
+    /* If the user called with an empty pCiphertext to query the ciphertext
+     * length, WP11_MlKem_Encapsulate() sets the size to pulCiphertextLen and
+     * returns 0. In this case, we have to exit early. */
+    if (rv == CKR_OK && pCiphertext == NULL)
+        return CKR_OK;
+
+    if (rv == CKR_OK)
+        rv = CheckPrivateObjectLogin(session, pTemplate, ulAttributeCount);
+
+    if (rv == CKR_OK) {
+        rv = CreateObject(session, pTemplate, ulAttributeCount, &secretObj);
+        if (rv == CKR_OK) {
+            secretKeyData[1] = derivedKey;
+            secretKeyLen[1] = keyLen;
+            ret = WP11_Object_SetSecretKey(secretObj, secretKeyData,
+                                           secretKeyLen);
+            if (ret != 0)
+                rv = CKR_FUNCTION_FAILED;
+            if (rv == CKR_OK)
+                rv = SetInitialStates(secretObj);
+            if (rv == CKR_OK)
+                rv = AddObject(session, secretObj, pTemplate, ulAttributeCount,
+                               phKey);
+        }
+        if (rv != CKR_OK && secretObj != NULL) {
+            WP11_Object_Free(secretObj);
+            secretObj = NULL;
+        }
+    }
+
+    if (derivedKey != NULL) {
+        wc_ForceZero(derivedKey, keyLen);
+        XFREE(derivedKey, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+    }
+
+    return rv;
+#else
     (void)hSession;
     (void)pMechanism;
     (void)hPublicKey;
@@ -8325,18 +10137,112 @@ CK_RV C_EncapsulateKey(CK_SESSION_HANDLE hSession, CK_MECHANISM_PTR pMechanism,
     (void)phKey;
     (void)pCiphertext;
     (void)pulCiphertextLen;
-
     return CKR_FUNCTION_NOT_SUPPORTED;
+#endif
 }
 
 CK_RV C_DecapsulateKey(CK_SESSION_HANDLE hSession, CK_MECHANISM_PTR pMechanism,
-                       CK_OBJECT_HANDLE hPrivateKey, CK_BYTE_PTR pCiphertext,
-                       CK_ULONG ulCiphertextLen, CK_ATTRIBUTE_PTR pTemplate,
-                       CK_ULONG ulAttributeCount, CK_OBJECT_HANDLE_PTR phKey)
+                       CK_OBJECT_HANDLE hPrivateKey, CK_ATTRIBUTE_PTR pTemplate,
+                       CK_ULONG ulAttributeCount, CK_BYTE_PTR pCiphertext,
+                       CK_ULONG ulCiphertextLen, CK_OBJECT_HANDLE_PTR phKey)
 {
+#ifdef WOLFPKCS11_MLKEM
+    int ret;
+    CK_RV rv = CKR_OK;
+    WP11_Session* session;
+    WP11_Object* privObj = NULL;
+    WP11_Object* secretObj = NULL;
+    byte* derivedKey = NULL;
+    word32 keyLen = 0;
+    unsigned char* secretKeyData[2] = { NULL, NULL };
+    CK_ULONG secretKeyLen[2] = { 0, 0 };
+#endif
+
     if (!WP11_Library_IsInitialized())
         return CKR_CRYPTOKI_NOT_INITIALIZED;
+#ifdef WOLFPKCS11_MLKEM
+    if (WP11_Session_Get(hSession, &session) != 0)
+        return CKR_SESSION_HANDLE_INVALID;
+    if (pMechanism == NULL || pCiphertext == NULL || pTemplate == NULL ||
+        phKey == NULL)
+        return CKR_ARGUMENTS_BAD;
 
+    ret = WP11_Object_Find(session, hPrivateKey, &privObj);
+    if (ret != 0)
+        return CKR_OBJECT_HANDLE_INVALID;
+    if (WP11_Object_GetClass(privObj) != CKO_PRIVATE_KEY)
+        return CKR_KEY_HANDLE_INVALID;
+
+    ret = CheckOpSupportedRv(privObj, CKA_DECAPSULATE,
+                             CKR_KEY_FUNCTION_NOT_PERMITTED);
+    if (ret != CKR_OK)
+        return (CK_RV)ret;
+
+    /* Only require R/W session for token objects */
+    if (!WP11_Session_IsRW(session)) {
+        CK_ATTRIBUTE* tokenAttr = NULL;
+        FindAttributeType(pTemplate, ulAttributeCount, CKA_TOKEN, &tokenAttr);
+        if (tokenAttr != NULL) {
+            if (tokenAttr->pValue == NULL ||
+                tokenAttr->ulValueLen != sizeof(CK_BBOOL)) {
+                rv = CKR_ATTRIBUTE_VALUE_INVALID;
+                return rv;
+            }
+            if (*(CK_BBOOL*)tokenAttr->pValue == CK_TRUE) {
+                rv = CKR_SESSION_READ_ONLY;
+                return rv;
+            }
+        }
+    }
+
+    switch (pMechanism->mechanism) {
+        case CKM_ML_KEM:
+            if (pMechanism->pParameter != NULL ||
+                pMechanism->ulParameterLen != 0) {
+                return CKR_MECHANISM_PARAM_INVALID;
+            }
+            ret = WP11_MlKem_Decapsulate(privObj, &derivedKey, &keyLen,
+                                         pCiphertext, ulCiphertextLen);
+            if (ret < 0)
+                rv = CKR_FUNCTION_FAILED;
+            else if (ret > 0)
+                rv = (CK_RV)ret;
+            break;
+        default:
+            return CKR_MECHANISM_INVALID;
+    }
+
+    if (rv == CKR_OK)
+        rv = CheckPrivateObjectLogin(session, pTemplate, ulAttributeCount);
+
+    if (rv == CKR_OK) {
+        rv = CreateObject(session, pTemplate, ulAttributeCount, &secretObj);
+        if (rv == CKR_OK) {
+            secretKeyData[1] = derivedKey;
+            secretKeyLen[1] = keyLen;
+            ret = WP11_Object_SetSecretKey(secretObj, secretKeyData,
+                                           secretKeyLen);
+            if (ret != 0)
+                rv = CKR_FUNCTION_FAILED;
+            if (rv == CKR_OK)
+                rv = SetInitialStates(secretObj);
+            if (rv == CKR_OK)
+                rv = AddObject(session, secretObj, pTemplate, ulAttributeCount,
+                               phKey);
+        }
+        if (rv != CKR_OK && secretObj != NULL) {
+            WP11_Object_Free(secretObj);
+            secretObj = NULL;
+        }
+    }
+
+    if (derivedKey != NULL) {
+        wc_ForceZero(derivedKey, keyLen);
+        XFREE(derivedKey, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+    }
+
+    return rv;
+#else
     (void)hSession;
     (void)pMechanism;
     (void)hPrivateKey;
@@ -8345,8 +10251,8 @@ CK_RV C_DecapsulateKey(CK_SESSION_HANDLE hSession, CK_MECHANISM_PTR pMechanism,
     (void)pTemplate;
     (void)ulAttributeCount;
     (void)phKey;
-
     return CKR_FUNCTION_NOT_SUPPORTED;
+#endif
 }
 
 CK_RV C_VerifySignatureInit(CK_SESSION_HANDLE hSession, CK_MECHANISM_PTR pMechanism,

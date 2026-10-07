@@ -65,7 +65,8 @@ static int soPinLen = 14;
 static byte* userPin = (byte*)"wolfpkcs11-test";
 static int userPinLen;
 
-#if !defined(NO_RSA) || defined(HAVE_ECC) || !defined(NO_DH)
+#if !defined(NO_RSA) || defined(HAVE_ECC) || !defined(NO_DH) || \
+    defined(WOLFPKCS11_MLDSA) || defined(WOLFPKCS11_MLKEM)
 static CK_OBJECT_CLASS pubKeyClass     = CKO_PUBLIC_KEY;
 #endif
 static CK_OBJECT_CLASS privKeyClass    = CKO_PRIVATE_KEY;
@@ -89,6 +90,12 @@ static CK_KEY_TYPE dhKeyType  = CKK_DH;
 static CK_KEY_TYPE aesKeyType  = CKK_AES;
 #endif
 static CK_KEY_TYPE genericKeyType  = CKK_GENERIC_SECRET;
+#ifdef WOLFPKCS11_MLDSA
+static CK_KEY_TYPE mldsaKeyType = CKK_ML_DSA;
+#endif
+#ifdef WOLFPKCS11_MLKEM
+static CK_KEY_TYPE mlkemKeyType = CKK_ML_KEM;
+#endif
 
 
 static CK_RV test_session(void* args)
@@ -240,14 +247,17 @@ static CK_RV test_object(void* args)
     CK_ATTRIBUTE empty[] = { };
 #endif
     CK_ATTRIBUTE keyTypeNull[] = {
+        { CKA_CLASS,             &secretKeyClass,   sizeof(secretKeyClass)    },
         { CKA_KEY_TYPE,          NULL,              sizeof(CK_KEY_TYPE)       }
     };
     CK_ATTRIBUTE keyTypeZeroLen[] = {
+        { CKA_CLASS,             &secretKeyClass,   sizeof(secretKeyClass)    },
         { CKA_KEY_TYPE,          &genericKeyType,   0,                        }
     };
     CK_ULONG badKeyType = -1;
     CK_ATTRIBUTE keyTypeBadValue[] = {
-        { CKA_KEY_TYPE,          &badKeyType,       sizeof(&badKeyType)       }
+        { CKA_CLASS,             &secretKeyClass,   sizeof(secretKeyClass)    },
+        { CKA_KEY_TYPE,          &badKeyType,       sizeof(badKeyType)        }
     };
     CK_ATTRIBUTE keyDataNull[] = {
         { CKA_CLASS,             &privKeyClass,     sizeof(privKeyClass)      },
@@ -263,10 +273,12 @@ static CK_RV test_object(void* args)
         { CKA_CLASS,             &secretKeyClass,   0,                        }
     };
     CK_ATTRIBUTE tokenNull[] = {
+        { CKA_CLASS,             &secretKeyClass,   sizeof(secretKeyClass)    },
         { CKA_KEY_TYPE,          &genericKeyType,   sizeof(genericKeyType)    },
         { CKA_TOKEN,             NULL,              sizeof(CK_BBOOL)          },
     };
     CK_ATTRIBUTE tokenBadLen[] = {
+        { CKA_CLASS,             &secretKeyClass,   sizeof(secretKeyClass)    },
         { CKA_KEY_TYPE,          &genericKeyType,   sizeof(genericKeyType)    },
         { CKA_TOKEN,             &ckTrue,           0                         },
     };
@@ -435,10 +447,21 @@ static CK_RV test_object(void* args)
         CHECK_CKR(ret, "Open Session - read-only");
     }
 #ifndef WOLFPKCS11_NSS
+    /* Session objects can be created/copied/destroyed in RO sessions */
     if (ret == CKR_OK) {
         ret = funcList->C_CreateObject(sessionRO, tmpl, tmplCnt, &obj);
+        CHECK_CKR(ret, "Create session Object in read-only session");
+    }
+    if (ret == CKR_OK) {
+        funcList->C_DestroyObject(sessionRO, obj);
+        obj = CK_INVALID_HANDLE;
+    }
+    /* Token objects must be blocked in RO sessions */
+    if (ret == CKR_OK) {
+        ret = funcList->C_CreateObject(sessionRO, tmplOnToken, tmplOnTokenCnt,
+                                                                          &obj);
         CHECK_CKR_FAIL(ret, CKR_SESSION_READ_ONLY,
-                                          "Create Object in read-only session");
+                                   "Create token Object in read-only session");
     }
     if (ret == CKR_OK) {
         ret = funcList->C_CopyObject(sessionRO, objOnToken, copyTmpl,
@@ -480,6 +503,7 @@ static CK_RV test_attribute(void* args)
         { CKA_CLASS,             &privKeyClass,     sizeof(privKeyClass)      },
         { CKA_KEY_TYPE,          &genericKeyType,   sizeof(genericKeyType)    },
         { CKA_EXTRACTABLE,       &ckTrue,           sizeof(ckTrue)            },
+        { CKA_SENSITIVE,         &ckFalse,          sizeof(ckFalse)           },
         { CKA_VALUE,             keyData,           sizeof(keyData)           },
     };
     CK_ULONG tmplCnt = sizeof(tmpl) / sizeof(*tmpl);
@@ -488,7 +512,7 @@ static CK_RV test_attribute(void* args)
         { CKA_TOKEN,             &ckTrue,           0                         }
     };
     CK_ATTRIBUTE badAttrType[] = {
-        { -1,                    &ckTrue,           sizeof(ckTrue)            }
+        { (CK_ATTRIBUTE_TYPE)-1, &ckTrue,           sizeof(ckTrue)            }
     };
     CK_ATTRIBUTE badAttrLen[] = {
         { CKA_VALUE,             retKeyData,        0                         }
@@ -778,12 +802,18 @@ static CK_RV get_generic_key(CK_SESSION_HANDLE session, unsigned char* data,
                              CK_OBJECT_HANDLE* key)
 {
     CK_RV ret;
+    CK_BBOOL sensitive = (extractable == CK_TRUE) ? CK_FALSE : CK_TRUE;
     CK_ATTRIBUTE generic_key[] = {
         { CKA_CLASS,             &secretKeyClass,   sizeof(secretKeyClass)    },
         { CKA_KEY_TYPE,          &genericKeyType,   sizeof(genericKeyType)    },
         { CKA_EXTRACTABLE,       &extractable,      sizeof(CK_BBOOL)          },
+        { CKA_SENSITIVE,         &sensitive,         sizeof(CK_BBOOL)          },
         { CKA_SIGN,              &ckTrue,           sizeof(ckTrue)            },
         { CKA_VERIFY,            &ckTrue,           sizeof(ckTrue)            },
+        { CKA_DERIVE,            &ckTrue,           sizeof(ckTrue)            },
+        /* CKA_WRAP/CKA_UNWRAP default flipped to CK_FALSE per Fenrir 2774. */
+        { CKA_WRAP,              &ckTrue,           sizeof(ckTrue)            },
+        { CKA_UNWRAP,            &ckTrue,           sizeof(ckTrue)            },
         { CKA_VALUE,             data,              len                       },
     };
     int cnt = sizeof(generic_key)/sizeof(*generic_key);
@@ -973,9 +1003,12 @@ static CK_RV get_aes_128_key(CK_SESSION_HANDLE session, unsigned char* id,
 #endif
         { CKA_ENCRYPT,           &ckTrue,           sizeof(ckTrue)            },
         { CKA_DECRYPT,           &ckTrue,           sizeof(ckTrue)            },
+        /* CKA_WRAP/CKA_UNWRAP default to CK_FALSE post-Fenrir 2774. */
+        { CKA_WRAP,              &ckTrue,           sizeof(ckTrue)            },
+        { CKA_UNWRAP,            &ckTrue,           sizeof(ckTrue)            },
         { CKA_VALUE,             aes_128_key,       sizeof(aes_128_key)       },
         { CKA_TOKEN,             &ckTrue,           sizeof(ckTrue)            },
-        { CKA_ID,                id,                idLen                     },
+        { CKA_ID,                id,                (CK_ULONG)idLen           },
     };
     int cnt = sizeof(aes_key)/sizeof(*aes_key);
 
@@ -1236,6 +1269,18 @@ static CK_RV test_digest(void* args)
         ret = funcList->C_DigestKey(CK_INVALID_HANDLE, key);
         CHECK_CKR_FAIL(ret, CKR_SESSION_HANDLE_INVALID,
                                            "Digest Key invalid session handle");
+    }
+    if (ret == CKR_OK) {
+        /* C_DigestKey must return CKR_OPERATION_NOT_INITIALIZED before any
+         * other validation when C_DigestInit has not been called. */
+        ret = funcList->C_DigestKey(session, key);
+        CHECK_CKR_FAIL(ret, CKR_OPERATION_NOT_INITIALIZED,
+                                        "Digest Key without DigestInit");
+    }
+    if (ret == CKR_OK) {
+        /* Now initialize and exercise the invalid-object-handle path. */
+        ret = funcList->C_DigestInit(session, &mech);
+        CHECK_CKR(ret, "Digest Init for invalid-handle case");
     }
     if (ret == CKR_OK) {
         ret = funcList->C_DigestKey(session, CK_INVALID_HANDLE);
@@ -1571,8 +1616,8 @@ static CK_RV test_encdec_digest(void* args)
     if (ret == CKR_OK) {
         ret = funcList->C_DigestEncryptUpdate(session, data, dataSz, enc,
                                                                         &encSz);
-        CHECK_CKR_FAIL(ret, CKR_OPERATION_NOT_INITIALIZED,
-                                       "Digest Encrypt Update not initialized");
+        CHECK_CKR_FAIL(ret, CKR_FUNCTION_NOT_SUPPORTED,
+                                       "Digest Encrypt Update unsupported");
     }
 
     if (ret == CKR_OK) {
@@ -1600,8 +1645,8 @@ static CK_RV test_encdec_digest(void* args)
     if (ret == CKR_OK) {
         ret = funcList->C_DecryptDigestUpdate(session, enc, encSz, data,
                                                                        &dataSz);
-        CHECK_CKR_FAIL(ret, CKR_OPERATION_NOT_INITIALIZED,
-                                       "Decrypt Digest Update not initialized");
+        CHECK_CKR_FAIL(ret, CKR_FUNCTION_NOT_SUPPORTED,
+                                       "Decrypt Digest Update unsupported");
     }
 
     return ret;
@@ -1639,8 +1684,8 @@ static CK_RV test_encdec_signverify(void* args)
     }
     if (ret == CKR_OK) {
         ret = funcList->C_SignEncryptUpdate(session, data, dataSz, enc, &encSz);
-        CHECK_CKR_FAIL(ret, CKR_OPERATION_NOT_INITIALIZED,
-                                         "Sign Encrypt Update not initialized");
+        CHECK_CKR_FAIL(ret, CKR_FUNCTION_NOT_SUPPORTED,
+                                         "Sign Encrypt Update unsupported");
     }
 
     if (ret == CKR_OK) {
@@ -1668,8 +1713,8 @@ static CK_RV test_encdec_signverify(void* args)
     if (ret == CKR_OK) {
         ret = funcList->C_DecryptVerifyUpdate(session, enc, encSz, data,
                                                                        &dataSz);
-        CHECK_CKR_FAIL(ret, CKR_OPERATION_NOT_INITIALIZED,
-                                       "Decrypt Verify Update not initialized");
+        CHECK_CKR_FAIL(ret, CKR_FUNCTION_NOT_SUPPORTED,
+                                       "Decrypt Verify Update unsupported");
     }
 
 
@@ -1821,7 +1866,7 @@ static CK_RV test_wrap_unwrap_key(void* args)
     ret = get_generic_key(session, wrappingKeyData, sizeof(wrappingKeyData),
                                                         CK_FALSE, &wrappingKey);
     if (ret == CKR_OK) {
-        ret = get_generic_key(session, keyData, sizeof(keyData), CK_FALSE,
+        ret = get_generic_key(session, keyData, sizeof(keyData), CK_TRUE,
                                                                           &key);
     }
     if (ret == CKR_OK) {
@@ -2027,6 +2072,8 @@ static CK_RV test_pubkey_sig_fail(CK_SESSION_HANDLE session, CK_MECHANISM* mech,
         ret = funcList->C_Sign(session, hash, hashSz, out, &outSz);
         CHECK_CKR_FAIL(ret, CKR_OPERATION_NOT_INITIALIZED, "Sign wrong init");
     }
+    /* Clean up active verify operation from cross-type testing */
+    (void)funcList->C_Verify(session, hash, hashSz, out, outSz);
 
     funcList->C_DestroyObject(session, key);
 
@@ -2040,10 +2087,15 @@ static CK_RV get_rsa_priv_key(CK_SESSION_HANDLE session, unsigned char* privId,
                               CK_OBJECT_HANDLE* obj)
 {
     CK_RV ret;
+    CK_BBOOL sensitive = (extractable == CK_TRUE) ? CK_FALSE : CK_TRUE;
     CK_ATTRIBUTE rsa_2048_priv_key[] = {
         { CKA_CLASS,             &privKeyClass,     sizeof(privKeyClass)      },
         { CKA_KEY_TYPE,          &rsaKeyType,       sizeof(rsaKeyType)        },
         { CKA_DECRYPT,           &ckTrue,           sizeof(ckTrue)            },
+        /* CKA_SIGN / CKA_SIGN_RECOVER are opt-in for RSA private keys
+         * (F-5520); this helper backs sign and sign-recover tests. */
+        { CKA_SIGN,              &ckTrue,           sizeof(ckTrue)            },
+        { CKA_SIGN_RECOVER,      &ckTrue,           sizeof(ckTrue)            },
         { CKA_VERIFY,            &ckTrue,           sizeof(ckTrue)            },
         { CKA_MODULUS,           rsa_2048_modulus,  sizeof(rsa_2048_modulus)  },
         { CKA_PRIVATE_EXPONENT,  rsa_2048_priv_exp, sizeof(rsa_2048_priv_exp) },
@@ -2054,8 +2106,9 @@ static CK_RV get_rsa_priv_key(CK_SESSION_HANDLE session, unsigned char* privId,
         { CKA_COEFFICIENT,       rsa_2048_u,        sizeof(rsa_2048_u)        },
         { CKA_PUBLIC_EXPONENT,   rsa_2048_pub_exp,  sizeof(rsa_2048_pub_exp)  },
         { CKA_EXTRACTABLE,       &extractable,      sizeof(CK_BBOOL)          },
+        { CKA_SENSITIVE,         &sensitive,         sizeof(CK_BBOOL)          },
         { CKA_TOKEN,             &ckTrue,           sizeof(ckTrue)            },
-        { CKA_ID,                privId,            privIdLen                 },
+        { CKA_ID,                privId,            (CK_ULONG)privIdLen       },
     };
     int cnt = sizeof(rsa_2048_priv_key)/sizeof(*rsa_2048_priv_key);
 
@@ -2079,7 +2132,7 @@ static CK_RV get_rsa_pub_key(CK_SESSION_HANDLE session, unsigned char* pubId,
         { CKA_MODULUS,           rsa_2048_modulus,  sizeof(rsa_2048_modulus)  },
         { CKA_PUBLIC_EXPONENT,   rsa_2048_pub_exp,  sizeof(rsa_2048_pub_exp)  },
         { CKA_TOKEN,             &ckTrue,           sizeof(ckTrue)            },
-        { CKA_ID,                pubId,             pubIdLen                  },
+        { CKA_ID,                pubId,             (CK_ULONG)pubIdLen        },
     };
     int cnt = sizeof(rsa_2048_pub_key)/sizeof(*rsa_2048_pub_key);
 
@@ -2110,7 +2163,7 @@ static CK_RV gen_rsa_key(CK_SESSION_HANDLE session, CK_OBJECT_HANDLE* pubKey,
     CK_ATTRIBUTE      privKeyTmpl[] = {
         {CKA_DECRYPT,  &ckTrue, sizeof(ckTrue) },
         {CKA_SIGN,     &ckTrue, sizeof(ckTrue) },
-        {CKA_ID,       id,      idLen          }
+        {CKA_ID,       id,      (CK_ULONG)idLen }
     };
     int               privTmplCnt = 2;
 
@@ -2156,7 +2209,7 @@ static CK_RV find_rsa_pub_key(CK_SESSION_HANDLE session,
     CK_ATTRIBUTE      pubKeyTmpl[] = {
         { CKA_CLASS,     &pubKeyClass,   sizeof(pubKeyClass)  },
         { CKA_KEY_TYPE,  &rsaKeyType,    sizeof(rsaKeyType)   },
-        { CKA_ID,        id,             idLen                }
+        { CKA_ID,        id,             (CK_ULONG)idLen      }
     };
     CK_ULONG pubKeyTmplCnt = sizeof(pubKeyTmpl) / sizeof(*pubKeyTmpl);
     CK_ULONG count;
@@ -2187,7 +2240,7 @@ static CK_RV find_rsa_priv_key(CK_SESSION_HANDLE session,
     CK_ATTRIBUTE      privKeyTmpl[] = {
         { CKA_CLASS,     &privKeyClass,  sizeof(privKeyClass) },
         { CKA_KEY_TYPE,  &rsaKeyType,    sizeof(rsaKeyType)   },
-        { CKA_ID,        id,             idLen                }
+        { CKA_ID,        id,             (CK_ULONG)idLen      }
     };
     CK_ULONG privKeyTmplCnt = sizeof(privKeyTmpl) / sizeof(*privKeyTmpl);
     CK_ULONG count;
@@ -2270,7 +2323,10 @@ static CK_RV test_attributes_rsa(void* args)
     if (ret == CKR_OK) {
         ret = funcList->C_GetAttributeValue(session, priv, rsaPrivTmpl,
                                                                 rsaPrivTmplCnt);
-        CHECK_CKR(ret, "Get Attributes RSA private key length");
+        /* extractable=FALSE -> noPriv -> CKR_ATTRIBUTE_SENSITIVE per
+         * Fenrir 2776. */
+        CHECK_CKR_FAIL(ret, CKR_ATTRIBUTE_SENSITIVE,
+                       "Get Attributes RSA private key length");
     }
     if (ret == CKR_OK) {
         CHECK_COND(rsaPrivTmpl[0].ulValueLen == sizeof(modulus), ret,
@@ -2628,6 +2684,10 @@ static CK_RV rsa_pkcs15_sig_test(CK_SESSION_HANDLE session,
         CHECK_CKR(ret, "RSA PKCS#1.5 Verify");
     }
     if (ret == CKR_OK) {
+        ret = funcList->C_VerifyInit(session, &mech, pub);
+        CHECK_CKR(ret, "RSA PKCS#1.5 Verify Init before bad hash");
+    }
+    if (ret == CKR_OK) {
         ret = funcList->C_Verify(session, badHash, sizeof(badHash), out, outSz);
         CHECK_CKR_FAIL(ret, CKR_SIGNATURE_INVALID,
                                                 "RSA PKCS#1.5 Verify bad hash");
@@ -2688,6 +2748,10 @@ static CK_RV rsa_pss_test(CK_SESSION_HANDLE session, CK_OBJECT_HANDLE priv,
         CHECK_CKR(ret, "RSA PKCS#1 PSS Verify");
     }
     if (ret == CKR_OK) {
+        ret = funcList->C_VerifyInit(session, &mech, pub);
+        CHECK_CKR(ret, "RSA PKCS#1 PSS Verify Init before bad hash");
+    }
+    if (ret == CKR_OK) {
         ret = funcList->C_Verify(session, badHash, hashSz, out, outSz);
         CHECK_CKR_FAIL(ret, CKR_SIGNATURE_INVALID,
                                               "RSA PKCS#1 PSS Verify bad hash");
@@ -2702,6 +2766,10 @@ static CK_RV rsa_pss_test(CK_SESSION_HANDLE session, CK_OBJECT_HANDLE priv,
         CHECK_CKR_FAIL(ret, CKR_BUFFER_TOO_SMALL,
                                       "RSA PKCS#1 PSS Sign out size too small");
         outSz = sizeof(out);
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_Sign(session, hash, hashSz, out, &outSz);
+        CHECK_CKR(ret, "RSA PKCS#1 PSS Sign cleanup");
     }
 
     return ret;
@@ -2961,6 +3029,9 @@ static CK_RV rsa_encdec_fail(CK_SESSION_HANDLE session, CK_MECHANISM* mech,
         CHECK_CKR_FAIL(ret, CKR_OPERATION_NOT_INITIALIZED,
                                                       "RSA Encrypt wrong init");
     }
+    /* Clean up active decrypt operation from cross-type testing */
+    decSz = sizeof(dec);
+    (void)funcList->C_Decrypt(session, enc, encSz, dec, &decSz);
 
     funcList->C_DestroyObject(session, key);
 
@@ -3387,11 +3458,14 @@ static CK_OBJECT_HANDLE get_ecc_priv_key(CK_SESSION_HANDLE session,
                                          CK_OBJECT_HANDLE* obj)
 {
     CK_RV ret;
+    CK_BBOOL sensitive = (extractable == CK_TRUE) ? CK_FALSE : CK_TRUE;
     CK_ATTRIBUTE ecc_p256_priv_key[] = {
         { CKA_CLASS,             &privKeyClass,     sizeof(privKeyClass)      },
         { CKA_KEY_TYPE,          &eccKeyType,       sizeof(eccKeyType)        },
         { CKA_EXTRACTABLE,       &extractable,      sizeof(CK_BBOOL)          },
+        { CKA_SENSITIVE,         &sensitive,         sizeof(CK_BBOOL)          },
         { CKA_VERIFY,            &ckTrue,           sizeof(ckTrue)            },
+        { CKA_DERIVE,            &ckTrue,           sizeof(ckTrue)            },
         { CKA_EC_PARAMS,         ecc_p256_params,   sizeof(ecc_p256_params)   },
         { CKA_VALUE,             ecc_p256_priv,     sizeof(ecc_p256_priv)     },
     };
@@ -3438,17 +3512,20 @@ static CK_RV gen_ec_keys(CK_SESSION_HANDLE session, byte* params, int paramSz,
     CK_MECHANISM      mech;
     CK_BBOOL          token;
     CK_ATTRIBUTE      pubKeyTmpl[] = {
-        { CKA_EC_PARAMS,       params,             paramSz                    },
+        { CKA_EC_PARAMS,       params,             (CK_ULONG)paramSz          },
         { CKA_VERIFY,          &ckTrue,            sizeof(ckTrue)             },
         { CKA_TOKEN,           &token,             sizeof(token)              },
-        { CKA_ID,              pubId,              pubIdLen                   },
+        { CKA_ID,              pubId,              (CK_ULONG)pubIdLen         },
     };
     int               pubTmplCnt = sizeof(pubKeyTmpl)/sizeof(*pubKeyTmpl);
     CK_ATTRIBUTE      privKeyTmpl[] = {
         { CKA_SIGN,            &ckTrue,            sizeof(ckTrue)             },
         { CKA_DERIVE,          &ckTrue,            sizeof(ckTrue)             },
+        /* Readable base so the derived secret can be checked (F-4533). */
+        { CKA_SENSITIVE,       &ckFalse,           sizeof(ckFalse)           },
+        { CKA_EXTRACTABLE,     &ckTrue,            sizeof(ckTrue)            },
         { CKA_TOKEN,           &token,             sizeof(token)              },
-        { CKA_ID,              privId,             privIdLen                  },
+        { CKA_ID,              privId,             (CK_ULONG)privIdLen        },
     };
     int               privTmplCnt = sizeof(privKeyTmpl)/sizeof(*privKeyTmpl);
 
@@ -3499,7 +3576,7 @@ static CK_RV find_ecc_priv_key(CK_SESSION_HANDLE session,
     CK_ATTRIBUTE      privKeyTmpl[] = {
         { CKA_CLASS,     &privKeyClass,  sizeof(privKeyClass) },
         { CKA_KEY_TYPE,  &eccKeyType,    sizeof(eccKeyType)   },
-        { CKA_ID,        id,             idLen                }
+        { CKA_ID,        id,             (CK_ULONG)idLen      }
     };
     CK_ULONG privKeyTmplCnt = sizeof(privKeyTmpl) / sizeof(*privKeyTmpl);
     CK_ULONG count;
@@ -3530,7 +3607,7 @@ static CK_RV find_ecc_pub_key(CK_SESSION_HANDLE session,
     CK_ATTRIBUTE      pubKeyTmpl[] = {
         { CKA_CLASS,     &pubKeyClass, sizeof(pubKeyClass) },
         { CKA_KEY_TYPE,  &eccKeyType,   sizeof(eccKeyType)  },
-        { CKA_ID,        id,            idLen               }
+        { CKA_ID,        id,            (CK_ULONG)idLen     }
     };
     CK_ULONG pubKeyTmplCnt = sizeof(pubKeyTmpl) / sizeof(*pubKeyTmpl);
     CK_ULONG count;
@@ -3624,7 +3701,10 @@ static CK_RV test_attributes_ecc(void* args)
     if (ret == CKR_OK) {
         ret = funcList->C_GetAttributeValue(session, priv, eccPrivTmpl,
                                                                 eccPrivTmplCnt);
-        CHECK_CKR(ret, "Get Attributes EC Private Key NULL values");
+        /* extractable=FALSE -> noPriv -> CKR_ATTRIBUTE_SENSITIVE per
+         * Fenrir 2776. */
+        CHECK_CKR_FAIL(ret, CKR_ATTRIBUTE_SENSITIVE,
+                       "Get Attributes EC Private Key NULL values");
     }
     if (ret == CKR_OK) {
         CHECK_COND(eccPrivTmpl[0].ulValueLen == sizeof(ecc_p256_params), ret,
@@ -3806,8 +3886,16 @@ static CK_RV ecdsa_test(CK_SESSION_HANDLE session, CK_OBJECT_HANDLE privKey,
         CHECK_CKR(ret, "ECDSA Verify");
     }
     if (ret == CKR_OK) {
+        ret = funcList->C_VerifyInit(session, &mech, pubKey);
+        CHECK_CKR(ret, "ECDSA Verify Init before bad hash");
+    }
+    if (ret == CKR_OK) {
         ret = funcList->C_Verify(session, hash, hashSz - 1, out, outSz);
         CHECK_CKR_FAIL(ret, CKR_SIGNATURE_INVALID, "ECDSA Verify bad hash");
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_VerifyInit(session, &mech, pubKey);
+        CHECK_CKR(ret, "ECDSA Verify Init before bad sig");
     }
     if (ret == CKR_OK) {
         outSz = 1;
@@ -4002,7 +4090,8 @@ static CK_RV test_ecc_fixed_keys_ecdh(void* args)
     CK_OBJECT_HANDLE priv = CK_INVALID_HANDLE;
     CK_OBJECT_HANDLE pub = CK_INVALID_HANDLE;
 
-    ret = get_ecc_priv_key(session, CK_FALSE, &priv);
+    /* Extractable base so the derived ECDH secret can be read (F-4533). */
+    ret = get_ecc_priv_key(session, CK_TRUE, &priv);
     if (ret == CKR_OK)
         ret = get_ecc_pub_key(session, &pub);
     if (ret == CKR_OK) {
@@ -4176,10 +4265,12 @@ static CK_OBJECT_HANDLE get_dh_priv_key(CK_SESSION_HANDLE session,
                                         CK_OBJECT_HANDLE* obj)
 {
     CK_RV ret;
+    CK_BBOOL sensitive = (extractable == CK_TRUE) ? CK_FALSE : CK_TRUE;
     CK_ATTRIBUTE dh_2048_priv_key[] = {
         { CKA_CLASS,             &privKeyClass,     sizeof(privKeyClass)      },
         { CKA_KEY_TYPE,          &dhKeyType,        sizeof(dhKeyType)         },
         { CKA_EXTRACTABLE,       &extractable,      sizeof(CK_BBOOL)          },
+        { CKA_SENSITIVE,         &sensitive,         sizeof(CK_BBOOL)          },
         { CKA_DERIVE,            &ckTrue,           sizeof(ckTrue)            },
         { CKA_PRIME,             dh_ffdhe2048_p,    sizeof(dh_ffdhe2048_p)    },
         { CKA_BASE,              dh_ffdhe2048_g,    sizeof(dh_ffdhe2048_g)    },
@@ -4229,16 +4320,19 @@ static CK_RV gen_dh_keys(CK_SESSION_HANDLE session, byte* prime, int primeSz,
     CK_MECHANISM      mech;
     CK_BBOOL          token;
     CK_ATTRIBUTE      pubKeyTmpl[] = {
-        { CKA_PRIME,           prime,              primeSz                    },
-        { CKA_BASE,            generator,          generatorSz                },
+        { CKA_PRIME,           prime,              (CK_ULONG)primeSz          },
+        { CKA_BASE,            generator,          (CK_ULONG)generatorSz      },
         { CKA_TOKEN,           &token,             sizeof(token)              },
-        { CKA_ID,              pubId,              pubIdLen                   },
+        { CKA_ID,              pubId,              (CK_ULONG)pubIdLen         },
     };
     int               pubTmplCnt = sizeof(pubKeyTmpl)/sizeof(*pubKeyTmpl);
     CK_ATTRIBUTE      privKeyTmpl[] = {
         { CKA_DERIVE,          &ckTrue,            sizeof(ckTrue)             },
+        /* Readable base so the derived secret can be checked (F-4533). */
+        { CKA_SENSITIVE,       &ckFalse,           sizeof(ckFalse)           },
+        { CKA_EXTRACTABLE,     &ckTrue,            sizeof(ckTrue)            },
         { CKA_TOKEN,           &token,             sizeof(token)              },
-        { CKA_ID,              privId,             privIdLen                  },
+        { CKA_ID,              privId,             (CK_ULONG)privIdLen        },
     };
     int               privTmplCnt = sizeof(privKeyTmpl)/sizeof(*privKeyTmpl);
 
@@ -4342,7 +4436,10 @@ static CK_RV test_attributes_dh(void* args)
     if (ret == CKR_OK) {
         ret = funcList->C_GetAttributeValue(session, priv, dhPrivTmpl,
                                                                  dhPrivTmplCnt);
-        CHECK_CKR(ret, "Get Attributes DH Public Key");
+        /* extractable=FALSE -> noPriv -> CKR_ATTRIBUTE_SENSITIVE per
+         * Fenrir 2776. */
+        CHECK_CKR_FAIL(ret, CKR_ATTRIBUTE_SENSITIVE,
+                       "Get Attributes DH Private Key (sensitive)");
     }
     if (ret == CKR_OK) {
         CHECK_COND(dhPrivTmpl[0].ulValueLen == sizeof(prime), ret,
@@ -4362,7 +4459,9 @@ static CK_RV test_attributes_dh(void* args)
     if (ret == CKR_OK) {
         ret = funcList->C_GetAttributeValue(session, priv, dhPrivTmpl,
                                                                  dhPrivTmplCnt);
-        CHECK_CKR(ret, "Get Attributes DH Public Key");
+        /* same priv key, still noPriv. */
+        CHECK_CKR_FAIL(ret, CKR_ATTRIBUTE_SENSITIVE,
+                       "Get Attributes DH Private Key (sensitive, populated)");
     }
     funcList->C_DestroyObject(session, priv);
     if (ret == CKR_OK) {
@@ -4463,7 +4562,8 @@ static CK_RV test_dh_fixed_keys(void* args)
     CK_OBJECT_HANDLE priv = CK_INVALID_HANDLE;
     CK_OBJECT_HANDLE pub = CK_INVALID_HANDLE;
 
-    ret = get_dh_priv_key(session, CK_FALSE, &priv);
+    /* Extractable base so the derived DH secret can be read (F-4533). */
+    ret = get_dh_priv_key(session, CK_TRUE, &priv);
     if (ret == CKR_OK)
         ret = get_dh_pub_key(session, &pub);
     if (ret == CKR_OK) {
@@ -4508,7 +4608,7 @@ static CK_RV gen_aes_key(CK_SESSION_HANDLE session, int len, unsigned char* id,
     CK_ATTRIBUTE      keyTmpl[] = {
         { CKA_VALUE_LEN,       &keyLen,            sizeof(keyLen)             },
         { CKA_TOKEN,           &token,             sizeof(token)              },
-        { CKA_ID,              id,                 idLen                      },
+        { CKA_ID,              id,                 (CK_ULONG)idLen            },
     };
     int               keyTmplCnt = sizeof(keyTmpl)/sizeof(*keyTmpl);
 
@@ -4554,7 +4654,7 @@ static CK_RV find_aes_key(CK_SESSION_HANDLE session, unsigned char* id,
     CK_ATTRIBUTE      keyTmpl[] = {
         { CKA_CLASS,     &secretKeyClass,  sizeof(secretKeyClass) },
         { CKA_KEY_TYPE,  &aesKeyType,      sizeof(aesKeyType)     },
-        { CKA_ID,        id,               idLen                  }
+        { CKA_ID,        id,               (CK_ULONG)idLen        }
     };
     CK_ULONG keyTmplCnt = sizeof(keyTmpl) / sizeof(*keyTmpl);
     CK_ULONG count;
@@ -5009,6 +5109,10 @@ static CK_RV test_aes_cbc_fail(void* args)
                                             "AES-CBC Encrypt Final wrong init");
     }
 
+    /* Clean up active decrypt operation from cross-type testing */
+    decSz = sizeof(dec);
+    (void)funcList->C_Decrypt(session, enc, encSz, dec, &decSz);
+
     funcList->C_DestroyObject(session, key);
     funcList->C_DestroyObject(session, generic);
 
@@ -5458,6 +5562,10 @@ static CK_RV test_aes_gcm_fail(void* args)
         CHECK_CKR_FAIL(ret, CKR_OPERATION_NOT_INITIALIZED,
                                             "AES-GCM Encrypt Final wrong init");
     }
+
+    /* Clean up active decrypt operation from cross-type testing */
+    decSz = sizeof(dec);
+    (void)funcList->C_Decrypt(session, enc, encSz, dec, &decSz);
 
     funcList->C_DestroyObject(session, key);
     funcList->C_DestroyObject(session, generic);
@@ -5951,6 +6059,10 @@ static CK_RV test_hmac_update(CK_SESSION_HANDLE session, int mechanism,
                                           "HMAC Sign Final out size too small");
         outSz = sizeof(out);
     }
+    if (ret == CKR_OK) {
+        ret = funcList->C_SignFinal(session, out, &outSz);
+        CHECK_CKR(ret, "HMAC Sign Final cleanup");
+    }
 
     return ret;
 }
@@ -6039,6 +6151,9 @@ static CK_RV test_hmac_fail(CK_SESSION_HANDLE session, CK_MECHANISM* mech,
         CHECK_CKR_FAIL(ret, CKR_OPERATION_NOT_INITIALIZED,
                                                   "HMAC Sign Final wrong init");
     }
+
+    /* Clean up active verify operation from cross-type testing */
+    (void)funcList->C_Verify(session, data, dataSz, out, outSz);
 
     funcList->C_DestroyObject(session, key);
     funcList->C_DestroyObject(session, aesKey);
@@ -6356,6 +6471,373 @@ static CK_RV test_hmac_sha512_fail(void* args)
 #endif
 #endif
 
+#ifdef WOLFPKCS11_MLDSA
+static CK_RV gen_mldsa_keys(CK_SESSION_HANDLE session,
+                            CK_ML_DSA_PARAMETER_SET_TYPE paramSet,
+                            CK_OBJECT_HANDLE* pubKey,
+                            CK_OBJECT_HANDLE* privKey,
+                            unsigned char* privId, int privIdLen,
+                            unsigned char* pubId, int pubIdLen, int onToken)
+{
+    CK_RV ret = CKR_OK;
+    CK_OBJECT_HANDLE pub = CK_INVALID_HANDLE;
+    CK_OBJECT_HANDLE priv = CK_INVALID_HANDLE;
+    CK_MECHANISM mech;
+    CK_BBOOL token = (CK_BBOOL)onToken;
+    CK_ATTRIBUTE pubKeyTmpl[] = {
+        { CKA_PARAMETER_SET,  &paramSet,   sizeof(paramSet) },
+        { CKA_VERIFY,         &ckTrue,     sizeof(ckTrue)   },
+        { CKA_TOKEN,          &token,      sizeof(token)    },
+        { CKA_ID,             pubId,       (CK_ULONG)pubIdLen },
+    };
+    int pubTmplCnt = sizeof(pubKeyTmpl) / sizeof(*pubKeyTmpl);
+    CK_ATTRIBUTE privKeyTmpl[] = {
+        { CKA_SIGN,           &ckTrue,     sizeof(ckTrue)   },
+        { CKA_TOKEN,          &token,      sizeof(token)    },
+        { CKA_ID,             privId,      (CK_ULONG)privIdLen },
+    };
+    int privTmplCnt = sizeof(privKeyTmpl) / sizeof(*privKeyTmpl);
+
+    if (pubId == NULL)
+        pubTmplCnt--;
+    if (privId == NULL)
+        privTmplCnt--;
+
+    mech.mechanism = CKM_ML_DSA_KEY_PAIR_GEN;
+    mech.pParameter = NULL;
+    mech.ulParameterLen = 0;
+
+    ret = funcList->C_GenerateKeyPair(session, &mech, pubKeyTmpl, pubTmplCnt,
+                                      privKeyTmpl, privTmplCnt, &pub, &priv);
+    CHECK_CKR(ret, "ML-DSA Key Generation");
+    if (ret == CKR_OK && pubKey != NULL)
+        *pubKey = pub;
+    if (ret == CKR_OK && privKey != NULL)
+        *privKey = priv;
+
+    return ret;
+}
+
+static CK_RV find_mldsa_priv_key(CK_SESSION_HANDLE session,
+    CK_OBJECT_HANDLE* key, unsigned char* id, int idLen)
+{
+    CK_RV ret;
+    CK_ATTRIBUTE tmpl[] = {
+        { CKA_CLASS,    &privKeyClass,  sizeof(privKeyClass) },
+        { CKA_KEY_TYPE, &mldsaKeyType,  sizeof(mldsaKeyType) },
+        { CKA_ID,       id,             (CK_ULONG)idLen      },
+    };
+    CK_ULONG count;
+
+    ret = funcList->C_FindObjectsInit(session, tmpl,
+                                      sizeof(tmpl) / sizeof(*tmpl));
+    CHECK_CKR(ret, "ML-DSA Find Priv Objects Init");
+    if (ret == CKR_OK) {
+        ret = funcList->C_FindObjects(session, key, 1, &count);
+        CHECK_CKR(ret, "ML-DSA Find Priv Objects");
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_FindObjectsFinal(session);
+        CHECK_CKR(ret, "ML-DSA Find Priv Objects Final");
+    }
+    if (ret == CKR_OK && count == 0) {
+        ret = -1;
+        CHECK_CKR(ret, "ML-DSA Find Priv Objects Count");
+    }
+
+    return ret;
+}
+
+static CK_RV mldsa_sign_verify(CK_SESSION_HANDLE session,
+    CK_OBJECT_HANDLE privKey, CK_OBJECT_HANDLE pubKey)
+{
+    CK_RV ret;
+    CK_MECHANISM mech;
+    CK_SIGN_ADDITIONAL_CONTEXT signCtx;
+    byte data[64];
+    byte sig[4672]; /* ML-DSA-44 max sig size */
+    CK_ULONG sigSz;
+
+    XMEMSET(data, 0x5A, sizeof(data));
+    XMEMSET(&signCtx, 0, sizeof(signCtx));
+    signCtx.hedgeVariant = CKH_HEDGE_REQUIRED;
+    signCtx.pContext = NULL;
+    signCtx.ulContextLen = 0;
+
+    mech.mechanism = CKM_ML_DSA;
+    mech.pParameter = &signCtx;
+    mech.ulParameterLen = sizeof(signCtx);
+
+    ret = funcList->C_SignInit(session, &mech, privKey);
+    CHECK_CKR(ret, "ML-DSA Sign Init");
+    if (ret == CKR_OK) {
+        sigSz = sizeof(sig);
+        ret = funcList->C_Sign(session, data, sizeof(data), sig, &sigSz);
+        CHECK_CKR(ret, "ML-DSA Sign");
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_VerifyInit(session, &mech, pubKey);
+        CHECK_CKR(ret, "ML-DSA Verify Init");
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_Verify(session, data, sizeof(data), sig, sigSz);
+        CHECK_CKR(ret, "ML-DSA Verify");
+    }
+
+    return ret;
+}
+
+static CK_RV test_mldsa_gen_keys(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_RV ret;
+    CK_OBJECT_HANDLE pub = CK_INVALID_HANDLE;
+    CK_OBJECT_HANDLE priv = CK_INVALID_HANDLE;
+    unsigned char* privId = (unsigned char*)"123mldsamttpriv";
+    int privIdLen = (int)strlen((char*)privId);
+
+    /* Generate and sign/verify */
+    ret = gen_mldsa_keys(session, CKP_ML_DSA_44, &pub, &priv, NULL, 0,
+                         NULL, 0, 0);
+    if (ret == CKR_OK)
+        ret = mldsa_sign_verify(session, priv, pub);
+
+    funcList->C_DestroyObject(session, pub);
+    funcList->C_DestroyObject(session, priv);
+    pub = CK_INVALID_HANDLE;
+    priv = CK_INVALID_HANDLE;
+
+    /* Generate with ID and find */
+    if (ret == CKR_OK) {
+        ret = gen_mldsa_keys(session, CKP_ML_DSA_44, &pub, NULL, privId,
+                             privIdLen, NULL, 0, 0);
+    }
+    if (ret == CKR_OK)
+        ret = find_mldsa_priv_key(session, &priv, privId, privIdLen);
+    if (ret == CKR_OK)
+        ret = mldsa_sign_verify(session, priv, pub);
+
+    funcList->C_DestroyObject(session, pub);
+    funcList->C_DestroyObject(session, priv);
+
+    return ret;
+}
+#endif /* WOLFPKCS11_MLDSA */
+
+#ifdef WOLFPKCS11_MLKEM
+static CK_RV gen_mlkem_keys(CK_SESSION_HANDLE session,
+                            CK_ML_KEM_PARAMETER_SET_TYPE paramSet,
+                            CK_OBJECT_HANDLE* pubKey,
+                            CK_OBJECT_HANDLE* privKey,
+                            unsigned char* privId, int privIdLen,
+                            unsigned char* pubId, int pubIdLen, int onToken)
+{
+    CK_RV ret = CKR_OK;
+    CK_OBJECT_HANDLE pub = CK_INVALID_HANDLE;
+    CK_OBJECT_HANDLE priv = CK_INVALID_HANDLE;
+    CK_MECHANISM mech;
+    CK_BBOOL token = (CK_BBOOL)onToken;
+    CK_ATTRIBUTE pubKeyTmpl[] = {
+        { CKA_PARAMETER_SET, &paramSet,  sizeof(paramSet) },
+        { CKA_ENCAPSULATE,   &ckTrue,    sizeof(ckTrue)   },
+        { CKA_TOKEN,         &token,     sizeof(token)    },
+        { CKA_ID,            pubId,      (CK_ULONG)pubIdLen },
+    };
+    int pubTmplCnt = sizeof(pubKeyTmpl) / sizeof(*pubKeyTmpl);
+    CK_ATTRIBUTE privKeyTmpl[] = {
+        { CKA_DECAPSULATE,   &ckTrue,    sizeof(ckTrue)   },
+        { CKA_TOKEN,         &token,     sizeof(token)    },
+        { CKA_ID,            privId,     (CK_ULONG)privIdLen },
+    };
+    int privTmplCnt = sizeof(privKeyTmpl) / sizeof(*privKeyTmpl);
+
+    if (pubId == NULL)
+        pubTmplCnt--;
+    if (privId == NULL)
+        privTmplCnt--;
+
+    mech.mechanism = CKM_ML_KEM_KEY_PAIR_GEN;
+    mech.pParameter = NULL;
+    mech.ulParameterLen = 0;
+
+    ret = funcList->C_GenerateKeyPair(session, &mech, pubKeyTmpl, pubTmplCnt,
+                                      privKeyTmpl, privTmplCnt, &pub, &priv);
+    CHECK_CKR(ret, "ML-KEM Key Generation");
+    if (ret == CKR_OK && pubKey != NULL)
+        *pubKey = pub;
+    if (ret == CKR_OK && privKey != NULL)
+        *privKey = priv;
+
+    return ret;
+}
+
+static CK_RV find_mlkem_priv_key(CK_SESSION_HANDLE session,
+    CK_OBJECT_HANDLE* key, unsigned char* id, int idLen)
+{
+    CK_RV ret;
+    CK_ATTRIBUTE tmpl[] = {
+        { CKA_CLASS,    &privKeyClass,  sizeof(privKeyClass) },
+        { CKA_KEY_TYPE, &mlkemKeyType,  sizeof(mlkemKeyType) },
+        { CKA_ID,       id,             (CK_ULONG)idLen      },
+    };
+    CK_ULONG count;
+
+    ret = funcList->C_FindObjectsInit(session, tmpl,
+                                      sizeof(tmpl) / sizeof(*tmpl));
+    CHECK_CKR(ret, "ML-KEM Find Priv Objects Init");
+    if (ret == CKR_OK) {
+        ret = funcList->C_FindObjects(session, key, 1, &count);
+        CHECK_CKR(ret, "ML-KEM Find Priv Objects");
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_FindObjectsFinal(session);
+        CHECK_CKR(ret, "ML-KEM Find Priv Objects Final");
+    }
+    if (ret == CKR_OK && count == 0) {
+        ret = -1;
+        CHECK_CKR(ret, "ML-KEM Find Priv Objects Count");
+    }
+
+    return ret;
+}
+
+static CK_RV mlkem_encap_decap(CK_SESSION_HANDLE session,
+                               CK_OBJECT_HANDLE pubKey,
+                               CK_OBJECT_HANDLE privKey)
+{
+    CK_RV ret = CKR_OK;
+    CK_INTERFACE* interface = NULL;
+    CK_FUNCTION_LIST_3_2* funcListExt = NULL;
+    CK_VERSION version = { 3, 2 };
+    CK_MECHANISM mech;
+
+#ifndef HAVE_PKCS11_STATIC
+    {
+        CK_C_GetInterface getInterface;
+        getInterface = (CK_C_GetInterface)dlsym(dlib, "C_GetInterface");
+        if (getInterface == NULL)
+            return CKR_FUNCTION_NOT_SUPPORTED;
+        ret = getInterface((CK_UTF8CHAR_PTR)"PKCS 11", &version,
+                           &interface, 0);
+    }
+#else
+    ret = C_GetInterface((CK_UTF8CHAR_PTR)"PKCS 11", &version,
+                         &interface, 0);
+#endif
+    CHECK_CKR(ret, "ML-KEM Get v3.2 Interface");
+    if (ret == CKR_OK)
+        funcListExt = (CK_FUNCTION_LIST_3_2*)interface->pFunctionList;
+    CK_OBJECT_CLASS secClass = CKO_SECRET_KEY;
+    CK_BBOOL extr = CK_TRUE;
+    CK_BBOOL sensitive = CK_FALSE;
+    CK_ATTRIBUTE secretTmpl[] = {
+        { CKA_CLASS,       &secClass,       sizeof(secClass)       },
+        { CKA_KEY_TYPE,    &genericKeyType, sizeof(genericKeyType) },
+        { CKA_EXTRACTABLE, &extr,           sizeof(extr)           },
+        { CKA_SENSITIVE,   &sensitive,      sizeof(sensitive)      },
+    };
+    CK_ULONG secretTmplCnt = sizeof(secretTmpl) / sizeof(*secretTmpl);
+    CK_OBJECT_HANDLE encapKey = CK_INVALID_HANDLE;
+    CK_OBJECT_HANDLE decapKey = CK_INVALID_HANDLE;
+    CK_BYTE* ciphertext = NULL;
+    CK_ULONG ctLen = 0;
+    CK_BYTE ss1[64];
+    CK_BYTE ss2[64];
+    CK_ULONG ss1Len = sizeof(ss1);
+    CK_ULONG ss2Len = sizeof(ss2);
+    CK_ATTRIBUTE getValueTmpl[] = { { CKA_VALUE, NULL, 0 } };
+
+    mech.mechanism = CKM_ML_KEM;
+    mech.pParameter = NULL;
+    mech.ulParameterLen = 0;
+
+    ret = funcListExt->C_EncapsulateKey(session, &mech, pubKey, secretTmpl,
+                                        secretTmplCnt, NULL, &ctLen, &encapKey);
+    CHECK_CKR(ret, "ML-KEM Encapsulate size query");
+
+    if (ret == CKR_OK) {
+        ciphertext = (CK_BYTE*)malloc(ctLen);
+        if (ciphertext == NULL)
+            ret = CKR_HOST_MEMORY;
+    }
+    if (ret == CKR_OK) {
+        ret = funcListExt->C_EncapsulateKey(session, &mech, pubKey, secretTmpl,
+                                            secretTmplCnt, ciphertext, &ctLen,
+                                            &encapKey);
+        CHECK_CKR(ret, "ML-KEM Encapsulate");
+    }
+    if (ret == CKR_OK) {
+        ret = funcListExt->C_DecapsulateKey(session, &mech, privKey, secretTmpl,
+                                            secretTmplCnt, ciphertext, ctLen,
+                                            &decapKey);
+        CHECK_CKR(ret, "ML-KEM Decapsulate");
+    }
+    if (ret == CKR_OK) {
+        getValueTmpl[0].pValue = ss1;
+        getValueTmpl[0].ulValueLen = ss1Len;
+        ret = funcList->C_GetAttributeValue(session, encapKey, getValueTmpl, 1);
+        CHECK_CKR(ret, "ML-KEM Get encap shared secret");
+        if (ret == CKR_OK)
+            ss1Len = getValueTmpl[0].ulValueLen;
+    }
+    if (ret == CKR_OK) {
+        getValueTmpl[0].pValue = ss2;
+        getValueTmpl[0].ulValueLen = ss2Len;
+        ret = funcList->C_GetAttributeValue(session, decapKey, getValueTmpl, 1);
+        CHECK_CKR(ret, "ML-KEM Get decap shared secret");
+        if (ret == CKR_OK)
+            ss2Len = getValueTmpl[0].ulValueLen;
+    }
+    if (ret == CKR_OK) {
+        CHECK_COND(ss1Len == ss2Len && XMEMCMP(ss1, ss2, ss1Len) == 0,
+                   ret, "ML-KEM Shared secrets match");
+    }
+
+    if (ciphertext != NULL)
+        free(ciphertext);
+    if (encapKey != CK_INVALID_HANDLE)
+        funcList->C_DestroyObject(session, encapKey);
+    if (decapKey != CK_INVALID_HANDLE)
+        funcList->C_DestroyObject(session, decapKey);
+
+    return ret;
+}
+
+static CK_RV test_mlkem_gen_keys(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_RV ret;
+    CK_OBJECT_HANDLE pub = CK_INVALID_HANDLE;
+    CK_OBJECT_HANDLE priv = CK_INVALID_HANDLE;
+    unsigned char* privId = (unsigned char*)"123mlkemmttpriv";
+    int privIdLen = (int)strlen((char*)privId);
+
+    /* Generate key pair and exercise encap/decap */
+    ret = gen_mlkem_keys(session, CKP_ML_KEM_512, &pub, &priv, NULL, 0,
+                         NULL, 0, 0);
+    if (ret == CKR_OK)
+        ret = mlkem_encap_decap(session, pub, priv);
+
+    funcList->C_DestroyObject(session, pub);
+    funcList->C_DestroyObject(session, priv);
+    pub = CK_INVALID_HANDLE;
+    priv = CK_INVALID_HANDLE;
+
+    /* Generate with ID and find */
+    if (ret == CKR_OK) {
+        ret = gen_mlkem_keys(session, CKP_ML_KEM_512, &pub, NULL, privId,
+                             privIdLen, NULL, 0, 0);
+    }
+    if (ret == CKR_OK)
+        ret = find_mlkem_priv_key(session, &priv, privId, privIdLen);
+
+    funcList->C_DestroyObject(session, pub);
+    funcList->C_DestroyObject(session, priv);
+
+    return ret;
+}
+#endif /* WOLFPKCS11_MLKEM */
+
 static CK_RV test_random(void* args)
 {
     CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
@@ -6649,6 +7131,12 @@ static TEST_FUNC testFunc[] = {
     PKCS11MTT_CASE(test_hmac_sha512),
     PKCS11MTT_CASE(test_hmac_sha512_fail),
 #endif
+#endif
+#ifdef WOLFPKCS11_MLDSA
+    PKCS11MTT_CASE(test_mldsa_gen_keys),
+#endif
+#ifdef WOLFPKCS11_MLKEM
+    PKCS11MTT_CASE(test_mlkem_gen_keys),
 #endif
     PKCS11MTT_CASE(test_random),
 };

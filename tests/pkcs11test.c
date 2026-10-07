@@ -38,6 +38,8 @@
 #include <dlfcn.h>
 #endif
 
+#include <limits.h>
+
 #include "unit.h"
 #include "testdata.h"
 #include <wolfpkcs11/internal.h>
@@ -89,9 +91,7 @@ static CK_OBJECT_CLASS secretKeyClass  = CKO_SECRET_KEY;
 static CK_OBJECT_CLASS certificateClass = CKO_CERTIFICATE;
 static CK_OBJECT_CLASS dataClass       = CKO_DATA;
 
-#if defined(HAVE_ECC) || !defined(NO_DH)
 static CK_BBOOL ckFalse = CK_FALSE;
-#endif
 static CK_BBOOL ckTrue  = CK_TRUE;
 
 #ifndef NO_RSA
@@ -464,7 +464,11 @@ static CK_RV test_no_token_init(void* args)
     CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
     CK_RV ret;
     CK_TOKEN_INFO tokenInfo;
-    CK_FLAGS expFlags = CKF_RNG | CKF_CLOCK_ON_TOKEN | CKF_TOKEN_INITIALIZED;
+    /* Per Fenrir 3407: CKF_TOKEN_INITIALIZED must not be set on a slot
+     * that has never had C_InitToken called. Pre-fix wp11_Token_Init
+     * unconditionally marked the token state INITIALIZED, so the old
+     * test included CKF_TOKEN_INITIALIZED in the expected mask. */
+    CK_FLAGS expFlags = CKF_RNG | CKF_CLOCK_ON_TOKEN;
     int flags = CKF_SERIAL_SESSION | CKF_RW_SESSION;
 
     ret = funcList->C_GetTokenInfo(slot, &tokenInfo);
@@ -540,6 +544,7 @@ static CK_RV test_slot(void* args)
     CK_ULONG count;
     CK_MECHANISM_TYPE* list = NULL;
     CK_MECHANISM_INFO info;
+    int ssl3MasterFound = 0;
     int i;
 
     (void)session;
@@ -621,6 +626,19 @@ static CK_RV test_slot(void* args)
         ret = funcList->C_GetMechanismList(slot, list, &count);
         CHECK_CKR(ret, "Get Mechanism List count");
     }
+    if (ret == CKR_OK) {
+        for (i = 0; i < (int)count; i++) {
+            if (list[i] == CKM_SSL3_MASTER_KEY_DERIVE)
+                ssl3MasterFound = 1;
+        }
+#ifdef WOLFPKCS11_NSS
+        CHECK_COND(ssl3MasterFound, ret,
+                   "NSS SSL3 master target mechanism advertised");
+#else
+        CHECK_COND(!ssl3MasterFound, ret,
+                   "Unimplemented SSL3 master derive not advertised");
+#endif
+    }
 
     if (ret == CKR_OK) {
         ret = funcList->C_GetMechanismInfo(0, list[0], &info);
@@ -635,6 +653,20 @@ static CK_RV test_slot(void* args)
         ret = funcList->C_GetMechanismInfo(slot, -1, &info);
         CHECK_CKR_FAIL(ret, CKR_MECHANISM_INVALID,
                                                  "Get Mechanism Info bad mech");
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_GetMechanismInfo(slot, CKM_SSL3_MASTER_KEY_DERIVE,
+                                           &info);
+#ifdef WOLFPKCS11_NSS
+        CHECK_CKR(ret, "Get NSS SSL3 master target mechanism info");
+        if (ret == CKR_OK) {
+            CHECK_COND(info.flags == 0, ret,
+                       "NSS SSL3 master target has no derive capability");
+        }
+#else
+        CHECK_CKR_FAIL(ret, CKR_MECHANISM_INVALID,
+                       "Get Mechanism Info unimplemented SSL3 derive");
+#endif
     }
     if (ret == CKR_OK) {
         for (i = 0; ret == CKR_OK && i < (int)count; i++) {
@@ -697,13 +729,15 @@ static CK_RV test_token(void* args)
         ret = funcList->C_InitToken(slot, soPin, soPinLen, NULL);
         CHECK_CKR_FAIL(ret, CKR_ARGUMENTS_BAD, "Init Token no label");
     }
+#if WP11_MIN_PIN_LEN > 3
     if (ret == CKR_OK) {
         ret = funcList->C_InitToken(slot, soPin, 3, label);
-        CHECK_CKR_FAIL(ret, CKR_PIN_INCORRECT, "Init Token too short PIN");
+        CHECK_CKR_FAIL(ret, CKR_PIN_LEN_RANGE, "Init Token too short PIN");
     }
+#endif
     if (ret == CKR_OK) {
         ret = funcList->C_InitToken(slot, soPin, 33, label);
-        CHECK_CKR_FAIL(ret, CKR_PIN_INCORRECT, "Init Token too long PIN");
+        CHECK_CKR_FAIL(ret, CKR_PIN_LEN_RANGE, "Init Token too long PIN");
     }
 
     if (ret == CKR_OK) {
@@ -833,13 +867,13 @@ static CK_RV test_pin(void* args)
 #if WP11_MIN_PIN_LEN > 3
                 if (ret == CKR_OK) {
                     ret = funcList->C_InitPIN(session, userPin, 3);
-                    CHECK_CKR_FAIL(ret, CKR_PIN_INCORRECT,
+                    CHECK_CKR_FAIL(ret, CKR_PIN_LEN_RANGE,
                                                       "Init PIN too short PIN");
                 }
 #endif
                 if (ret == CKR_OK) {
                     ret = funcList->C_InitPIN(session, userPin, 33);
-                    CHECK_CKR_FAIL(ret, CKR_PIN_INCORRECT,
+                    CHECK_CKR_FAIL(ret, CKR_PIN_LEN_RANGE,
                                                        "Init PIN too long PIN");
                 }
                 funcList->C_Logout(session);
@@ -882,14 +916,14 @@ static CK_RV test_pin(void* args)
             if (ret == CKR_OK) {
                 ret = funcList->C_SetPIN(session, userPin, userPinLen,userPin,
                                                                              3);
-                CHECK_CKR_FAIL(ret, CKR_PIN_INCORRECT,
+                CHECK_CKR_FAIL(ret, CKR_PIN_LEN_RANGE,
                                                    "Set PIN too short new pin");
             }
 #endif
             if (ret == CKR_OK) {
                 ret = funcList->C_SetPIN(session, userPin, userPinLen, userPin,
                                                                             33);
-                CHECK_CKR_FAIL(ret, CKR_PIN_INCORRECT,
+                CHECK_CKR_FAIL(ret, CKR_PIN_LEN_RANGE,
                                                     "Set PIN too long new pin");
             }
             if (ret == CKR_OK) {
@@ -1016,6 +1050,13 @@ static CK_RV test_login_logout(void* args)
         CHECK_CKR_FAIL(ret, CKR_SESSION_HANDLE_INVALID,
                                                "Logout invalid session handle");
     }
+    /* C_Logout should return CKR_USER_NOT_LOGGED_IN when no user is
+     * currently logged in. */
+    if (ret == CKR_OK) {
+        ret = funcList->C_Logout(session);
+        CHECK_CKR_FAIL(ret, CKR_USER_NOT_LOGGED_IN,
+                                               "Logout when not logged in");
+    }
 
     if (ret == CKR_OK) {
         ret = funcList->C_GetTokenInfo(slot, &tokenInfo);
@@ -1076,6 +1117,9 @@ static CK_RV test_session(void* args)
     }
     if (ret == CKR_OK)
         CHECK_COND((info.ulDeviceError == 0), ret, "Get Session info error");
+    if (ret == CKR_OK)
+        CHECK_COND((info.slotID == (CK_SLOT_ID)slot), ret,
+                                                    "Get Session info slotID");
 
     /* Get function status and cancel function are not valid anymore. */
     if (ret == CKR_OK) {
@@ -1155,7 +1199,7 @@ static CK_RV test_op_state_success(void* args)
         ret = CKR_OK;
     }
     if (ret == CKR_OK) {
-        data = XMALLOC(len, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+        data = (byte*)XMALLOC(len, NULL, DYNAMIC_TYPE_TMP_BUFFER);
         ret = funcList->C_GetOperationState(session, data, &len);
         CHECK_CKR(ret, "Could not get operation state");
     }
@@ -1824,9 +1868,9 @@ static CK_RV test_pkcs5_pbkdf2_key_gen(void* args)
         if (ret == CKR_OK && key != CK_INVALID_HANDLE) {
             CK_KEY_TYPE retrievedKeyType;
             CK_ULONG retrievedLen = sizeof(retrievedKeyType);
-            ret = funcList->C_GetAttributeValue(session, key,
-                                               &(CK_ATTRIBUTE){CKA_KEY_TYPE, &retrievedKeyType, retrievedLen},
-                                               1);
+            CK_ATTRIBUTE keyTypeTmpl = {CKA_KEY_TYPE, &retrievedKeyType,
+                retrievedLen};
+            ret = funcList->C_GetAttributeValue(session, key, &keyTypeTmpl, 1);
             CHECK_CKR(ret, "Get attribute value");
             if (ret == CKR_OK && retrievedKeyType != CKK_AES) {
                 ret = CKR_GENERAL_ERROR;
@@ -1986,14 +2030,17 @@ static CK_RV test_object(void* args)
     CK_ATTRIBUTE empty[] = { };
 #endif
     CK_ATTRIBUTE keyTypeNull[] = {
+        { CKA_CLASS,             &secretKeyClass,   sizeof(secretKeyClass)    },
         { CKA_KEY_TYPE,          NULL,              sizeof(CK_KEY_TYPE)       }
     };
     CK_ATTRIBUTE keyTypeZeroLen[] = {
+        { CKA_CLASS,             &secretKeyClass,   sizeof(secretKeyClass)    },
         { CKA_KEY_TYPE,          &genericKeyType,   0,                        }
     };
     CK_ULONG badKeyType = -1;
     CK_ATTRIBUTE keyTypeBadValue[] = {
-        { CKA_KEY_TYPE,          &badKeyType,       sizeof(&badKeyType)       }
+        { CKA_CLASS,             &secretKeyClass,   sizeof(secretKeyClass)    },
+        { CKA_KEY_TYPE,          &badKeyType,       sizeof(badKeyType)        }
     };
     CK_ATTRIBUTE keyDataNull[] = {
         { CKA_CLASS,             &privKeyClass,     sizeof(privKeyClass)      },
@@ -2009,10 +2056,12 @@ static CK_RV test_object(void* args)
         { CKA_CLASS,             &secretKeyClass,   0,                        }
     };
     CK_ATTRIBUTE tokenNull[] = {
+        { CKA_CLASS,             &secretKeyClass,   sizeof(secretKeyClass)    },
         { CKA_KEY_TYPE,          &genericKeyType,   sizeof(genericKeyType)    },
         { CKA_TOKEN,             NULL,              sizeof(CK_BBOOL)          },
     };
     CK_ATTRIBUTE tokenBadLen[] = {
+        { CKA_CLASS,             &secretKeyClass,   sizeof(secretKeyClass)    },
         { CKA_KEY_TYPE,          &genericKeyType,   sizeof(genericKeyType)    },
         { CKA_TOKEN,             &ckTrue,           0                         },
     };
@@ -2179,21 +2228,17 @@ static CK_RV test_object(void* args)
         CHECK_CKR(ret, "Open Session - read-only");
     }
 
+    /* Token objects must be blocked in RO sessions */
     if (ret == CKR_OK) {
-        ret = funcList->C_CreateObject(sessionRO, tmpl, tmplCnt, &obj);
+        ret = funcList->C_CreateObject(sessionRO, tmplOnToken, tmplOnTokenCnt,
+                                                                          &obj);
         CHECK_CKR_FAIL(ret, CKR_SESSION_READ_ONLY,
-                                          "Create Object in read-only session");
-    }
-    if (ret == CKR_OK) {
-        ret = funcList->C_CopyObject(sessionRO, objOnToken, copyTmpl,
-                                                         copyTmplCnt, &copyObj);
-        CHECK_CKR_FAIL(ret, CKR_SESSION_READ_ONLY,
-                              "Copy Object symmetric key in read-only session");
+                                  "Create token Object in read-only session");
     }
     if (ret == CKR_OK) {
         ret = funcList->C_DestroyObject(sessionRO, objOnToken);
         CHECK_CKR_FAIL(ret, CKR_SESSION_READ_ONLY,
-                                         "Destroy object in read-only session");
+                                    "Destroy token object in read-only session");
     }
 
     if (ret == CKR_OK && sessionRO != CK_INVALID_HANDLE) {
@@ -2230,6 +2275,7 @@ static CK_RV test_copy_object_deep_copy(void* args)
         { CKA_VALUE,             keyData,           sizeof(keyData)           },
         { CKA_ID,                keyId,             sizeof(keyId)             },
         { CKA_LABEL,             label,             sizeof(label)-1           },
+        { CKA_SENSITIVE,         &ckFalse,          sizeof(ckFalse)           },
         { CKA_EXTRACTABLE,       &ckTrue,           sizeof(ckTrue)            },
         { CKA_ENCRYPT,           &ckTrue,           sizeof(ckTrue)            },
         { CKA_DECRYPT,           &ckTrue,           sizeof(ckTrue)            },
@@ -3209,6 +3255,7 @@ static CK_RV test_attribute(void* args)
     CK_ATTRIBUTE tmpl[] = {
         { CKA_CLASS,             &privKeyClass,     sizeof(privKeyClass)      },
         { CKA_KEY_TYPE,          &genericKeyType,   sizeof(genericKeyType)    },
+        { CKA_SENSITIVE,         &ckFalse,          sizeof(ckFalse)           },
         { CKA_EXTRACTABLE,       &ckTrue,           sizeof(ckTrue)            },
         { CKA_VALUE,             keyData,           sizeof(keyData)           },
     };
@@ -3218,7 +3265,7 @@ static CK_RV test_attribute(void* args)
         { CKA_TOKEN,             &ckTrue,           0                         }
     };
     CK_ATTRIBUTE badAttrType[] = {
-        { -1,                    &ckTrue,           sizeof(ckTrue)            }
+        { (CK_ATTRIBUTE_TYPE)-1, &ckTrue,           sizeof(ckTrue)            }
     };
     CK_ATTRIBUTE badAttrLen[] = {
         { CKA_VALUE,             retKeyData,        0                         }
@@ -3716,6 +3763,109 @@ static CK_RV test_attribute_get(void* args)
     return ret;
 }
 
+static CK_RV test_extractable_set_false_to_true(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_RV ret = CKR_OK;
+    CK_OBJECT_HANDLE objFalse = CK_INVALID_HANDLE;
+    CK_OBJECT_HANDLE objTrue = CK_INVALID_HANDLE;
+    static byte keyData[] = { 0x01 };
+    static byte id[] = { 0x04, 0x05, 0x06 };
+    CK_BBOOL val;
+    /* Object created with CKA_EXTRACTABLE = FALSE */
+    CK_ATTRIBUTE createTmplFalse[] = {
+        { CKA_CLASS,             &pubKeyClass,      sizeof(pubKeyClass)     },
+        { CKA_KEY_TYPE,          &genericKeyType,   sizeof(genericKeyType)  },
+        { CKA_EXTRACTABLE,       &ckFalse,          sizeof(ckFalse)         },
+        { CKA_VALUE,             keyData,            sizeof(keyData)         },
+        { CKA_ID,                id,                 sizeof(id)             },
+    };
+    CK_ULONG createTmplFalseCnt =
+        sizeof(createTmplFalse) / sizeof(*createTmplFalse);
+    /* Object created with CKA_EXTRACTABLE = TRUE */
+    CK_ATTRIBUTE createTmplTrue[] = {
+        { CKA_CLASS,             &pubKeyClass,      sizeof(pubKeyClass)     },
+        { CKA_KEY_TYPE,          &genericKeyType,   sizeof(genericKeyType)  },
+        { CKA_EXTRACTABLE,       &ckTrue,           sizeof(ckTrue)          },
+        { CKA_VALUE,             keyData,            sizeof(keyData)         },
+        { CKA_ID,                id,                 sizeof(id)             },
+    };
+    CK_ULONG createTmplTrueCnt =
+        sizeof(createTmplTrue) / sizeof(*createTmplTrue);
+    CK_ATTRIBUTE setExtractTrue[] = {
+        { CKA_EXTRACTABLE,       &ckTrue,           sizeof(ckTrue)          },
+    };
+    CK_ULONG setExtractTrueCnt =
+        sizeof(setExtractTrue) / sizeof(*setExtractTrue);
+    CK_ATTRIBUTE setExtractFalse[] = {
+        { CKA_EXTRACTABLE,       &ckFalse,          sizeof(ckFalse)         },
+    };
+    CK_ULONG setExtractFalseCnt =
+        sizeof(setExtractFalse) / sizeof(*setExtractFalse);
+    CK_ATTRIBUTE getExtract[] = {
+        { CKA_EXTRACTABLE,       &val,              sizeof(val)             },
+    };
+    CK_ULONG getExtractCnt = sizeof(getExtract) / sizeof(*getExtract);
+
+    /* Create object with CKA_EXTRACTABLE = FALSE */
+    ret = funcList->C_CreateObject(session, createTmplFalse, createTmplFalseCnt,
+                                   &objFalse);
+    CHECK_CKR(ret, "Create Object extractable=false");
+
+    /* Attempt to change CKA_EXTRACTABLE FALSE -> TRUE (must fail) */
+    if (ret == CKR_OK) {
+        ret = funcList->C_SetAttributeValue(session, objFalse, setExtractTrue,
+                                            setExtractTrueCnt);
+        CHECK_CKR_FAIL(ret, CKR_ATTRIBUTE_READ_ONLY,
+                       "Set extractable false->true");
+    }
+
+    /* Verify CKA_EXTRACTABLE is still FALSE */
+    if (ret == CKR_OK) {
+        val = CK_TRUE;
+        ret = funcList->C_GetAttributeValue(session, objFalse, getExtract,
+                                            getExtractCnt);
+        CHECK_CKR(ret, "Get extractable after failed set");
+    }
+    if (ret == CKR_OK) {
+        CHECK_COND(val == CK_FALSE, ret,
+                   "Extractable still false after failed set");
+    }
+
+    /* Create object with CKA_EXTRACTABLE = TRUE */
+    if (ret == CKR_OK) {
+        ret = funcList->C_CreateObject(session, createTmplTrue,
+                                       createTmplTrueCnt, &objTrue);
+        CHECK_CKR(ret, "Create Object extractable=true");
+    }
+
+    /* Change CKA_EXTRACTABLE TRUE -> FALSE (must succeed) */
+    if (ret == CKR_OK) {
+        ret = funcList->C_SetAttributeValue(session, objTrue, setExtractFalse,
+                                            setExtractFalseCnt);
+        CHECK_CKR(ret, "Set extractable true->false");
+    }
+
+    /* Verify CKA_EXTRACTABLE is now FALSE */
+    if (ret == CKR_OK) {
+        val = CK_TRUE;
+        ret = funcList->C_GetAttributeValue(session, objTrue, getExtract,
+                                            getExtractCnt);
+        CHECK_CKR(ret, "Get extractable after set false");
+    }
+    if (ret == CKR_OK) {
+        CHECK_COND(val == CK_FALSE, ret,
+                   "Extractable now false after set");
+    }
+
+    if (objFalse != CK_INVALID_HANDLE)
+        funcList->C_DestroyObject(session, objFalse);
+    if (objTrue != CK_INVALID_HANDLE)
+        funcList->C_DestroyObject(session, objTrue);
+
+    return ret;
+}
+
 static CK_RV test_data_object(void* args)
 {
     CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
@@ -4193,9 +4343,15 @@ static CK_RV get_generic_key(CK_SESSION_HANDLE session, unsigned char* data,
     CK_ATTRIBUTE generic_key[] = {
         { CKA_CLASS,             &secretKeyClass,   sizeof(secretKeyClass)    },
         { CKA_KEY_TYPE,          &genericKeyType,   sizeof(genericKeyType)    },
+        { CKA_SENSITIVE,         &ckFalse,          sizeof(ckFalse)           },
         { CKA_EXTRACTABLE,       &extractable,      sizeof(CK_BBOOL)          },
         { CKA_SIGN,              &ckTrue,           sizeof(ckTrue)            },
         { CKA_VERIFY,            &ckTrue,           sizeof(ckTrue)            },
+        { CKA_DERIVE,            &ckTrue,           sizeof(ckTrue)            },
+        /* CKA_WRAP/CKA_UNWRAP defaults flipped to CK_FALSE per Fenrir 2774;
+         * keep both TRUE so this helper still backs wrap/unwrap call sites. */
+        { CKA_WRAP,              &ckTrue,           sizeof(ckTrue)            },
+        { CKA_UNWRAP,            &ckTrue,           sizeof(ckTrue)            },
         { CKA_VALUE,             data,              len                       },
     };
     int cnt = sizeof(generic_key)/sizeof(*generic_key);
@@ -4463,6 +4619,18 @@ static CK_RV test_find_objects(void* args)
         CHECK_CKR_FAIL(ret, CKR_SESSION_HANDLE_INVALID,
                                    "Find Objects Final invalid session handle");
     }
+    /* C_FindObjects and C_FindObjectsFinal should return
+     * CKR_OPERATION_NOT_INITIALIZED when called without C_FindObjectsInit. */
+    if (ret == CKR_OK) {
+        ret = funcList->C_FindObjects(session, &found, 1, &count);
+        CHECK_CKR_FAIL(ret, CKR_OPERATION_NOT_INITIALIZED,
+                                          "Find Objects without Init");
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_FindObjectsFinal(session);
+        CHECK_CKR_FAIL(ret, CKR_OPERATION_NOT_INITIALIZED,
+                                    "Find Objects Final without Init");
+    }
 
     if (ret == CKR_OK) {
         ret = funcList->C_FindObjectsInit(session, findTmpl, findTmplCnt);
@@ -4501,6 +4669,72 @@ static CK_RV test_find_objects(void* args)
     return ret;
 }
 
+static CK_RV test_find_objects_many(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_RV ret = CKR_OK;
+    CK_OBJECT_HANDLE objects[WP11_FIND_MAX + 1];
+    CK_OBJECT_HANDLE found[7];
+    CK_ULONG foundCount;
+    CK_ULONG total = 0;
+    int created = 0;
+    int findActive = 0;
+    int i;
+    static byte keyData[] = { 0x5a };
+    static byte id[] = { 0x46, 0x38, 0x36, 0x35, 0x37 };
+    CK_ATTRIBUTE tmpl[] = {
+        { CKA_CLASS,    &secretKeyClass,  sizeof(secretKeyClass) },
+        { CKA_KEY_TYPE, &genericKeyType,  sizeof(genericKeyType) },
+        { CKA_VALUE,    keyData,          sizeof(keyData)         },
+        { CKA_ID,       id,               sizeof(id)              },
+        { CKA_TOKEN,    &ckTrue,          sizeof(ckTrue)          },
+        { CKA_PRIVATE,  &ckFalse,         sizeof(ckFalse)         },
+    };
+    CK_ATTRIBUTE findTmpl[] = {
+        { CKA_ID, id, sizeof(id) },
+    };
+
+    for (i = 0; ret == CKR_OK && i < (int)(WP11_FIND_MAX + 1); i++) {
+        ret = funcList->C_CreateObject(session, tmpl,
+            sizeof(tmpl) / sizeof(*tmpl), &objects[i]);
+        CHECK_CKR(ret, "Create object beyond former find cache limit");
+        if (ret == CKR_OK)
+            created++;
+    }
+
+    if (ret == CKR_OK) {
+        ret = funcList->C_FindObjectsInit(session, findTmpl,
+            sizeof(findTmpl) / sizeof(*findTmpl));
+        CHECK_CKR(ret, "Find many objects init");
+        if (ret == CKR_OK)
+            findActive = 1;
+    }
+    while (ret == CKR_OK) {
+        ret = funcList->C_FindObjects(session, found,
+                                      sizeof(found) / sizeof(*found),
+                                      &foundCount);
+        CHECK_CKR(ret, "Find many objects batch");
+        if (ret != CKR_OK || foundCount == 0)
+            break;
+        total += foundCount;
+    }
+    if (ret == CKR_OK) {
+        CHECK_COND(total == WP11_FIND_MAX + 1, ret,
+                   "Find returns objects beyond former cache limit");
+    }
+    if (findActive) {
+        CK_RV finalRet = funcList->C_FindObjectsFinal(session);
+        CHECK_CKR(finalRet, "Find many objects final");
+        if (ret == CKR_OK)
+            ret = finalRet;
+    }
+
+    for (i = 0; i < created; i++)
+        funcList->C_DestroyObject(session, objects[i]);
+
+    return ret;
+}
+
 static CK_RV get_aes_128_key(CK_SESSION_HANDLE session, unsigned char* id,
                              int idLen, CK_OBJECT_HANDLE* key)
 {
@@ -4516,11 +4750,20 @@ static CK_RV get_aes_128_key(CK_SESSION_HANDLE session, unsigned char* id,
         { CKA_DECRYPT,           &ckTrue,           sizeof(ckTrue)            },
         { CKA_SIGN,              &ckTrue,           sizeof(ckTrue)            },
         { CKA_VERIFY,            &ckTrue,           sizeof(ckTrue)            },
+        { CKA_DERIVE,            &ckTrue,           sizeof(ckTrue)            },
+        /* Readable base so derived secrets can be checked (F-4533). */
+        { CKA_SENSITIVE,         &ckFalse,          sizeof(ckFalse)           },
+        { CKA_EXTRACTABLE,       &ckTrue,           sizeof(ckTrue)            },
+        /* CKA_WRAP/CKA_UNWRAP default to CK_FALSE per spec (Fenrir 2774).
+         * This helper backs the wrapping-key role in test_aes_wrap_unwrap_*,
+         * so set both explicitly. */
+        { CKA_WRAP,              &ckTrue,           sizeof(ckTrue)            },
+        { CKA_UNWRAP,            &ckTrue,           sizeof(ckTrue)            },
 #ifndef NO_AES
         { CKA_VALUE,             aes_128_key,       sizeof(aes_128_key)       },
 #endif
         { CKA_TOKEN,             &ckTrue,           sizeof(ckTrue)            },
-        { CKA_ID,                id,                idLen                     },
+        { CKA_ID,                id,                (CK_ULONG)idLen           },
     };
     int cnt = sizeof(aes_key)/sizeof(*aes_key);
 
@@ -4714,6 +4957,65 @@ static CK_RV test_encrypt_decrypt(void* args)
     }
     return ret;
 }
+
+#ifndef NO_AES
+static CK_RV test_encrypt_decrypt_op_not_supported(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_RV ret;
+    CK_OBJECT_HANDLE key;
+    byte iv[16];
+    CK_MECHANISM mech;
+    CK_BBOOL falseVal = CK_FALSE;
+    CK_BBOOL trueVal = CK_TRUE;
+
+    CK_ATTRIBUTE noEncKey[] = {
+        { CKA_CLASS,             &secretKeyClass,   sizeof(secretKeyClass)    },
+        { CKA_KEY_TYPE,          &aesKeyType,       sizeof(aesKeyType)        },
+        { CKA_ENCRYPT,           &falseVal,         sizeof(falseVal)          },
+        { CKA_DECRYPT,           &trueVal,          sizeof(trueVal)           },
+        { CKA_VALUE,             aes_128_key,       sizeof(aes_128_key)       },
+        { CKA_TOKEN,             &falseVal,         sizeof(falseVal)          },
+    };
+    CK_ATTRIBUTE noDecKey[] = {
+        { CKA_CLASS,             &secretKeyClass,   sizeof(secretKeyClass)    },
+        { CKA_KEY_TYPE,          &aesKeyType,       sizeof(aesKeyType)        },
+        { CKA_ENCRYPT,           &trueVal,          sizeof(trueVal)           },
+        { CKA_DECRYPT,           &falseVal,         sizeof(falseVal)          },
+        { CKA_VALUE,             aes_128_key,       sizeof(aes_128_key)       },
+        { CKA_TOKEN,             &falseVal,         sizeof(falseVal)          },
+    };
+
+    memset(iv, 9, sizeof(iv));
+    mech.mechanism      = CKM_AES_CBC;
+    mech.ulParameterLen = sizeof(iv);
+    mech.pParameter     = iv;
+
+    /* Create key with CKA_ENCRYPT=FALSE, try C_EncryptInit */
+    ret = funcList->C_CreateObject(session, noEncKey,
+                                   sizeof(noEncKey)/sizeof(*noEncKey), &key);
+    CHECK_CKR(ret, "Create AES key with CKA_ENCRYPT=FALSE");
+    if (ret == CKR_OK) {
+        ret = funcList->C_EncryptInit(session, &mech, key);
+        CHECK_CKR_FAIL(ret, CKR_KEY_FUNCTION_NOT_PERMITTED,
+                        "EncryptInit should fail with CKA_ENCRYPT=FALSE");
+    }
+
+    /* Create key with CKA_DECRYPT=FALSE, try C_DecryptInit */
+    if (ret == CKR_OK) {
+        ret = funcList->C_CreateObject(session, noDecKey,
+                                       sizeof(noDecKey)/sizeof(*noDecKey), &key);
+        CHECK_CKR(ret, "Create AES key with CKA_DECRYPT=FALSE");
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_DecryptInit(session, &mech, key);
+        CHECK_CKR_FAIL(ret, CKR_KEY_FUNCTION_NOT_PERMITTED,
+                        "DecryptInit should fail with CKA_DECRYPT=FALSE");
+    }
+
+    return ret;
+}
+#endif
 
 #ifndef NO_SHA256
 static CK_RV test_digest(void* args)
@@ -5091,6 +5393,18 @@ static CK_RV test_digest_fail(void* args)
                                            "Digest Key invalid session handle");
     }
     if (ret == CKR_OK) {
+        /* C_DigestKey must return CKR_OPERATION_NOT_INITIALIZED before any
+         * other validation when C_DigestInit has not been called. */
+        ret = funcList->C_DigestKey(session, key);
+        CHECK_CKR_FAIL(ret, CKR_OPERATION_NOT_INITIALIZED,
+                                        "Digest Key without DigestInit");
+    }
+    if (ret == CKR_OK) {
+        /* Now initialize and exercise the invalid-object-handle path. */
+        ret = funcList->C_DigestInit(session, &mech);
+        CHECK_CKR(ret, "Digest Init for invalid-handle case");
+    }
+    if (ret == CKR_OK) {
         ret = funcList->C_DigestKey(session, CK_INVALID_HANDLE);
         CHECK_CKR_FAIL(ret, CKR_OBJECT_HANDLE_INVALID,
                                             "Digest Key invalid object handle");
@@ -5107,6 +5421,48 @@ static CK_RV test_digest_fail(void* args)
 
     return ret;
 }
+
+#ifndef NO_SHA256
+static CK_RV test_digest_single_size_query(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_RV ret;
+    CK_MECHANISM mech;
+    byte data[32], hash[32];
+    CK_ULONG dataSz = sizeof(data);
+    CK_ULONG hashSz = 0;
+
+    XMEMSET(data, 0x42, sizeof(data));
+    mech.mechanism = CKM_SHA256;
+    mech.ulParameterLen = 0;
+    mech.pParameter = NULL;
+
+    /* C_Digest with pDigest=NULL should return size without computing */
+    ret = funcList->C_DigestInit(session, &mech);
+    CHECK_CKR(ret, "Digest Init for size query");
+    if (ret == CKR_OK) {
+        hashSz = 0;
+        ret = funcList->C_Digest(session, data, dataSz, NULL, &hashSz);
+        CHECK_CKR(ret, "C_Digest size query with pDigest=NULL");
+    }
+    if (ret == CKR_OK && hashSz != 32) {
+        ret = -1;
+        CHECK_CKR(ret, "C_Digest size query should return 32 for SHA-256");
+    }
+    /* Now actually compute with properly sized buffer */
+    if (ret == CKR_OK) {
+        hashSz = sizeof(hash);
+        ret = funcList->C_Digest(session, data, dataSz, hash, &hashSz);
+        CHECK_CKR(ret, "C_Digest compute");
+    }
+    if (ret == CKR_OK && hashSz != 32) {
+        ret = -1;
+        CHECK_CKR(ret, "C_Digest output should be 32 for SHA-256");
+    }
+
+    return ret;
+}
+#endif
 
 static CK_RV test_sign_verify(void* args)
 {
@@ -5266,6 +5622,63 @@ static CK_RV test_sign_verify(void* args)
     return ret;
 }
 
+static CK_RV test_sign_verify_op_not_supported(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_RV ret;
+    CK_MECHANISM mech;
+    CK_OBJECT_HANDLE key;
+    byte keyData[32];
+    CK_ULONG keySz = sizeof(keyData);
+    CK_BBOOL falseVal = CK_FALSE;
+    CK_BBOOL trueVal = CK_TRUE;
+
+    CK_ATTRIBUTE noSignKey[] = {
+        { CKA_CLASS,             &secretKeyClass,   sizeof(secretKeyClass)    },
+        { CKA_KEY_TYPE,          &genericKeyType,   sizeof(genericKeyType)    },
+        { CKA_SIGN,              &falseVal,         sizeof(falseVal)          },
+        { CKA_VERIFY,            &trueVal,          sizeof(trueVal)           },
+        { CKA_VALUE,             keyData,           keySz                     },
+    };
+    CK_ATTRIBUTE noVerifyKey[] = {
+        { CKA_CLASS,             &secretKeyClass,   sizeof(secretKeyClass)    },
+        { CKA_KEY_TYPE,          &genericKeyType,   sizeof(genericKeyType)    },
+        { CKA_SIGN,              &trueVal,          sizeof(trueVal)           },
+        { CKA_VERIFY,            &falseVal,         sizeof(falseVal)          },
+        { CKA_VALUE,             keyData,           keySz                     },
+    };
+
+    memset(keyData, 9, sizeof(keyData));
+    mech.mechanism      = CKM_SHA256_HMAC;
+    mech.ulParameterLen = 0;
+    mech.pParameter     = NULL;
+
+    /* Create key with CKA_SIGN=FALSE, try C_SignInit */
+    ret = funcList->C_CreateObject(session, noSignKey,
+                                   sizeof(noSignKey)/sizeof(*noSignKey), &key);
+    CHECK_CKR(ret, "Create generic key with CKA_SIGN=FALSE");
+    if (ret == CKR_OK) {
+        ret = funcList->C_SignInit(session, &mech, key);
+        CHECK_CKR_FAIL(ret, CKR_KEY_FUNCTION_NOT_PERMITTED,
+                        "SignInit should fail with CKA_SIGN=FALSE");
+    }
+
+    /* Create key with CKA_VERIFY=FALSE, try C_VerifyInit */
+    if (ret == CKR_OK) {
+        ret = funcList->C_CreateObject(session, noVerifyKey,
+                                       sizeof(noVerifyKey)/sizeof(*noVerifyKey),
+                                       &key);
+        CHECK_CKR(ret, "Create generic key with CKA_VERIFY=FALSE");
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_VerifyInit(session, &mech, key);
+        CHECK_CKR_FAIL(ret, CKR_KEY_FUNCTION_NOT_PERMITTED,
+                        "VerifyInit should fail with CKA_VERIFY=FALSE");
+    }
+
+    return ret;
+}
+
 static CK_RV test_recover(void* args)
 {
     CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
@@ -5392,6 +5805,10 @@ static CK_RV rsa_verify_recover(CK_SESSION_HANDLE session,
         { CKA_CLASS,             &privKeyClass,     sizeof(privKeyClass)      },
         { CKA_KEY_TYPE,          &rsaKeyType,       sizeof(rsaKeyType)        },
         { CKA_DECRYPT,           &ckTrue,           sizeof(ckTrue)            },
+        /* CKA_SIGN / CKA_SIGN_RECOVER are opt-in for RSA private keys
+         * (F-5520); this key is used for sign-recover. */
+        { CKA_SIGN,              &ckTrue,           sizeof(ckTrue)            },
+        { CKA_SIGN_RECOVER,      &ckTrue,           sizeof(ckTrue)            },
         { CKA_MODULUS,           rsa_2048_modulus,  sizeof(rsa_2048_modulus)  },
         { CKA_PRIVATE_EXPONENT,  rsa_2048_priv_exp, sizeof(rsa_2048_priv_exp) },
         { CKA_PRIME_1,           rsa_2048_p,        sizeof(rsa_2048_p)        },
@@ -5485,6 +5902,39 @@ static CK_RV test_verify_recover_x509(void* args)
 }
 #endif
 
+#ifndef NO_RSA
+static CK_RV test_verify_recover_op_not_supported(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_RV ret;
+    CK_OBJECT_HANDLE pubKey;
+    CK_BBOOL falseVal = CK_FALSE;
+    CK_BBOOL trueVal = CK_TRUE;
+    CK_MECHANISM mech = { CKM_RSA_PKCS, NULL_PTR, 0 };
+
+    CK_ATTRIBUTE rsaPubNoVerifyRecover[] = {
+        { CKA_CLASS,             &pubKeyClass,      sizeof(pubKeyClass)       },
+        { CKA_KEY_TYPE,          &rsaKeyType,       sizeof(rsaKeyType)        },
+        { CKA_ENCRYPT,           &trueVal,          sizeof(trueVal)           },
+        { CKA_VERIFY_RECOVER,    &falseVal,         sizeof(falseVal)          },
+        { CKA_MODULUS,           rsa_2048_modulus,   sizeof(rsa_2048_modulus)  },
+        { CKA_PUBLIC_EXPONENT,   rsa_2048_pub_exp,  sizeof(rsa_2048_pub_exp)  },
+    };
+
+    ret = funcList->C_CreateObject(session, rsaPubNoVerifyRecover,
+                       sizeof(rsaPubNoVerifyRecover)/sizeof(*rsaPubNoVerifyRecover),
+                       &pubKey);
+    CHECK_CKR(ret, "Create RSA pub key with CKA_VERIFY_RECOVER=FALSE");
+    if (ret == CKR_OK) {
+        ret = funcList->C_VerifyRecoverInit(session, &mech, pubKey);
+        CHECK_CKR_FAIL(ret, CKR_KEY_FUNCTION_NOT_PERMITTED,
+                "VerifyRecoverInit should fail with CKA_VERIFY_RECOVER=FALSE");
+    }
+
+    return ret;
+}
+#endif
+
 static CK_RV test_encdec_digest(void* args)
 {
     CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
@@ -5519,8 +5969,8 @@ static CK_RV test_encdec_digest(void* args)
     if (ret == CKR_OK) {
         ret = funcList->C_DigestEncryptUpdate(session, data, dataSz, enc,
                                                                         &encSz);
-        CHECK_CKR_FAIL(ret, CKR_OPERATION_NOT_INITIALIZED,
-                                       "Digest Encrypt Update not initialized");
+        CHECK_CKR_FAIL(ret, CKR_FUNCTION_NOT_SUPPORTED,
+                                       "Digest Encrypt Update unsupported");
     }
 
     if (ret == CKR_OK) {
@@ -5548,8 +5998,8 @@ static CK_RV test_encdec_digest(void* args)
     if (ret == CKR_OK) {
         ret = funcList->C_DecryptDigestUpdate(session, enc, encSz, data,
                                                                        &dataSz);
-        CHECK_CKR_FAIL(ret, CKR_OPERATION_NOT_INITIALIZED,
-                                       "Decrypt Digest Update not initialized");
+        CHECK_CKR_FAIL(ret, CKR_FUNCTION_NOT_SUPPORTED,
+                                       "Decrypt Digest Update unsupported");
     }
 
     return ret;
@@ -5587,8 +6037,8 @@ static CK_RV test_encdec_signverify(void* args)
     }
     if (ret == CKR_OK) {
         ret = funcList->C_SignEncryptUpdate(session, data, dataSz, enc, &encSz);
-        CHECK_CKR_FAIL(ret, CKR_OPERATION_NOT_INITIALIZED,
-                                         "Sign Encrypt Update not initialized");
+        CHECK_CKR_FAIL(ret, CKR_FUNCTION_NOT_SUPPORTED,
+                                         "Sign Encrypt Update unsupported");
     }
 
     if (ret == CKR_OK) {
@@ -5616,8 +6066,8 @@ static CK_RV test_encdec_signverify(void* args)
     if (ret == CKR_OK) {
         ret = funcList->C_DecryptVerifyUpdate(session, enc, encSz, data,
                                                                        &dataSz);
-        CHECK_CKR_FAIL(ret, CKR_OPERATION_NOT_INITIALIZED,
-                                       "Decrypt Verify Update not initialized");
+        CHECK_CKR_FAIL(ret, CKR_FUNCTION_NOT_SUPPORTED,
+                                       "Decrypt Verify Update unsupported");
     }
 
 
@@ -5737,6 +6187,62 @@ static CK_RV test_generate_key_pair(void* args)
 
     return ret;
 }
+
+#ifndef WOLFPKCS11_NSS
+static CK_RV test_private_key_secure_defaults(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_RV ret;
+    CK_ULONG bits = 2048;
+    CK_OBJECT_HANDLE priv = CK_INVALID_HANDLE;
+    CK_OBJECT_HANDLE pub = CK_INVALID_HANDLE;
+    CK_MECHANISM mech;
+    CK_BBOOL sensitive = CK_FALSE;
+    CK_BBOOL extractable = CK_TRUE;
+    CK_ATTRIBUTE pubKeyTmpl[] = {
+        { CKA_MODULUS_BITS,    &bits,           sizeof(bits)           },
+        { CKA_PUBLIC_EXPONENT, rsa_2048_pub_exp, sizeof(rsa_2048_pub_exp) }
+    };
+    int pubTmplCnt = sizeof(pubKeyTmpl)/sizeof(*pubKeyTmpl);
+    /* No CKA_SENSITIVE or CKA_EXTRACTABLE — rely on defaults */
+    CK_ATTRIBUTE privKeyTmpl[] = {
+        { CKA_DECRYPT, &ckTrue, sizeof(ckTrue) },
+        { CKA_SIGN,    &ckTrue, sizeof(ckTrue) },
+    };
+    int privTmplCnt = sizeof(privKeyTmpl)/sizeof(*privKeyTmpl);
+    CK_ATTRIBUTE getSensitive = { CKA_SENSITIVE, &sensitive, sizeof(sensitive) };
+    CK_ATTRIBUTE getExtract = { CKA_EXTRACTABLE, &extractable,
+                                sizeof(extractable) };
+
+    mech.mechanism      = CKM_RSA_PKCS_KEY_PAIR_GEN;
+    mech.ulParameterLen = 0;
+    mech.pParameter     = NULL;
+
+    ret = funcList->C_GenerateKeyPair(session, &mech, pubKeyTmpl, pubTmplCnt,
+                                       privKeyTmpl, privTmplCnt, &pub, &priv);
+    CHECK_CKR(ret, "Generate RSA key pair for default check");
+
+    if (ret == CKR_OK) {
+        ret = funcList->C_GetAttributeValue(session, priv, &getSensitive, 1);
+        CHECK_CKR(ret, "Get CKA_SENSITIVE");
+    }
+    if (ret == CKR_OK) {
+        CHECK_COND(sensitive == CK_TRUE, ret,
+                   "Private key CKA_SENSITIVE should default to TRUE");
+    }
+
+    if (ret == CKR_OK) {
+        ret = funcList->C_GetAttributeValue(session, priv, &getExtract, 1);
+        CHECK_CKR(ret, "Get CKA_EXTRACTABLE");
+    }
+    if (ret == CKR_OK) {
+        CHECK_COND(extractable == CK_FALSE, ret,
+                   "Private key CKA_EXTRACTABLE should default to FALSE");
+    }
+
+    return ret;
+}
+#endif /* !WOLFPKCS11_NSS */
 #endif
 
 #if defined(HAVE_AES_KEYWRAP) && !defined(WOLFPKCS11_NO_STORE)
@@ -5760,7 +6266,7 @@ static CK_RV test_aes_wrap_unwrap_key(void* args)
 
     ret = get_aes_128_key(session, NULL, 0, &wrappingKey);
     if (ret == CKR_OK) {
-        ret = get_generic_key(session, keyData, sizeof(keyData), CK_FALSE,
+        ret = get_generic_key(session, keyData, sizeof(keyData), CK_TRUE,
                                                                           &key);
     }
     if (ret == CKR_OK) {
@@ -5804,7 +6310,7 @@ static CK_RV test_aes_wrap_unwrap_pad_key(void* args)
 
     ret = get_aes_128_key(session, NULL, 0, &wrappingKey);
     if (ret == CKR_OK) {
-        ret = get_generic_key(session, keyData, sizeof(keyData), CK_FALSE,
+        ret = get_generic_key(session, keyData, sizeof(keyData), CK_TRUE,
                                                                           &key);
     }
     if (ret == CKR_OK) {
@@ -5854,7 +6360,7 @@ static CK_RV test_wrap_unwrap_key(void* args)
     ret = get_generic_key(session, wrappingKeyData, sizeof(wrappingKeyData),
                                                         CK_FALSE, &wrappingKey);
     if (ret == CKR_OK) {
-        ret = get_generic_key(session, keyData, sizeof(keyData), CK_FALSE,
+        ret = get_generic_key(session, keyData, sizeof(keyData), CK_TRUE,
                                                                           &key);
     }
     if (ret == CKR_OK) {
@@ -5948,6 +6454,269 @@ static CK_RV test_wrap_unwrap_key(void* args)
     }
 
     funcList->C_DestroyObject(session, wrappingKey);
+    funcList->C_DestroyObject(session, key);
+
+    return ret;
+}
+
+/* Regression test: C_WrapKey on a key with CKA_EXTRACTABLE=CK_FALSE must
+ * return CKR_KEY_UNEXTRACTABLE (PKCS#11 spec 2.1.4). */
+static CK_RV test_wrap_key_unextractable(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_RV ret;
+    CK_MECHANISM mech = { CKM_AES_KEY_WRAP, NULL, 0 };
+    CK_OBJECT_HANDLE wrappingKey = CK_INVALID_HANDLE;
+    CK_OBJECT_HANDLE key = CK_INVALID_HANDLE;
+    byte wrappedKey[40], keyData[16];
+    CK_ULONG wrappedKeyLen = sizeof(wrappedKey);
+    //CK_BBOOL ckfalse = CK_FALSE;
+    CK_ATTRIBUTE wrapKeyTmpl[] = {
+        { CKA_CLASS,       &secretKeyClass,   sizeof(secretKeyClass)    },
+        { CKA_KEY_TYPE,    &aesKeyType,       sizeof(aesKeyType)        },
+        { CKA_VALUE,       aes_128_key,       sizeof(aes_128_key)       },
+        { CKA_WRAP,        &ckTrue,           sizeof(ckTrue)            },
+    };
+    CK_ULONG wrapKeyTmplCnt = sizeof(wrapKeyTmpl) / sizeof(*wrapKeyTmpl);
+    CK_ATTRIBUTE nonExtractTmpl[] = {
+        { CKA_CLASS,       &secretKeyClass,   sizeof(secretKeyClass)    },
+        { CKA_KEY_TYPE,    &genericKeyType,   sizeof(genericKeyType)    },
+        { CKA_VALUE,       keyData,           sizeof(keyData)           },
+        { CKA_EXTRACTABLE, &ckFalse,          sizeof(CK_BBOOL)          },
+    };
+    CK_ULONG nonExtractTmplCnt = sizeof(nonExtractTmpl) /
+                                                        sizeof(*nonExtractTmpl);
+
+    memset(keyData, 0x42, sizeof(keyData));
+
+    ret = funcList->C_CreateObject(session, wrapKeyTmpl, wrapKeyTmplCnt,
+                                   &wrappingKey);
+    CHECK_CKR(ret, "Create AES wrapping key for unextractable test");
+    if (ret == CKR_OK) {
+        ret = funcList->C_CreateObject(session, nonExtractTmpl,
+                                       nonExtractTmplCnt, &key);
+        CHECK_CKR(ret, "Create non-extractable key");
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_WrapKey(session, &mech, wrappingKey, key,
+                                  wrappedKey, &wrappedKeyLen);
+        CHECK_CKR_FAIL(ret, CKR_KEY_UNEXTRACTABLE,
+                       "Wrap non-extractable key must return CKR_KEY_UNEXTRACTABLE");
+    }
+
+    funcList->C_DestroyObject(session, wrappingKey);
+    funcList->C_DestroyObject(session, key);
+
+    return ret;
+}
+
+static CK_RV test_wrap_unwrap_op_not_supported(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_RV ret;
+    CK_MECHANISM mech = { CKM_AES_KEY_WRAP, NULL, 0 };
+    CK_OBJECT_HANDLE noWrapKey = CK_INVALID_HANDLE;
+    CK_OBJECT_HANDLE key = CK_INVALID_HANDLE;
+    byte wrappedKey[40], keyData[16];
+    CK_ULONG wrappedKeyLen = sizeof(wrappedKey);
+    CK_ATTRIBUTE noWrapTmpl[] = {
+        { CKA_CLASS,       &secretKeyClass,   sizeof(secretKeyClass)    },
+        { CKA_KEY_TYPE,    &aesKeyType,       sizeof(aesKeyType)        },
+        { CKA_VALUE,       aes_128_key,       sizeof(aes_128_key)       },
+        { CKA_WRAP,        &ckFalse,          sizeof(ckFalse)           },
+        { CKA_UNWRAP,      &ckTrue,           sizeof(ckTrue)            },
+    };
+    CK_ULONG noWrapTmplCnt = sizeof(noWrapTmpl) / sizeof(*noWrapTmpl);
+    CK_ATTRIBUTE noUnwrapTmpl[] = {
+        { CKA_CLASS,       &secretKeyClass,   sizeof(secretKeyClass)    },
+        { CKA_KEY_TYPE,    &aesKeyType,       sizeof(aesKeyType)        },
+        { CKA_VALUE,       aes_128_key,       sizeof(aes_128_key)       },
+        { CKA_WRAP,        &ckTrue,           sizeof(ckTrue)            },
+        { CKA_UNWRAP,      &ckFalse,          sizeof(ckFalse)           },
+    };
+    CK_ULONG noUnwrapTmplCnt = sizeof(noUnwrapTmpl) / sizeof(*noUnwrapTmpl);
+    CK_ATTRIBUTE unwrapResultTmpl[] = {
+        { CKA_CLASS,       &secretKeyClass,   sizeof(secretKeyClass)    },
+        { CKA_KEY_TYPE,    &genericKeyType,   sizeof(genericKeyType)    },
+    };
+    CK_ULONG unwrapResultCnt = sizeof(unwrapResultTmpl) /
+                                                    sizeof(*unwrapResultTmpl);
+    CK_OBJECT_HANDLE unwrapped = CK_INVALID_HANDLE;
+
+    memset(keyData, 0x42, sizeof(keyData));
+
+    /* Create key with CKA_WRAP=FALSE */
+    ret = funcList->C_CreateObject(session, noWrapTmpl, noWrapTmplCnt,
+                                   &noWrapKey);
+    CHECK_CKR(ret, "Create AES key with CKA_WRAP=FALSE");
+    if (ret == CKR_OK) {
+        ret = get_generic_key(session, keyData, sizeof(keyData), CK_TRUE, &key);
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_WrapKey(session, &mech, noWrapKey, key,
+                                  wrappedKey, &wrappedKeyLen);
+        CHECK_CKR_FAIL(ret, CKR_KEY_FUNCTION_NOT_PERMITTED,
+                        "WrapKey should fail with CKA_WRAP=FALSE");
+    }
+    funcList->C_DestroyObject(session, noWrapKey);
+    funcList->C_DestroyObject(session, key);
+
+    /* Now test CKA_UNWRAP=FALSE: first wrap with a valid key, then unwrap
+     * with a key that has CKA_UNWRAP=FALSE */
+    if (ret == CKR_OK) {
+        CK_OBJECT_HANDLE wrapKey = CK_INVALID_HANDLE;
+        ret = funcList->C_CreateObject(session, noUnwrapTmpl, noUnwrapTmplCnt,
+                                       &noWrapKey);
+        CHECK_CKR(ret, "Create AES key with CKA_UNWRAP=FALSE");
+        if (ret == CKR_OK) {
+            /* Use same key template but with wrap=true to actually wrap */
+            CK_ATTRIBUTE wrapOkTmpl[] = {
+                { CKA_CLASS,   &secretKeyClass, sizeof(secretKeyClass) },
+                { CKA_KEY_TYPE, &aesKeyType,    sizeof(aesKeyType)     },
+                { CKA_VALUE,   aes_128_key,     sizeof(aes_128_key)    },
+                { CKA_WRAP,    &ckTrue,         sizeof(ckTrue)         },
+                { CKA_UNWRAP,  &ckTrue,         sizeof(ckTrue)         },
+            };
+            ret = funcList->C_CreateObject(session, wrapOkTmpl,
+                                           sizeof(wrapOkTmpl)/sizeof(*wrapOkTmpl),
+                                           &wrapKey);
+            CHECK_CKR(ret, "Create valid wrapping key");
+        }
+        if (ret == CKR_OK) {
+            ret = get_generic_key(session, keyData, sizeof(keyData), CK_TRUE,
+                                  &key);
+        }
+        if (ret == CKR_OK) {
+            wrappedKeyLen = sizeof(wrappedKey);
+            ret = funcList->C_WrapKey(session, &mech, wrapKey, key,
+                                      wrappedKey, &wrappedKeyLen);
+            CHECK_CKR(ret, "Wrap key for unwrap test");
+        }
+        funcList->C_DestroyObject(session, wrapKey);
+        funcList->C_DestroyObject(session, key);
+
+        if (ret == CKR_OK) {
+            ret = funcList->C_UnwrapKey(session, &mech, noWrapKey, wrappedKey,
+                                        wrappedKeyLen, unwrapResultTmpl,
+                                        unwrapResultCnt, &unwrapped);
+            CHECK_CKR_FAIL(ret, CKR_KEY_FUNCTION_NOT_PERMITTED,
+                            "UnwrapKey should fail with CKA_UNWRAP=FALSE");
+        }
+        funcList->C_DestroyObject(session, noWrapKey);
+        if (unwrapped != CK_INVALID_HANDLE)
+            funcList->C_DestroyObject(session, unwrapped);
+    }
+
+    return ret;
+}
+
+/* Regression test: C_WrapKey on a key with CKA_WRAP_WITH_TRUSTED=CK_TRUE must
+ * return CKR_KEY_NOT_WRAPPABLE when the wrapping key lacks CKA_TRUSTED, and
+ * succeed when the wrapping key has CKA_TRUSTED=CK_TRUE. */
+static CK_RV test_wrap_key_wrap_with_trusted(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_RV ret;
+    CK_MECHANISM mech = { CKM_AES_KEY_WRAP, NULL, 0 };
+    CK_OBJECT_HANDLE untrustedKey = CK_INVALID_HANDLE;
+    CK_OBJECT_HANDLE trustedKey = CK_INVALID_HANDLE;
+    CK_OBJECT_HANDLE key = CK_INVALID_HANDLE;
+    byte wrappedKey[40], keyData[16];
+    CK_ULONG wrappedKeyLen;
+    CK_BBOOL ckTrusted = CK_TRUE;
+    CK_ATTRIBUTE untrustedWrapTmpl[] = {
+        { CKA_CLASS,       &secretKeyClass,   sizeof(secretKeyClass)    },
+        { CKA_KEY_TYPE,    &aesKeyType,       sizeof(aesKeyType)        },
+        { CKA_VALUE,       aes_128_key,       sizeof(aes_128_key)       },
+        { CKA_WRAP,        &ckTrue,           sizeof(ckTrue)            },
+    };
+    CK_ULONG untrustedWrapTmplCnt = sizeof(untrustedWrapTmpl) /
+                                    sizeof(*untrustedWrapTmpl);
+    /* CKA_TRUSTED may only be set by the SO, so the trusted wrapping key is
+     * provisioned as a public token object under an SO session. */
+    CK_ATTRIBUTE trustedWrapTmpl[] = {
+        { CKA_CLASS,       &secretKeyClass,   sizeof(secretKeyClass)    },
+        { CKA_KEY_TYPE,    &aesKeyType,       sizeof(aesKeyType)        },
+        { CKA_VALUE,       aes_128_key,       sizeof(aes_128_key)       },
+        { CKA_WRAP,        &ckTrue,           sizeof(ckTrue)            },
+        { CKA_TRUSTED,     &ckTrusted,        sizeof(CK_BBOOL)          },
+        { CKA_TOKEN,       &ckTrue,           sizeof(ckTrue)            },
+        { CKA_PRIVATE,     &ckFalse,          sizeof(ckFalse)           },
+    };
+    CK_ULONG trustedWrapTmplCnt = sizeof(trustedWrapTmpl) /
+                                  sizeof(*trustedWrapTmpl);
+    CK_ATTRIBUTE wwtTmpl[] = {
+        { CKA_CLASS,             &secretKeyClass,   sizeof(secretKeyClass)    },
+        { CKA_KEY_TYPE,          &genericKeyType,   sizeof(genericKeyType)    },
+        { CKA_VALUE,             keyData,           sizeof(keyData)           },
+        { CKA_EXTRACTABLE,       &ckTrue,           sizeof(ckTrue)            },
+        { CKA_WRAP_WITH_TRUSTED, &ckTrusted,        sizeof(CK_BBOOL)          },
+    };
+    CK_ULONG wwtTmplCnt = sizeof(wwtTmpl) / sizeof(*wwtTmpl);
+
+    memset(keyData, 0x55, sizeof(keyData));
+
+    /* Provision the trusted wrapping key as the SO. The token has a single
+     * login state, so log the harness user out, log in as SO to create the
+     * public token key, then restore the user session. */
+    ret = funcList->C_Logout(session);
+    CHECK_CKR(ret, "Logout user before SO provisioning");
+    if (ret == CKR_OK) {
+        ret = funcList->C_Login(session, CKU_SO, soPin, soPinLen);
+        CHECK_CKR(ret, "Login SO to create trusted key");
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_CreateObject(session, trustedWrapTmpl,
+                                       trustedWrapTmplCnt, &trustedKey);
+        CHECK_CKR(ret, "Create trusted AES wrapping key (SO)");
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_Logout(session);
+        CHECK_CKR(ret, "Logout SO after provisioning");
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_Login(session, CKU_USER, userPin, userPinLen);
+        CHECK_CKR(ret, "Re-login user after SO provisioning");
+    }
+
+    /* A user session must not be able to forge CKA_TRUSTED (F-5867). */
+    if (ret == CKR_OK) {
+        CK_OBJECT_HANDLE forgedKey = CK_INVALID_HANDLE;
+        ret = funcList->C_CreateObject(session, trustedWrapTmpl,
+                                       trustedWrapTmplCnt, &forgedKey);
+        if (ret == CKR_OK)
+            funcList->C_DestroyObject(session, forgedKey);
+        CHECK_CKR_FAIL(ret, CKR_ATTRIBUTE_READ_ONLY,
+                       "User session forging CKA_TRUSTED must be rejected");
+    }
+
+    if (ret == CKR_OK) {
+        ret = funcList->C_CreateObject(session, untrustedWrapTmpl,
+                                       untrustedWrapTmplCnt, &untrustedKey);
+        CHECK_CKR(ret, "Create untrusted AES wrapping key");
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_CreateObject(session, wwtTmpl, wwtTmplCnt, &key);
+        CHECK_CKR(ret, "Create CKA_WRAP_WITH_TRUSTED key");
+    }
+    /* Wrap with untrusted key must fail */
+    if (ret == CKR_OK) {
+        wrappedKeyLen = sizeof(wrappedKey);
+        ret = funcList->C_WrapKey(session, &mech, untrustedKey, key,
+                                  wrappedKey, &wrappedKeyLen);
+        CHECK_CKR_FAIL(ret, CKR_KEY_NOT_WRAPPABLE,
+                       "Wrap CKA_WRAP_WITH_TRUSTED key with untrusted wrapping key");
+    }
+    /* Wrap with trusted key must succeed */
+    if (ret == CKR_OK) {
+        wrappedKeyLen = sizeof(wrappedKey);
+        ret = funcList->C_WrapKey(session, &mech, trustedKey, key,
+                                  wrappedKey, &wrappedKeyLen);
+        CHECK_CKR(ret, "Wrap CKA_WRAP_WITH_TRUSTED key with trusted wrapping key");
+    }
+
+    funcList->C_DestroyObject(session, untrustedKey);
+    funcList->C_DestroyObject(session, trustedKey);
     funcList->C_DestroyObject(session, key);
 
     return ret;
@@ -6058,6 +6827,8 @@ static CK_RV test_pubkey_sig_fail(CK_SESSION_HANDLE session, CK_MECHANISM* mech,
         ret = funcList->C_Sign(session, hash, hashSz, out, &outSz);
         CHECK_CKR_FAIL(ret, CKR_OPERATION_NOT_INITIALIZED, "Sign wrong init");
     }
+    /* Clean up active verify operation from cross-type testing */
+    (void)funcList->C_Verify(session, hash, hashSz, out, outSz);
 
     return ret;
 }
@@ -6073,7 +6844,15 @@ static CK_RV get_rsa_priv_key(CK_SESSION_HANDLE session, unsigned char* privId,
         { CKA_CLASS,             &privKeyClass,     sizeof(privKeyClass)      },
         { CKA_KEY_TYPE,          &rsaKeyType,       sizeof(rsaKeyType)        },
         { CKA_DECRYPT,           &ckTrue,           sizeof(ckTrue)            },
+        /* CKA_SIGN / CKA_SIGN_RECOVER are opt-in for RSA private keys
+         * (F-5520); this helper backs sign and sign-recover tests. */
+        { CKA_SIGN,              &ckTrue,           sizeof(ckTrue)            },
+        { CKA_SIGN_RECOVER,      &ckTrue,           sizeof(ckTrue)            },
         { CKA_VERIFY,            &ckTrue,           sizeof(ckTrue)            },
+        /* CKA_UNWRAP defaults to CK_FALSE post-2774; set explicitly so the
+         * RSA wrap/unwrap path exercised by test_rsa_wrap_unwrap_key still
+         * works. */
+        { CKA_UNWRAP,            &ckTrue,           sizeof(ckTrue)            },
         { CKA_MODULUS,           rsa_2048_modulus,  sizeof(rsa_2048_modulus)  },
         { CKA_PRIVATE_EXPONENT,  rsa_2048_priv_exp, sizeof(rsa_2048_priv_exp) },
         { CKA_PRIME_1,           rsa_2048_p,        sizeof(rsa_2048_p)        },
@@ -6082,9 +6861,10 @@ static CK_RV get_rsa_priv_key(CK_SESSION_HANDLE session, unsigned char* privId,
         { CKA_EXPONENT_2,        rsa_2048_dQ,       sizeof(rsa_2048_dQ)       },
         { CKA_COEFFICIENT,       rsa_2048_u,        sizeof(rsa_2048_u)        },
         { CKA_PUBLIC_EXPONENT,   rsa_2048_pub_exp,  sizeof(rsa_2048_pub_exp)  },
+        { CKA_SENSITIVE,         &ckFalse,          sizeof(ckFalse)           },
         { CKA_EXTRACTABLE,       &extractable,      sizeof(CK_BBOOL)          },
         { CKA_TOKEN,             &ckTrue,           sizeof(ckTrue)            },
-        { CKA_ID,                privId,            privIdLen                 },
+        { CKA_ID,                privId,            (CK_ULONG)privIdLen       },
     };
     int cnt = sizeof(rsa_2048_priv_key)/sizeof(*rsa_2048_priv_key);
 
@@ -6105,10 +6885,13 @@ static CK_RV get_rsa_pub_key(CK_SESSION_HANDLE session, unsigned char* pubId,
         { CKA_CLASS,             &pubKeyClass,      sizeof(pubKeyClass)       },
         { CKA_KEY_TYPE,          &rsaKeyType,       sizeof(rsaKeyType)        },
         { CKA_ENCRYPT,           &ckTrue,           sizeof(ckTrue)            },
+        /* CKA_WRAP defaults to CK_FALSE post-2774; set explicitly so the
+         * RSA wrap path in test_rsa_wrap_unwrap_key still works. */
+        { CKA_WRAP,              &ckTrue,           sizeof(ckTrue)            },
         { CKA_MODULUS,           rsa_2048_modulus,  sizeof(rsa_2048_modulus)  },
         { CKA_PUBLIC_EXPONENT,   rsa_2048_pub_exp,  sizeof(rsa_2048_pub_exp)  },
         { CKA_TOKEN,             &ckTrue,           sizeof(ckTrue)            },
-        { CKA_ID,                pubId,             pubIdLen                  },
+        { CKA_ID,                pubId,             (CK_ULONG)pubIdLen        },
     };
     int cnt = sizeof(rsa_2048_pub_key)/sizeof(*rsa_2048_pub_key);
 
@@ -6141,7 +6924,7 @@ static CK_RV gen_rsa_key(CK_SESSION_HANDLE session, CK_OBJECT_HANDLE* pubKey,
         { CKA_DECRYPT,  &ckTrue, sizeof(ckTrue) },
         { CKA_SIGN,     &ckTrue, sizeof(ckTrue) },
         { CKA_LABEL,    (unsigned char*)"priv_label", 10 },
-        { CKA_ID,       id,      idLen          }
+        { CKA_ID,       id,      (CK_ULONG)idLen }
     };
     int               privTmplCnt = 3;
 
@@ -6187,7 +6970,7 @@ static CK_RV find_rsa_pub_key(CK_SESSION_HANDLE session,
     CK_ATTRIBUTE      pubKeyTmpl[] = {
         { CKA_CLASS,     &pubKeyClass,   sizeof(pubKeyClass)  },
         { CKA_KEY_TYPE,  &rsaKeyType,    sizeof(rsaKeyType)   },
-        { CKA_ID,        id,             idLen                }
+        { CKA_ID,        id,             (CK_ULONG)idLen      }
     };
     CK_ULONG pubKeyTmplCnt = sizeof(pubKeyTmpl) / sizeof(*pubKeyTmpl);
     CK_ULONG count;
@@ -6218,7 +7001,7 @@ static CK_RV find_rsa_priv_key(CK_SESSION_HANDLE session,
     CK_ATTRIBUTE      privKeyTmpl[] = {
         { CKA_CLASS,     &privKeyClass,  sizeof(privKeyClass) },
         { CKA_KEY_TYPE,  &rsaKeyType,    sizeof(rsaKeyType)   },
-        { CKA_ID,        id,             idLen                }
+        { CKA_ID,        id,             (CK_ULONG)idLen      }
     };
     CK_ULONG privKeyTmplCnt = sizeof(privKeyTmpl) / sizeof(*privKeyTmpl);
     CK_ULONG count;
@@ -6339,7 +7122,7 @@ static CK_RV test_rsa_wrap_unwrap_key(void* args)
 
     /* Create a secret key to wrap */
     if (ret == CKR_OK) {
-        ret = get_generic_key(session, keyData, sizeof(keyData), CK_FALSE,
+        ret = get_generic_key(session, keyData, sizeof(keyData), CK_TRUE,
                               &key);
     }
 
@@ -6364,7 +7147,7 @@ static CK_RV test_rsa_wrap_unwrap_key(void* args)
 
     /* Test getting wrapped key length */
     if (ret == CKR_OK) {
-        ret = get_generic_key(session, keyData, sizeof(keyData), CK_FALSE,
+        ret = get_generic_key(session, keyData, sizeof(keyData), CK_TRUE,
                               &key);
         if (ret == CKR_OK) {
             CK_ULONG testLen = 0;
@@ -6409,7 +7192,7 @@ static CK_RV test_rsa_wrap_unwrap_key(void* args)
     /* Test buffer too small error */
     if (ret == CKR_OK) {
         /* Create fresh key for this test since original was destroyed */
-        ret = get_generic_key(session, keyData, sizeof(keyData), CK_FALSE,
+        ret = get_generic_key(session, keyData, sizeof(keyData), CK_TRUE,
                               &key);
         if (ret == CKR_OK) {
             CK_ULONG smallLen = 1;
@@ -6429,6 +7212,138 @@ static CK_RV test_rsa_wrap_unwrap_key(void* args)
     return ret;
 }
 #endif
+
+#if defined(WOLFPKCS11_KEYPAIR_GEN_COMMON_LABEL) && \
+    defined(HAVE_AES_KEYWRAP) && !defined(WOLFPKCS11_NO_STORE) && \
+    !defined(NO_RSA) && !defined(NO_AES) && \
+    (defined(WOLFSSL_KEY_GEN) || defined(OPENSSL_EXTRA))
+/* Test that the companion public key auto-generated during RSA private key
+ * unwrap has CKA_WRAP set to CK_FALSE (not CK_TRUE). */
+static CK_RV test_rsa_unwrap_companion_pub_cka_wrap(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_RV ret;
+    CK_MECHANISM mech = { CKM_AES_KEY_WRAP_PAD, NULL, 0 };
+    CK_OBJECT_HANDLE wrappingKey = CK_INVALID_HANDLE;
+    CK_OBJECT_HANDLE privKey = CK_INVALID_HANDLE;
+    CK_OBJECT_HANDLE unwrappedPrivKey = CK_INVALID_HANDLE;
+    CK_OBJECT_HANDLE pubKey = CK_INVALID_HANDLE;
+    byte wrappedKey[2048];
+    CK_ULONG wrappedKeyLen = sizeof(wrappedKey);
+    CK_BBOOL wrapAttr = CK_TRUE;
+    CK_BBOOL sessionObj = CK_FALSE;
+    CK_BBOOL wrapTrue = CK_TRUE;
+    CK_BBOOL unwrapTrue = CK_TRUE;
+    CK_ULONG count;
+    CK_ATTRIBUTE aesKeyTmpl[] = {
+        { CKA_CLASS,    &secretKeyClass, sizeof(secretKeyClass) },
+        { CKA_KEY_TYPE, &aesKeyType,     sizeof(aesKeyType)     },
+        { CKA_ENCRYPT,  &ckTrue,         sizeof(ckTrue)         },
+        { CKA_DECRYPT,  &ckTrue,         sizeof(ckTrue)         },
+        { CKA_WRAP,     &wrapTrue,       sizeof(wrapTrue)       },
+        { CKA_UNWRAP,   &unwrapTrue,     sizeof(unwrapTrue)     },
+        { CKA_TOKEN,    &sessionObj,     sizeof(sessionObj)     },
+        { CKA_VALUE,    aes_128_key,     sizeof(aes_128_key)    },
+    };
+    CK_ULONG aesKeyTmplCnt = sizeof(aesKeyTmpl) / sizeof(*aesKeyTmpl);
+    CK_ATTRIBUTE rsaPrivTmpl[] = {
+        { CKA_CLASS,            &privKeyClass,     sizeof(privKeyClass)      },
+        { CKA_KEY_TYPE,         &rsaKeyType,       sizeof(rsaKeyType)        },
+        { CKA_DECRYPT,          &ckTrue,           sizeof(ckTrue)            },
+        { CKA_MODULUS,          rsa_2048_modulus,  sizeof(rsa_2048_modulus)  },
+        { CKA_PRIVATE_EXPONENT, rsa_2048_priv_exp, sizeof(rsa_2048_priv_exp) },
+        { CKA_PRIME_1,          rsa_2048_p,        sizeof(rsa_2048_p)        },
+        { CKA_PRIME_2,          rsa_2048_q,        sizeof(rsa_2048_q)        },
+        { CKA_EXPONENT_1,       rsa_2048_dP,       sizeof(rsa_2048_dP)       },
+        { CKA_EXPONENT_2,       rsa_2048_dQ,       sizeof(rsa_2048_dQ)       },
+        { CKA_COEFFICIENT,      rsa_2048_u,        sizeof(rsa_2048_u)        },
+        { CKA_PUBLIC_EXPONENT,  rsa_2048_pub_exp,  sizeof(rsa_2048_pub_exp)  },
+        { CKA_EXTRACTABLE,      &ckTrue,           sizeof(ckTrue)            },
+        { CKA_TOKEN,            &sessionObj,       sizeof(sessionObj)        },
+    };
+    CK_ULONG rsaPrivTmplCnt = sizeof(rsaPrivTmpl) / sizeof(*rsaPrivTmpl);
+    CK_ATTRIBUTE unwrapTmpl[] = {
+        { CKA_CLASS,    &privKeyClass, sizeof(privKeyClass) },
+        { CKA_KEY_TYPE, &rsaKeyType,   sizeof(rsaKeyType)   },
+        { CKA_TOKEN,    &sessionObj,   sizeof(sessionObj)   },
+    };
+    CK_ULONG unwrapTmplCnt = sizeof(unwrapTmpl) / sizeof(*unwrapTmpl);
+    CK_ATTRIBUTE pubKeySearchTmpl[] = {
+        { CKA_CLASS,    &pubKeyClass, sizeof(pubKeyClass) },
+        { CKA_KEY_TYPE, &rsaKeyType,  sizeof(rsaKeyType)  },
+        { CKA_TOKEN,    &sessionObj,  sizeof(sessionObj)  },
+    };
+    CK_ULONG pubKeySearchTmplCnt =
+        sizeof(pubKeySearchTmpl) / sizeof(*pubKeySearchTmpl);
+    CK_ATTRIBUTE getWrapTmpl[] = {
+        { CKA_WRAP, &wrapAttr, sizeof(wrapAttr) },
+    };
+    /* Create the AES wrapping key */
+    ret = funcList->C_CreateObject(session, aesKeyTmpl, aesKeyTmplCnt,
+                                   &wrappingKey);
+    CHECK_CKR(ret, "AES Wrapping Key Create Object");
+    /* Create the RSA private key */
+    if (ret == CKR_OK) {
+        ret = funcList->C_CreateObject(session, rsaPrivTmpl, rsaPrivTmplCnt,
+                                       &privKey);
+        CHECK_CKR(ret, "RSA Private Key Create Object");
+    }
+    /* Wrap the RSA private key */
+    if (ret == CKR_OK) {
+        ret = funcList->C_WrapKey(session, &mech, wrappingKey, privKey,
+                                  wrappedKey, &wrappedKeyLen);
+        CHECK_CKR(ret, "Wrap RSA Private Key with AES");
+    }
+    /* Clean up */
+    funcList->C_DestroyObject(session, privKey);
+    privKey = CK_INVALID_HANDLE;
+    /* Unwrap the RSA private key */
+    if (ret == CKR_OK) {
+        ret = funcList->C_UnwrapKey(session, &mech, wrappingKey,
+                                    wrappedKey, wrappedKeyLen,
+                                    unwrapTmpl, unwrapTmplCnt,
+                                    &unwrappedPrivKey);
+        CHECK_CKR(ret, "Unwrap RSA Private Key");
+    }
+    /* Find the companion public key */
+    if (ret == CKR_OK) {
+        ret = funcList->C_FindObjectsInit(session, pubKeySearchTmpl,
+                                          pubKeySearchTmplCnt);
+        CHECK_CKR(ret, "Find companion public key Init");
+    }
+    /* Find the companion public key */
+    if (ret == CKR_OK) {
+        ret = funcList->C_FindObjects(session, &pubKey, 1, &count);
+        CHECK_CKR(ret, "Find companion public key");
+    }
+    /* Finalize the object search */
+    if (ret == CKR_OK) {
+        ret = funcList->C_FindObjectsFinal(session);
+        CHECK_CKR(ret, "Find companion public key Final");
+    }
+    /* Check if the companion public key was found */
+    if (ret == CKR_OK && count == 0) {
+        ret = -1;
+        CHECK_CKR(ret, "Companion public key not found");
+    }
+    /* Check the wrap attribute of the companion public key */
+    if (ret == CKR_OK) {
+        ret = funcList->C_GetAttributeValue(session, pubKey, getWrapTmpl, 1);
+        CHECK_CKR(ret, "Get CKA_WRAP from companion public key");
+    }
+    /* Check that the companion public key has CKA_WRAP set to CK_FALSE */
+    if (ret == CKR_OK && wrapAttr != CK_FALSE) {
+        ret = -1;
+        CHECK_CKR(ret, "CKA_WRAP must be CK_FALSE on companion public key");
+    }
+    /* Clean up */
+    funcList->C_DestroyObject(session, wrappingKey);
+    funcList->C_DestroyObject(session, unwrappedPrivKey);
+    funcList->C_DestroyObject(session, pubKey);
+
+    return ret;
+}
+#endif /* WOLFPKCS11_KEYPAIR_GEN_COMMON_LABEL && HAVE_AES_KEYWRAP && ... */
 
 static CK_RV test_attributes_rsa(void* args)
 {
@@ -6488,7 +7403,12 @@ static CK_RV test_attributes_rsa(void* args)
     if (ret == CKR_OK) {
         ret = funcList->C_GetAttributeValue(session, priv, rsaPrivTmpl,
                                                                 rsaPrivTmplCnt);
-        CHECK_CKR(ret, "Get Attributes RSA private key length");
+        /* get_rsa_priv_key(extractable=FALSE) sets the noPriv flag, so per
+         * Fenrir 2776 the sensitive components now return
+         * CKR_ATTRIBUTE_SENSITIVE rather than silently CKR_OK with a
+         * sentinel length. */
+        CHECK_CKR_FAIL(ret, CKR_ATTRIBUTE_SENSITIVE,
+                       "Get Attributes RSA private key length");
     }
     if (ret == CKR_OK) {
         CHECK_COND(rsaPrivTmpl[0].ulValueLen == sizeof(modulus), ret,
@@ -6847,6 +7767,10 @@ static CK_RV rsa_x_509_sig_test(CK_SESSION_HANDLE session,
         CHECK_CKR(ret, "RSA X_509 Verify");
     }
     if (ret == CKR_OK) {
+        ret = funcList->C_VerifyInit(session, &mech, pub);
+        CHECK_CKR(ret, "RSA X_509 Verify Init before bad hash");
+    }
+    if (ret == CKR_OK) {
         ret = funcList->C_Verify(session, badHash, sizeof(badHash), out, outSz);
         CHECK_CKR_FAIL(ret, CKR_SIGNATURE_INVALID, "RSA X_509 Verify bad hash");
     }
@@ -6902,6 +7826,10 @@ static CK_RV rsa_pkcs15_sig_test(CK_SESSION_HANDLE session,
         CHECK_CKR(ret, "RSA PKCS#1.5 Verify");
     }
     if (ret == CKR_OK) {
+        ret = funcList->C_VerifyInit(session, &mech, pub);
+        CHECK_CKR(ret, "RSA PKCS#1.5 Verify Init before bad hash");
+    }
+    if (ret == CKR_OK) {
         ret = funcList->C_Verify(session, badHash, sizeof(badHash), out, outSz);
         CHECK_CKR_FAIL(ret, CKR_SIGNATURE_INVALID,
                                                 "RSA PKCS#1.5 Verify bad hash");
@@ -6949,6 +7877,8 @@ static CK_RV test_sha256_rsa_pkcs15(void* args)
         { CKA_CLASS,             &privKeyClass,     sizeof(privKeyClass)      },
         { CKA_KEY_TYPE,          &rsaKeyType,       sizeof(rsaKeyType)        },
         { CKA_DECRYPT,           &ckTrue,           sizeof(ckTrue)            },
+        /* CKA_SIGN is opt-in for RSA private keys (F-5520). */
+        { CKA_SIGN,              &ckTrue,           sizeof(ckTrue)            },
         { CKA_MODULUS,           rsa_2048_modulus,  sizeof(rsa_2048_modulus)  },
         { CKA_PRIVATE_EXPONENT,  rsa_2048_priv_exp, sizeof(rsa_2048_priv_exp) },
         { CKA_PRIME_1,           rsa_2048_p,        sizeof(rsa_2048_p)        },
@@ -7035,6 +7965,10 @@ static CK_RV sha256_rsa_pkcs15_sig_test(CK_SESSION_HANDLE session,
         CHECK_CKR(ret, "RSA PKCS#1.5 Verify");
     }
     if (ret == CKR_OK) {
+        ret = funcList->C_VerifyInit(session, &mech, pub);
+        CHECK_CKR(ret, "RSA PKCS#1.5 Verify Init before bad hash");
+    }
+    if (ret == CKR_OK) {
         ret = funcList->C_Verify(session, badHash, sizeof(badHash), out, outSz);
         CHECK_CKR_FAIL(ret, CKR_SIGNATURE_INVALID,
                                                 "RSA PKCS#1.5 Verify bad hash");
@@ -7096,6 +8030,10 @@ static CK_RV rsa_pss_test(CK_SESSION_HANDLE session, CK_OBJECT_HANDLE priv,
         CHECK_CKR(ret, "RSA PKCS#1 PSS Verify");
     }
     if (ret == CKR_OK) {
+        ret = funcList->C_VerifyInit(session, &mech, pub);
+        CHECK_CKR(ret, "RSA PKCS#1 PSS Verify Init before bad hash");
+    }
+    if (ret == CKR_OK) {
         ret = funcList->C_Verify(session, badHash, hashSz, out, outSz);
         CHECK_CKR_FAIL(ret, CKR_SIGNATURE_INVALID,
                                               "RSA PKCS#1 PSS Verify bad hash");
@@ -7110,6 +8048,10 @@ static CK_RV rsa_pss_test(CK_SESSION_HANDLE session, CK_OBJECT_HANDLE priv,
         CHECK_CKR_FAIL(ret, CKR_BUFFER_TOO_SMALL,
                                       "RSA PKCS#1 PSS Sign out size too small");
         outSz = sizeof(out);
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_Sign(session, hash, hashSz, out, &outSz);
+        CHECK_CKR(ret, "RSA PKCS#1 PSS Sign cleanup");
     }
 
     return ret;
@@ -7168,6 +8110,10 @@ static CK_RV sha256_rsa_pss_test(CK_SESSION_HANDLE session,
         CHECK_CKR(ret, "RSA PKCS#1 PSS Verify");
     }
     if (ret == CKR_OK) {
+        ret = funcList->C_VerifyInit(session, &mech, pub);
+        CHECK_CKR(ret, "RSA PKCS#1 PSS Verify Init before bad hash");
+    }
+    if (ret == CKR_OK) {
         ret = funcList->C_Verify(session, badHash, hashSz, out, outSz);
         CHECK_CKR_FAIL(ret, CKR_SIGNATURE_INVALID,
                                 "RSA PKCS#1 PSS Verify bad hash");
@@ -7182,6 +8128,10 @@ static CK_RV sha256_rsa_pss_test(CK_SESSION_HANDLE session,
         CHECK_CKR_FAIL(ret, CKR_BUFFER_TOO_SMALL,
                         "RSA PKCS#1 PSS Sign out size too small");
         outSz = sizeof(out);
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_Sign(session, hash, hashSz, out, &outSz);
+        CHECK_CKR(ret, "RSA PKCS#1 PSS Sign cleanup");
     }
 
     return ret;
@@ -7580,6 +8530,9 @@ static CK_RV test_rsa_encdec_fail(CK_SESSION_HANDLE session, CK_MECHANISM* mech,
         CHECK_CKR_FAIL(ret, CKR_OPERATION_NOT_INITIALIZED,
                                                       "RSA Encrypt wrong init");
     }
+    /* Clean up active decrypt operation from cross-type testing */
+    decSz = sizeof(dec);
+    (void)funcList->C_Decrypt(session, enc, encSz, dec, &decSz);
 
     return ret;
 }
@@ -7633,6 +8586,46 @@ static CK_RV test_rsa_x_509_fail(void* args)
 
     return ret;
 }
+
+#ifdef WC_RSA_DIRECT
+/* Regression test for WP11_Rsa_Verify early return when inLen > key size. */
+static CK_RV test_rsa_x_509_verify_lock(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_RV ret;
+    CK_MECHANISM mech;
+    CK_OBJECT_HANDLE pub = CK_INVALID_HANDLE;
+    /* One byte larger than RSA-2048 key size (256 bytes) */
+    byte overData[2048/8 + 1];
+    byte sig[2048/8];
+    CK_ULONG sigSz = sizeof(sig);
+
+    mech.mechanism      = CKM_RSA_X_509;
+    mech.ulParameterLen = 0;
+    mech.pParameter     = NULL;
+
+    memset(overData, 0, sizeof(overData));
+    memset(sig, 0, sizeof(sig));
+
+    /* Token-based key so pub->onToken=1 and the lock path is active */
+    ret = get_rsa_pub_key(session, NULL, 0, &pub);
+
+    /* inLen > decSigLen triggers the early return path in WP11_Rsa_Verify */
+    if (ret == CKR_OK) {
+        ret = funcList->C_VerifyInit(session, &mech, pub);
+        CHECK_CKR(ret, "RSA X_509 Verify Init token key");
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_Verify(session, overData, sizeof(overData),
+                                 sig, sigSz);
+        CHECK_CKR_FAIL(ret, CKR_FUNCTION_FAILED,
+                       "RSA X_509 Verify oversized data");
+    }
+
+    funcList->C_DestroyObject(session, pub);
+    return ret;
+}
+#endif /* WC_RSA_DIRECT */
 
 static CK_RV test_rsa_pkcs_encdec_fail(void* args)
 {
@@ -7990,8 +8983,10 @@ static CK_OBJECT_HANDLE get_ecc_priv_key(CK_SESSION_HANDLE session,
     CK_ATTRIBUTE ecc_p256_priv_key[] = {
         { CKA_CLASS,             &privKeyClass,     sizeof(privKeyClass)      },
         { CKA_KEY_TYPE,          &eccKeyType,       sizeof(eccKeyType)        },
+        { CKA_SENSITIVE,         &ckFalse,          sizeof(ckFalse)           },
         { CKA_EXTRACTABLE,       &extractable,      sizeof(CK_BBOOL)          },
         { CKA_VERIFY,            &ckTrue,           sizeof(ckTrue)            },
+        { CKA_DERIVE,            &ckTrue,           sizeof(ckTrue)            },
         { CKA_EC_PARAMS,         ecc_p256_params,   sizeof(ecc_p256_params)   },
         { CKA_VALUE,             ecc_p256_priv,     sizeof(ecc_p256_priv)     },
     };
@@ -8038,17 +9033,21 @@ static CK_RV gen_ec_keys(CK_SESSION_HANDLE session, byte* params, int paramSz,
     CK_MECHANISM      mech;
     CK_BBOOL          token;
     CK_ATTRIBUTE      pubKeyTmpl[] = {
-        { CKA_EC_PARAMS,       params,             paramSz                    },
+        { CKA_EC_PARAMS,       params,             (CK_ULONG)paramSz          },
         { CKA_VERIFY,          &ckTrue,            sizeof(ckTrue)             },
         { CKA_TOKEN,           &token,             sizeof(token)              },
-        { CKA_ID,              pubId,              pubIdLen                   },
+        { CKA_ID,              pubId,              (CK_ULONG)pubIdLen         },
     };
     int               pubTmplCnt = sizeof(pubKeyTmpl)/sizeof(*pubKeyTmpl);
     CK_ATTRIBUTE      privKeyTmpl[] = {
         { CKA_SIGN,            &ckTrue,            sizeof(ckTrue)             },
         { CKA_DERIVE,          &ckTrue,            sizeof(ckTrue)             },
+        /* Readable base so the derived secret can be checked (F-4533 makes
+         * the derived key inherit the base key's protection). */
+        { CKA_SENSITIVE,       &ckFalse,           sizeof(ckFalse)           },
+        { CKA_EXTRACTABLE,     &ckTrue,            sizeof(ckTrue)            },
         { CKA_TOKEN,           &token,             sizeof(token)              },
-        { CKA_ID,              privId,             privIdLen                  },
+        { CKA_ID,              privId,             (CK_ULONG)privIdLen        },
     };
     int               privTmplCnt = sizeof(privKeyTmpl)/sizeof(*privKeyTmpl);
 
@@ -8099,7 +9098,7 @@ static CK_RV find_ecc_priv_key(CK_SESSION_HANDLE session,
     CK_ATTRIBUTE      privKeyTmpl[] = {
         { CKA_CLASS,     &privKeyClass,  sizeof(privKeyClass) },
         { CKA_KEY_TYPE,  &eccKeyType,    sizeof(eccKeyType)   },
-        { CKA_ID,        id,             idLen                }
+        { CKA_ID,        id,             (CK_ULONG)idLen      }
     };
     CK_ULONG privKeyTmplCnt = sizeof(privKeyTmpl) / sizeof(*privKeyTmpl);
     CK_ULONG count;
@@ -8130,7 +9129,7 @@ static CK_RV find_ecc_pub_key(CK_SESSION_HANDLE session,
     CK_ATTRIBUTE      pubKeyTmpl[] = {
         { CKA_CLASS,     &pubKeyClass, sizeof(pubKeyClass) },
         { CKA_KEY_TYPE,  &eccKeyType,   sizeof(eccKeyType)  },
-        { CKA_ID,        id,            idLen               }
+        { CKA_ID,        id,            (CK_ULONG)idLen     }
     };
     CK_ULONG pubKeyTmplCnt = sizeof(pubKeyTmpl) / sizeof(*pubKeyTmpl);
     CK_ULONG count;
@@ -8223,7 +9222,10 @@ static CK_RV test_attributes_ecc(void* args)
     if (ret == CKR_OK) {
         ret = funcList->C_GetAttributeValue(session, priv, eccPrivTmpl,
                                                                 eccPrivTmplCnt);
-        CHECK_CKR(ret, "Get Attributes EC Private Key NULL values");
+        /* extractable=FALSE -> noPriv -> CKR_ATTRIBUTE_SENSITIVE per
+         * Fenrir 2776. */
+        CHECK_CKR_FAIL(ret, CKR_ATTRIBUTE_SENSITIVE,
+                       "Get Attributes EC Private Key NULL values");
     }
     if (ret == CKR_OK) {
         CHECK_COND(eccPrivTmpl[0].ulValueLen == sizeof(ecc_p256_params), ret,
@@ -8312,6 +9314,15 @@ static CK_RV ecdh_test(CK_SESSION_HANDLE session, CK_OBJECT_HANDLE privKey,
             ret = -1;
             CHECK_CKR(ret, "Secret compare with expected");
         }
+    }
+    else if (ret == CKR_OK) {
+        /* An all-zero secret is the signature of a derive that ran without
+         * the private key material (identity/empty scalar result). */
+        word32 i;
+        byte acc = 0;
+        for (i = 0; i < outSz; i++)
+            acc |= out[i];
+        CHECK_COND(acc != 0, ret, "EC Derive Key secret is all zeros");
     }
     if (ret == CKR_OK) {
         mech.pParameter = NULL;
@@ -8430,8 +9441,16 @@ static CK_RV ecdsa_test(CK_SESSION_HANDLE session, CK_OBJECT_HANDLE privKey,
     }
 #endif
     if (ret == CKR_OK) {
+        ret = funcList->C_VerifyInit(session, &mech, pubKey);
+        CHECK_CKR(ret, "ECDSA Verify Init before bad hash");
+    }
+    if (ret == CKR_OK) {
         ret = funcList->C_Verify(session, hash, hashSz - 1, out, outSz);
         CHECK_CKR_FAIL(ret, CKR_SIGNATURE_INVALID, "ECDSA Verify bad hash");
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_VerifyInit(session, &mech, pubKey);
+        CHECK_CKR(ret, "ECDSA Verify Init before bad sig");
     }
     if (ret == CKR_OK) {
         outSz = 1;
@@ -8488,8 +9507,16 @@ static CK_RV ecdsa_test(CK_SESSION_HANDLE session, CK_OBJECT_HANDLE privKey,
         }
 #endif
         if (ret == CKR_OK) {
+            ret = funcList->C_VerifyInit(session, &mech, pubKey);
+            CHECK_CKR(ret, "ECDSA Verify Init before bad hash");
+        }
+        if (ret == CKR_OK) {
             ret = funcList->C_Verify(session, data, dataSz - 1, out, outSz);
             CHECK_CKR_FAIL(ret, CKR_SIGNATURE_INVALID, "ECDSA Verify bad hash");
+        }
+        if (ret == CKR_OK) {
+            ret = funcList->C_VerifyInit(session, &mech, pubKey);
+            CHECK_CKR(ret, "ECDSA Verify Init before bad sig");
         }
         if (ret == CKR_OK) {
             outSz = 1;
@@ -8502,8 +9529,6 @@ static CK_RV ecdsa_test(CK_SESSION_HANDLE session, CK_OBJECT_HANDLE privKey,
 }
 
 /* Tests for error occurring when private and public curves mismatch. */
-/* Crashes with TPM test right now. */
-#ifndef WOLFPKCS11_TPM
 static CK_RV test_ecc_curve(void *args)
 {
     CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
@@ -8637,7 +9662,6 @@ static CK_RV test_ecc_curve(void *args)
 
     return ret;
 }
-#endif
 
 /* Calling C_SetAttributeValue used to erase a key */
 static CK_RV test_ecc_key_erase_bug(void* args)
@@ -8649,6 +9673,8 @@ static CK_RV test_ecc_key_erase_bug(void* args)
     CK_ATTRIBUTE ecc_p256_priv_key[] = {
         { CKA_CLASS,             &privKeyClass,     sizeof(privKeyClass)      },
         { CKA_KEY_TYPE,          &eccKeyType,       sizeof(eccKeyType)        },
+        { CKA_SENSITIVE,         &ckFalse,          sizeof(ckFalse)           },
+        { CKA_EXTRACTABLE,       &ckTrue,           sizeof(ckTrue)            },
         { CKA_VERIFY,            &ckTrue,           sizeof(ckTrue)            },
         { CKA_EC_PARAMS,         ecc_p256_params,   sizeof(ecc_p256_params)   },
         { CKA_VALUE,             ecc_p256_priv,     sizeof(ecc_p256_priv)     },
@@ -8874,7 +9900,8 @@ static CK_RV test_ecc_fixed_keys_ecdh(void* args)
     CK_OBJECT_HANDLE priv = CK_INVALID_HANDLE;
     CK_OBJECT_HANDLE pub = CK_INVALID_HANDLE;
 
-    ret = get_ecc_priv_key(session, CK_FALSE, &priv);
+    /* Extractable base so the derived ECDH secret can be read (F-4533). */
+    ret = get_ecc_priv_key(session, CK_TRUE, &priv);
     if (ret == CKR_OK)
         ret = get_ecc_pub_key(session, &pub);
     if (ret == CKR_OK) {
@@ -9050,7 +10077,8 @@ static CK_RV test_ecdh_x963(void* args)
     CK_OBJECT_HANDLE priv = CK_INVALID_HANDLE;
     CK_OBJECT_HANDLE pub = CK_INVALID_HANDLE;
 
-    ret = get_ecc_priv_key(session, CK_FALSE, &priv);
+    /* Extractable base so the derived ECDH secret can be read (F-4533). */
+    ret = get_ecc_priv_key(session, CK_TRUE, &priv);
     if (ret == CKR_OK)
         ret = get_ecc_pub_key(session, &pub);
     if (ret == CKR_OK) {
@@ -9072,6 +10100,7 @@ static CK_OBJECT_HANDLE get_dh_priv_key(CK_SESSION_HANDLE session,
     CK_ATTRIBUTE dh_2048_priv_key[] = {
         { CKA_CLASS,             &privKeyClass,     sizeof(privKeyClass)      },
         { CKA_KEY_TYPE,          &dhKeyType,        sizeof(dhKeyType)         },
+        { CKA_SENSITIVE,         &ckFalse,          sizeof(ckFalse)           },
         { CKA_EXTRACTABLE,       &extractable,      sizeof(CK_BBOOL)          },
         { CKA_DERIVE,            &ckTrue,           sizeof(ckTrue)            },
         { CKA_PRIME,             dh_ffdhe2048_p,    sizeof(dh_ffdhe2048_p)    },
@@ -9122,16 +10151,19 @@ static CK_RV gen_dh_keys(CK_SESSION_HANDLE session, byte* prime, int primeSz,
     CK_MECHANISM      mech;
     CK_BBOOL          token;
     CK_ATTRIBUTE      pubKeyTmpl[] = {
-        { CKA_PRIME,           prime,              primeSz                    },
-        { CKA_BASE,            generator,          generatorSz                },
+        { CKA_PRIME,           prime,              (CK_ULONG)primeSz          },
+        { CKA_BASE,            generator,          (CK_ULONG)generatorSz      },
         { CKA_TOKEN,           &token,             sizeof(token)              },
-        { CKA_ID,              pubId,              pubIdLen                   },
+        { CKA_ID,              pubId,              (CK_ULONG)pubIdLen         },
     };
     int               pubTmplCnt = sizeof(pubKeyTmpl)/sizeof(*pubKeyTmpl);
     CK_ATTRIBUTE      privKeyTmpl[] = {
         { CKA_DERIVE,          &ckTrue,            sizeof(ckTrue)             },
+        /* Readable base so the derived secret can be checked (F-4533). */
+        { CKA_SENSITIVE,       &ckFalse,           sizeof(ckFalse)           },
+        { CKA_EXTRACTABLE,     &ckTrue,            sizeof(ckTrue)            },
         { CKA_TOKEN,           &token,             sizeof(token)              },
-        { CKA_ID,              privId,             privIdLen                  },
+        { CKA_ID,              privId,             (CK_ULONG)privIdLen        },
     };
     int               privTmplCnt = sizeof(privKeyTmpl)/sizeof(*privKeyTmpl);
 
@@ -9234,7 +10266,10 @@ static CK_RV test_attributes_dh(void* args)
     if (ret == CKR_OK) {
         ret = funcList->C_GetAttributeValue(session, priv, dhPrivTmpl,
                                                                  dhPrivTmplCnt);
-        CHECK_CKR(ret, "Get Attributes DH Public Key");
+        /* extractable=FALSE -> noPriv -> CKR_ATTRIBUTE_SENSITIVE per
+         * Fenrir 2776. */
+        CHECK_CKR_FAIL(ret, CKR_ATTRIBUTE_SENSITIVE,
+                       "Get Attributes DH Private Key (sensitive)");
     }
     if (ret == CKR_OK) {
         CHECK_COND(dhPrivTmpl[0].ulValueLen == sizeof(prime), ret,
@@ -9254,7 +10289,9 @@ static CK_RV test_attributes_dh(void* args)
     if (ret == CKR_OK) {
         ret = funcList->C_GetAttributeValue(session, priv, dhPrivTmpl,
                                                                  dhPrivTmplCnt);
-        CHECK_CKR(ret, "Get Attributes DH Public Key");
+        /* same priv key, still noPriv. */
+        CHECK_CKR_FAIL(ret, CKR_ATTRIBUTE_SENSITIVE,
+                       "Get Attributes DH Private Key (sensitive, populated)");
     }
     funcList->C_DestroyObject(session, priv);
     if (ret == CKR_OK) {
@@ -9353,7 +10390,8 @@ static CK_RV test_dh_fixed_keys(void* args)
     CK_OBJECT_HANDLE priv = CK_INVALID_HANDLE;
     CK_OBJECT_HANDLE pub = CK_INVALID_HANDLE;
 
-    ret = get_dh_priv_key(session, CK_FALSE, &priv);
+    /* Extractable base so the derived DH secret can be read (F-4533). */
+    ret = get_dh_priv_key(session, CK_TRUE, &priv);
     if (ret == CKR_OK)
         ret = get_dh_pub_key(session, &pub);
     if (ret == CKR_OK) {
@@ -9391,8 +10429,12 @@ static CK_RV gen_aes_key(CK_SESSION_HANDLE session, int len, unsigned char* id,
     CK_ULONG          keyLen = len;
     CK_ATTRIBUTE      keyTmpl[] = {
         { CKA_VALUE_LEN,       &keyLen,            sizeof(keyLen)             },
+        { CKA_DERIVE,          &ckTrue,            sizeof(ckTrue)             },
+        /* Readable base so the derived secret can be checked (F-4533). */
+        { CKA_SENSITIVE,       &ckFalse,           sizeof(ckFalse)           },
+        { CKA_EXTRACTABLE,     &ckTrue,            sizeof(ckTrue)            },
         { CKA_TOKEN,           &token,             sizeof(token)              },
-        { CKA_ID,              id,                 idLen                      },
+        { CKA_ID,              id,                 (CK_ULONG)idLen            },
     };
     int               keyTmplCnt = sizeof(keyTmpl)/sizeof(*keyTmpl);
 
@@ -9438,7 +10480,7 @@ static CK_RV find_aes_key(CK_SESSION_HANDLE session, unsigned char* id,
     CK_ATTRIBUTE      keyTmpl[] = {
         { CKA_CLASS,     &secretKeyClass,  sizeof(secretKeyClass) },
         { CKA_KEY_TYPE,  &aesKeyType,      sizeof(aesKeyType)     },
-        { CKA_ID,        id,               idLen                  }
+        { CKA_ID,        id,               (CK_ULONG)idLen        }
     };
     CK_ULONG keyTmplCnt = sizeof(keyTmpl) / sizeof(*keyTmpl);
     CK_ULONG count;
@@ -9949,6 +10991,10 @@ static CK_RV test_aes_cbc_fail(void* args)
                                             "AES-CBC Encrypt Final wrong init");
     }
 
+    /* Clean up active decrypt operation from cross-type testing */
+    decSz = sizeof(dec);
+    (void)funcList->C_Decrypt(session, enc, encSz, dec, &decSz);
+
     return ret;
 }
 
@@ -10027,6 +11073,85 @@ static CK_RV test_aes_cbc_pad_len_test(void* args)
     return ret;
 }
 
+static CK_RV test_aes_cbc_pad_block_aligned_size(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_RV ret;
+    CK_OBJECT_HANDLE key;
+    CK_MECHANISM mech;
+    byte iv[16];
+    CK_ULONG ivSz = sizeof(iv);
+    CK_ULONG encSz;
+    CK_ULONG i;
+    /* Test block-aligned sizes: 0, 16, 32, 48 */
+    CK_ULONG sizes[] = { 0, 16, 32, 48 };
+    byte plain[48];
+    byte enc[48 + 16];
+    byte dec[48];
+    CK_ULONG decSz;
+
+    memset(plain, 9, sizeof(plain));
+    memset(iv, 9, sizeof(iv));
+
+    mech.mechanism      = CKM_AES_CBC_PAD;
+    mech.ulParameterLen = ivSz;
+    mech.pParameter     = iv;
+
+    ret = get_aes_128_key(session, NULL, 0, &key);
+    CHECK_CKR(ret, "Getting AES key");
+
+    for (i = 0; i < sizeof(sizes)/sizeof(sizes[0]) && ret == CKR_OK; i++) {
+        CK_ULONG plainSz = sizes[i];
+        CK_ULONG expectedEncSz = plainSz + 16; /* PKCS#7 always adds padding */
+
+        /* Size query with pEncryptedData=NULL */
+        ret = funcList->C_EncryptInit(session, &mech, key);
+        CHECK_CKR(ret, "AES-CBC-PAD Encrypt Init for size query");
+        if (ret == CKR_OK) {
+            encSz = 0;
+            ret = funcList->C_Encrypt(session, plain, plainSz, NULL, &encSz);
+            CHECK_CKR(ret, "AES-CBC-PAD Encrypt size query");
+        }
+        if (ret == CKR_OK && encSz != expectedEncSz) {
+            ret = -1;
+            CHECK_CKR(ret, "AES-CBC-PAD size query must be plainSz+16");
+        }
+
+        /* Actual encrypt-then-decrypt roundtrip */
+        if (ret == CKR_OK) {
+            encSz = sizeof(enc);
+            ret = funcList->C_Encrypt(session, plain, plainSz, enc, &encSz);
+            CHECK_CKR(ret, "AES-CBC-PAD Encrypt");
+        }
+        if (ret == CKR_OK && encSz != expectedEncSz) {
+            ret = -1;
+            CHECK_CKR(ret, "AES-CBC-PAD encrypt output size must be plainSz+16");
+        }
+        if (ret == CKR_OK) {
+            ret = funcList->C_DecryptInit(session, &mech, key);
+            CHECK_CKR(ret, "AES-CBC-PAD Decrypt Init");
+        }
+        if (ret == CKR_OK) {
+            decSz = sizeof(dec);
+            ret = funcList->C_Decrypt(session, enc, encSz, dec, &decSz);
+            CHECK_CKR(ret, "AES-CBC-PAD Decrypt");
+        }
+        if (ret == CKR_OK && decSz != plainSz) {
+            ret = -1;
+            CHECK_CKR(ret, "AES-CBC-PAD roundtrip size mismatch");
+        }
+        if (ret == CKR_OK && plainSz > 0 &&
+                                      XMEMCMP(plain, dec, plainSz) != 0) {
+            ret = -1;
+            CHECK_CKR(ret, "AES-CBC-PAD roundtrip data mismatch");
+        }
+    }
+
+    funcList->C_DestroyObject(session, key);
+
+    return ret;
+}
+
 static CK_RV test_aes_cbc_pad_encdec(CK_SESSION_HANDLE session,
                                      unsigned char* exp, CK_OBJECT_HANDLE key)
 {
@@ -10053,7 +11178,7 @@ static CK_RV test_aes_cbc_pad_encdec(CK_SESSION_HANDLE session,
         ret = funcList->C_Encrypt(session, plain, plainSz, NULL, &encSz);
         CHECK_CKR(ret, "AES-CBC Pad Encrypt no enc");
     }
-    if (ret == CKR_OK && encSz != plainSz) {
+    if (ret == CKR_OK && encSz != plainSz + 16) {
         ret = -1;
         CHECK_CKR(ret, "AES-CBC Pad Encrypt encrypted length");
     }
@@ -10082,7 +11207,7 @@ static CK_RV test_aes_cbc_pad_encdec(CK_SESSION_HANDLE session,
         ret = funcList->C_Decrypt(session, enc, encSz, NULL, &decSz);
         CHECK_CKR(ret, "AES-CBC Pad Decrypt");
     }
-    if (ret == CKR_OK && decSz != encSz-1) {
+    if (ret == CKR_OK && decSz != encSz - 1) {
         ret = -1;
         CHECK_CKR(ret, "AES-CBC Pad Decrypt decrypted length");
     }
@@ -11289,6 +12414,10 @@ static CK_RV test_aes_gcm_fail(void* args)
                                             "AES-GCM Encrypt Final wrong init");
     }
 
+    /* Clean up active decrypt operation from cross-type testing */
+    decSz = sizeof(dec);
+    (void)funcList->C_Decrypt(session, enc, encSz, dec, &decSz);
+
     return ret;
 }
 
@@ -11990,6 +13119,10 @@ static CK_RV test_aes_cmac_update(CK_SESSION_HANDLE session, unsigned char* exp,
                                           "AES-CMAC Sign Final out size too small");
         outSz = sizeof(out);
     }
+    if (ret == CKR_OK) {
+        ret = funcList->C_SignFinal(session, out, &outSz);
+        CHECK_CKR(ret, "AES-CMAC Sign Final cleanup");
+    }
 
     return ret;
 }
@@ -12161,6 +13294,10 @@ static CK_RV test_aes_cmac_general_update(CK_SESSION_HANDLE session,
         CHECK_CKR_FAIL(ret, CKR_BUFFER_TOO_SMALL,
                                           "AES-CMAC Sign Final out size too small");
         outSz = sizeof(out);
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_SignFinal(session, out, &outSz);
+        CHECK_CKR(ret, "AES-CMAC Sign Final cleanup");
     }
 
     return ret;
@@ -12509,6 +13646,10 @@ static CK_RV test_hmac_update(CK_SESSION_HANDLE session, int mechanism,
                                           "HMAC Sign Final out size too small");
         outSz = sizeof(out);
     }
+    if (ret == CKR_OK) {
+        ret = funcList->C_SignFinal(session, out, &outSz);
+        CHECK_CKR(ret, "HMAC Sign Final cleanup");
+    }
 
     return ret;
 }
@@ -12597,6 +13738,9 @@ static CK_RV test_hmac_fail(CK_SESSION_HANDLE session, CK_MECHANISM* mech,
         CHECK_CKR_FAIL(ret, CKR_OPERATION_NOT_INITIALIZED,
                                                   "HMAC Sign Final wrong init");
     }
+
+    /* Clean up active verify operation from cross-type testing */
+    (void)funcList->C_Verify(session, data, dataSz, out, outSz);
 
     return ret;
 }
@@ -12780,6 +13924,78 @@ static CK_RV test_hmac_sha256_fail(void* args)
     mech.pParameter     = NULL;
 
     ret = test_hmac_fail(session, &mech, keyData, sizeof(keyData));
+
+    return ret;
+}
+
+static CK_RV test_hmac_sha256_truncated_sig(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_RV ret;
+    CK_OBJECT_HANDLE key;
+    byte data[32], sig[32];
+    CK_ULONG dataSz = sizeof(data), sigSz = sizeof(sig);
+    CK_MECHANISM mech;
+    static unsigned char keyData[] = {
+        0x74, 0x9A, 0xBD, 0xAA, 0x2A, 0x52, 0x07, 0x47,
+        0xD6, 0xA6, 0x36, 0xB2, 0x07, 0x32, 0x8E, 0xD0,
+        0xBA, 0x69, 0x7B, 0xC6, 0xC3, 0x44, 0x9E, 0xD4,
+        0x81, 0x48, 0xFD, 0x2D, 0x68, 0xA2, 0x8B, 0x67,
+    };
+
+    memset(data, 9, sizeof(data));
+    mech.mechanism      = CKM_SHA256_HMAC;
+    mech.ulParameterLen = 0;
+    mech.pParameter     = NULL;
+
+    ret = get_generic_key(session, keyData, sizeof(keyData), CK_FALSE, &key);
+
+    /* Sign to get a valid signature */
+    if (ret == CKR_OK) {
+        ret = funcList->C_SignInit(session, &mech, key);
+        CHECK_CKR(ret, "HMAC Sign Init for truncation test");
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_Sign(session, data, dataSz, sig, &sigSz);
+        CHECK_CKR(ret, "HMAC Sign for truncation test");
+    }
+
+    /* Verify with truncated signature (1 byte) — must fail */
+    if (ret == CKR_OK) {
+        ret = funcList->C_VerifyInit(session, &mech, key);
+        CHECK_CKR(ret, "HMAC Verify Init truncated");
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_Verify(session, data, dataSz, sig, 1);
+        CHECK_CKR_FAIL(ret, CKR_SIGNATURE_INVALID,
+                        "Verify with 1-byte truncated HMAC should fail");
+    }
+
+    /* Verify with truncated signature (sigSz - 1) — must fail */
+    if (ret == CKR_OK) {
+        ret = funcList->C_VerifyInit(session, &mech, key);
+        CHECK_CKR(ret, "HMAC Verify Init truncated-1");
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_Verify(session, data, dataSz, sig, sigSz - 1);
+        CHECK_CKR_FAIL(ret, CKR_SIGNATURE_INVALID,
+                        "Verify with sigSz-1 truncated HMAC should fail");
+    }
+
+    /* Verify multi-part with truncated signature */
+    if (ret == CKR_OK) {
+        ret = funcList->C_VerifyInit(session, &mech, key);
+        CHECK_CKR(ret, "HMAC Verify Init for multi-part truncated");
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_VerifyUpdate(session, data, dataSz);
+        CHECK_CKR(ret, "HMAC Verify Update for truncated");
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_VerifyFinal(session, sig, 1);
+        CHECK_CKR_FAIL(ret, CKR_SIGNATURE_INVALID,
+                        "VerifyFinal with 1-byte truncated HMAC should fail");
+    }
 
     return ret;
 }
@@ -13857,15 +15073,17 @@ static CK_RV test_hkdf_derive_extract_then_expand_salt_data(void* args)
 
     CK_MECHANISM mechanism = { CKM_HKDF_DERIVE, &params, sizeof(params) };
 
-    /* Template for the derived key (PRK) */
-    CK_ATTRIBUTE template[] = {
+    /* Template for the derived key (PRK). CKA_DERIVE=CK_TRUE so the PRK can
+     * itself serve as the base key for the subsequent Expand call. */
+    CK_ATTRIBUTE tmpl[] = {
         {CKA_CLASS, &secretKeyClass, sizeof(secretKeyClass)},
         {CKA_KEY_TYPE, &genericKeyType, sizeof(genericKeyType)},
         {CKA_SENSITIVE, &ckFalse, sizeof(ckFalse)},
         {CKA_EXTRACTABLE, &ckTrue, sizeof(ckTrue)},
+        {CKA_DERIVE, &ckTrue, sizeof(ckTrue)},
         {CKA_VALUE_LEN, &derived_len, sizeof(derived_len)}
     };
-    CK_ULONG template_count = sizeof(template) / sizeof(template[0]);
+    CK_ULONG template_count = sizeof(tmpl) / sizeof(tmpl[0]);
 
     CK_ATTRIBUTE templateExpand[] = {
         {CKA_CLASS, &secretKeyClass, sizeof(secretKeyClass)},
@@ -13911,7 +15129,7 @@ static CK_RV test_hkdf_derive_extract_then_expand_salt_data(void* args)
     CHECK_CKR(ret, "Create object failed");
 
     if (ret == CKR_OK) {
-        ret = funcList->C_DeriveKey(session, &mechanism, hBaseKey1, template,
+        ret = funcList->C_DeriveKey(session, &mechanism, hBaseKey1, tmpl,
             template_count, &hDerivedKey);
         CHECK_CKR(ret, "C_DeriveKey failed");
     }
@@ -14047,14 +15265,14 @@ static CK_RV test_hkdf_derive_extract_with_expand_salt_data(void* args)
     CK_MECHANISM mechanism = { CKM_HKDF_DERIVE, &params, sizeof(params) };
 
     // Template for the derived key (OKM)
-    CK_ATTRIBUTE template[] = {
+    CK_ATTRIBUTE tmpl[] = {
         {CKA_CLASS, &secretKeyClass, sizeof(secretKeyClass)},
         {CKA_KEY_TYPE, &genericKeyType, sizeof(genericKeyType)},
         {CKA_SENSITIVE, &ckFalse, sizeof(ckFalse)},
         {CKA_EXTRACTABLE, &ckTrue, sizeof(ckTrue)},
         {CKA_VALUE_LEN, &derived_len, sizeof(derived_len)} // Expecting 42 bytes OKM
     };
-    CK_ULONG template_count = sizeof(template) / sizeof(template[0]);
+    CK_ULONG template_count = sizeof(tmpl) / sizeof(tmpl[0]);
 
     CK_ATTRIBUTE templateSecret[] = {
         {CKA_CLASS, &secretKeyClass, sizeof(secretKeyClass)},
@@ -14078,7 +15296,7 @@ static CK_RV test_hkdf_derive_extract_with_expand_salt_data(void* args)
     CHECK_CKR(ret, "Create object failed");
 
     if (ret == CKR_OK) {
-        ret = funcList->C_DeriveKey(session, &mechanism, hBaseKey1, template,
+        ret = funcList->C_DeriveKey(session, &mechanism, hBaseKey1, tmpl,
             template_count, &hDerivedKey);
         CHECK_CKR(ret, "Derive key");
     }
@@ -14162,14 +15380,14 @@ static CK_RV test_hkdf_derive_expand_with_extract_null_salt(void* args)
 
     CK_MECHANISM mechanism = { CKM_HKDF_DERIVE, &params, sizeof(params) };
 
-    CK_ATTRIBUTE template[] = {
+    CK_ATTRIBUTE tmpl[] = {
         {CKA_CLASS, &secretKeyClass, sizeof(secretKeyClass)},
         {CKA_KEY_TYPE, &genericKeyType, sizeof(genericKeyType)},
         {CKA_SENSITIVE, &ckFalse, sizeof(ckFalse)},
         {CKA_EXTRACTABLE, &ckTrue, sizeof(ckTrue)},
         {CKA_VALUE_LEN, &derived_len, sizeof(derived_len)}
     };
-    CK_ULONG template_count = sizeof(template) / sizeof(template[0]);
+    CK_ULONG template_count = sizeof(tmpl) / sizeof(tmpl[0]);
 
     CK_ATTRIBUTE templateSecret[] = {
         {CKA_CLASS, &secretKeyClass, sizeof(secretKeyClass)},
@@ -14192,7 +15410,7 @@ static CK_RV test_hkdf_derive_expand_with_extract_null_salt(void* args)
     CHECK_CKR(ret, "Create object failed");
 
     if (ret == CKR_OK) {
-        ret= funcList->C_DeriveKey(session, &mechanism, hBaseKey1, template,
+        ret= funcList->C_DeriveKey(session, &mechanism, hBaseKey1, tmpl,
             template_count, &hDerivedKey);
         CHECK_CKR(ret, "Derive key");
     }
@@ -14273,14 +15491,14 @@ static CK_RV test_hkdf_derive_extract_with_expand_salt_key(void* args)
     CK_ULONG derived_len = sizeof(derived_value);
 
     // Template for the derived key (OKM)
-    CK_ATTRIBUTE template[] = {
+    CK_ATTRIBUTE tmpl[] = {
         {CKA_CLASS, &secretKeyClass, sizeof(secretKeyClass)},
         {CKA_KEY_TYPE, &genericKeyType, sizeof(genericKeyType)},
         {CKA_SENSITIVE, &ckFalse, sizeof(ckFalse)},
         {CKA_EXTRACTABLE, &ckTrue, sizeof(ckTrue)},
         {CKA_VALUE_LEN, &derived_len, sizeof(derived_len)} // Expecting 42 bytes OKM
     };
-    CK_ULONG template_count = sizeof(template) / sizeof(template[0]);
+    CK_ULONG template_count = sizeof(tmpl) / sizeof(tmpl[0]);
 
     CK_ATTRIBUTE templateSecret[] = {
         {CKA_CLASS, &secretKeyClass, sizeof(secretKeyClass)},
@@ -14337,7 +15555,7 @@ static CK_RV test_hkdf_derive_extract_with_expand_salt_key(void* args)
         };
 
         CK_MECHANISM mechanism = { CKM_HKDF_DERIVE, &params, sizeof(params) };
-        ret = funcList->C_DeriveKey(session, &mechanism, hBaseKey1, template,
+        ret = funcList->C_DeriveKey(session, &mechanism, hBaseKey1, tmpl,
             template_count, &hDerivedKey);
         CHECK_CKR(ret, "Derive key");
     }
@@ -14418,6 +15636,118 @@ static CK_RV test_hkdf_gen_key(void* args)
                                            "Generate Key bad parameter length");
         mech.ulParameterLen = 0;
     }
+
+    return ret;
+}
+
+/* Regression test: HKDF expand with NULL pValue in CKA_VALUE_LEN
+ * previously crashed (Issue #1315: lenAttr->pValue was dereferenced
+ * without NULL check).
+ */
+static CK_RV test_hkdf_derive_expand_null_value_len(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_RV ret;
+    CK_OBJECT_HANDLE hBaseKey = CK_INVALID_HANDLE;
+    CK_OBJECT_HANDLE hPrk = CK_INVALID_HANDLE;
+    CK_OBJECT_HANDLE hExpandKey = CK_INVALID_HANDLE;
+
+    CK_BYTE ikm[] = {
+        0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b,
+        0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b,
+        0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b
+    };
+    CK_ULONG ikm_len = sizeof(ikm);
+    CK_BYTE salt[] = {
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+        0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f
+    };
+    CK_BYTE info[] = { 0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7,
+                        0xf8, 0xf9 };
+    CK_ULONG prk_len = 32;
+
+    /* Create IKM as a secret key object */
+    CK_ATTRIBUTE templateSecret[] = {
+        {CKA_CLASS, &secretKeyClass, sizeof(secretKeyClass)},
+        {CKA_KEY_TYPE, &genericKeyType, sizeof(genericKeyType)},
+        {CKA_TOKEN, &ckFalse, sizeof(ckFalse)},
+        {CKA_PRIVATE, &ckTrue, sizeof(ckTrue)},
+        {CKA_SENSITIVE, &ckFalse, sizeof(ckFalse)},
+        {CKA_EXTRACTABLE, &ckTrue, sizeof(ckTrue)},
+        {CKA_VALUE, ikm, ikm_len},
+        {CKA_VALUE_LEN, &ikm_len, sizeof(ikm_len)},
+        {CKA_DERIVE, &ckTrue, sizeof(ckTrue)}
+    };
+    CK_ULONG templateSecretCount =
+        sizeof(templateSecret) / sizeof(templateSecret[0]);
+
+    /* Extract params */
+    CK_HKDF_PARAMS paramsExtract = {
+        CK_TRUE, CK_FALSE, CKM_SHA256_HMAC,
+        CKF_HKDF_SALT_DATA, salt, sizeof(salt),
+        CK_INVALID_HANDLE, NULL_PTR, 0
+    };
+    CK_MECHANISM mechExtract =
+        { CKM_HKDF_DERIVE, &paramsExtract, sizeof(paramsExtract) };
+    CK_ATTRIBUTE templateExtract[] = {
+        {CKA_CLASS, &secretKeyClass, sizeof(secretKeyClass)},
+        {CKA_KEY_TYPE, &genericKeyType, sizeof(genericKeyType)},
+        {CKA_SENSITIVE, &ckFalse, sizeof(ckFalse)},
+        {CKA_EXTRACTABLE, &ckTrue, sizeof(ckTrue)},
+        {CKA_DERIVE, &ckTrue, sizeof(ckTrue)},
+        {CKA_VALUE_LEN, &prk_len, sizeof(prk_len)}
+    };
+    CK_ULONG templateExtractCount =
+        sizeof(templateExtract) / sizeof(templateExtract[0]);
+
+    /* Expand params - expand only */
+    CK_HKDF_PARAMS paramsExpand = {
+        CK_FALSE, CK_TRUE, CKM_SHA256_HMAC,
+        CKF_HKDF_SALT_NULL, NULL_PTR, 0,
+        CK_INVALID_HANDLE, info, sizeof(info)
+    };
+    CK_MECHANISM mechExpand =
+        { CKM_HKDF_DERIVE, &paramsExpand, sizeof(paramsExpand) };
+
+    /* Expand template with NULL pValue for CKA_VALUE_LEN.
+     * This exercises the NULL CKA_VALUE_LEN pValue check in HKDF expand.
+     */
+    CK_ATTRIBUTE templateExpand[] = {
+        {CKA_CLASS, &secretKeyClass, sizeof(secretKeyClass)},
+        {CKA_KEY_TYPE, &genericKeyType, sizeof(genericKeyType)},
+        {CKA_SENSITIVE, &ckFalse, sizeof(ckFalse)},
+        {CKA_EXTRACTABLE, &ckTrue, sizeof(ckTrue)},
+        {CKA_VALUE_LEN, NULL_PTR, 0}
+    };
+    CK_ULONG templateExpandCount =
+        sizeof(templateExpand) / sizeof(templateExpand[0]);
+
+    /* Step 1: Create base key */
+    ret = funcList->C_CreateObject(session, templateSecret,
+        templateSecretCount, &hBaseKey);
+    CHECK_CKR(ret, "Create IKM object");
+
+    /* Step 2: Extract to get PRK */
+    if (ret == CKR_OK) {
+        ret = funcList->C_DeriveKey(session, &mechExtract, hBaseKey,
+            templateExtract, templateExtractCount, &hPrk);
+        CHECK_CKR(ret, "HKDF extract");
+    }
+
+    /* Step 3: Expand with NULL CKA_VALUE_LEN pValue - previously crashed */
+    if (ret == CKR_OK) {
+        ret = funcList->C_DeriveKey(session, &mechExpand, hPrk,
+            templateExpand, templateExpandCount, &hExpandKey);
+        /* Before the fix, this line is never reached (NULL deref crash).
+         * After the fix, expect an error return. */
+        CHECK_CKR_FAIL(ret, CKR_ATTRIBUTE_VALUE_INVALID,
+            "HKDF expand with NULL CKA_VALUE_LEN pValue");
+    }
+
+    if (hBaseKey != CK_INVALID_HANDLE)
+        funcList->C_DestroyObject(session, hBaseKey);
+    if (hPrk != CK_INVALID_HANDLE)
+        funcList->C_DestroyObject(session, hPrk);
 
     return ret;
 }
@@ -14683,6 +16013,13 @@ static CK_RV test_random(void* args)
         CHECK_CKR_FAIL(ret, CKR_ARGUMENTS_BAD, "Seed Random no seed");
     }
     if (ret == CKR_OK) {
+        /* A seed length that cannot fit in the int taken by the lower layer
+         * must be rejected, not silently truncated to a small value. INT_MAX
+         * + 1 is the smallest such length on any int width. */
+        ret = funcList->C_SeedRandom(session, seed, ((CK_ULONG)INT_MAX + 1));
+        CHECK_CKR_FAIL(ret, CKR_ARGUMENTS_BAD, "Seed Random oversized length");
+    }
+    if (ret == CKR_OK) {
         ret = funcList->C_GenerateRandom(CK_INVALID_HANDLE, data1,
                                                                  sizeof(data1));
         CHECK_CKR_FAIL(ret, CKR_SESSION_HANDLE_INVALID,
@@ -14691,6 +16028,32 @@ static CK_RV test_random(void* args)
     if (ret == CKR_OK) {
         ret = funcList->C_GenerateRandom(session, NULL, sizeof(data1));
         CHECK_CKR_FAIL(ret, CKR_ARGUMENTS_BAD, "Generate Random no data");
+    }
+    if (ret == CKR_OK) {
+        /* Regression: a request larger than WOLFPKCS11_RNG_MAX_GEN must fill
+         * the whole buffer, not just the first chunk. Truncating the CK_ULONG
+         * length to int would leave the tail untouched while still returning
+         * CKR_OK. Verify the tail past the first chunk is written. */
+        CK_ULONG bigLen = (1024 * 1024) + 4096;
+        unsigned char* big = (unsigned char*)XMALLOC(bigLen, NULL,
+                                                     DYNAMIC_TYPE_TMP_BUFFER);
+        if (big == NULL) {
+            ret = CKR_HOST_MEMORY;
+            CHECK_CKR(ret, "Allocate large random buffer");
+        }
+        if (ret == CKR_OK) {
+            XMEMSET(big, 0xAA, bigLen);
+            ret = funcList->C_GenerateRandom(session, big, bigLen);
+            CHECK_CKR(ret, "Generate Random large");
+        }
+        if (ret == CKR_OK) {
+            b = 0;
+            for (i = 0; i < 32; i++)
+                b |= (unsigned char)(big[bigLen - 32 + i] ^ 0xAA);
+            CHECK_COND(b != 0, ret, "Large generate filled tail of buffer");
+        }
+        if (big != NULL)
+            XFREE(big, NULL, DYNAMIC_TYPE_TMP_BUFFER);
     }
 
     return ret;
@@ -14962,7 +16325,9 @@ static CK_RV test_derive_tls12_master_key_dh(void* args) {
         {CKA_KEY_TYPE, &keyType, sizeof(keyType)},
         {CKA_VALUE, preMasterSecret, ulPreMasterSecretLen},
         {CKA_SENSITIVE, &falseValue, sizeof(falseValue)},
-        {CKA_EXTRACTABLE, &falseValue, sizeof(falseValue)},
+        /* Extractable base so the derived master secret can be read for
+         * comparison (F-4533 makes the derived key inherit base protection). */
+        {CKA_EXTRACTABLE, &trueValue, sizeof(trueValue)},
         {CKA_DERIVE, &trueValue, sizeof(trueValue)},
         {CKA_TOKEN, &falseValue, sizeof(falseValue)}
     };
@@ -15088,7 +16453,9 @@ static CK_RV test_derive_tls12_master_key(void* args) {
         {CKA_KEY_TYPE, &keyType, sizeof(keyType)},
         {CKA_VALUE, preMasterSecret, ulPreMasterSecretLen},
         {CKA_SENSITIVE, &falseValue, sizeof(falseValue)},
-        {CKA_EXTRACTABLE, &falseValue, sizeof(falseValue)},
+        /* Extractable base so the derived master secret can be read for
+         * comparison (F-4533 makes the derived key inherit base protection). */
+        {CKA_EXTRACTABLE, &trueValue, sizeof(trueValue)},
         {CKA_DERIVE, &trueValue, sizeof(trueValue)},
         {CKA_TOKEN, &falseValue, sizeof(falseValue)}
     };
@@ -15412,7 +16779,9 @@ static CK_RV test_nss_derive_tls12_master_key(void* args) {
         {CKA_KEY_TYPE, &keyType, sizeof(keyType)},
         {CKA_VALUE, preMasterSecret, ulPreMasterSecretLen},
         {CKA_SENSITIVE, &falseValue, sizeof(falseValue)},
-        {CKA_EXTRACTABLE, &falseValue, sizeof(falseValue)},
+        /* Extractable base so the derived master secret can be read for
+         * comparison (F-4533 makes the derived key inherit base protection). */
+        {CKA_EXTRACTABLE, &trueValue, sizeof(trueValue)},
         {CKA_DERIVE, &trueValue, sizeof(trueValue)},
         {CKA_TOKEN, &falseValue, sizeof(falseValue)}
     };
@@ -15689,6 +17058,16 @@ static CK_RV test_private_object_access(void* args)
     };
     CK_ULONG findTmplCnt = sizeof(findTmpl) / sizeof(*findTmpl);
     CK_OBJECT_HANDLE found;
+#ifndef WOLFPKCS11_NSS
+    CK_OBJECT_HANDLE soObj = CK_INVALID_HANDLE;
+#else
+    CK_OBJECT_HANDLE nssObj = CK_INVALID_HANDLE;
+    CK_BBOOL nssSession = CK_FALSE;
+#endif
+    CK_ULONG valueLen = 0;
+    CK_ATTRIBUTE getTmpl = {
+        CKA_VALUE_LEN, &valueLen, sizeof(valueLen)
+    };
     CK_ULONG count;
 
     /* Create a private object while logged in (test setup logs us in) */
@@ -15719,8 +17098,79 @@ static CK_RV test_private_object_access(void* args)
         }
     }
 
+#ifndef WOLFPKCS11_NSS
     if (ret == CKR_OK) {
-        /* Login as user */
+        ret = funcList->C_Login(session, CKU_SO, soPin, soPinLen);
+        CHECK_CKR(ret, "Login SO for private object test");
+    }
+
+    if (ret == CKR_OK) {
+        ret = funcList->C_FindObjectsInit(session, findTmpl, findTmplCnt);
+        CHECK_CKR(ret, "Find Objects Init - SO logged in");
+        if (ret == CKR_OK) {
+            ret = funcList->C_FindObjects(session, &found, 1, &count);
+            CHECK_CKR(ret, "Find Objects - SO logged in");
+        }
+        if (ret == CKR_OK && count != 0) {
+            ret = -1;
+            CHECK_CKR(ret, "SO must not discover private objects");
+        }
+        if (ret == CKR_OK) {
+            ret = funcList->C_FindObjectsFinal(session);
+            CHECK_CKR(ret, "Find Objects Final - SO logged in");
+        }
+    }
+
+    if (ret == CKR_OK) {
+        ret = funcList->C_GetAttributeValue(session, obj, &getTmpl, 1);
+        CHECK_CKR_FAIL(ret, CKR_OBJECT_HANDLE_INVALID,
+                       "SO must not resolve private object handles");
+    }
+
+    if (ret == CKR_OK) {
+        ret = funcList->C_CreateObject(session, tmpl, tmplCnt, &soObj);
+        CHECK_CKR_FAIL(ret, CKR_USER_NOT_LOGGED_IN,
+                       "SO must not create private objects");
+    }
+
+    if (ret == CKR_OK) {
+        ret = funcList->C_Logout(session);
+        CHECK_CKR(ret, "Logout SO for private object test");
+    }
+#else
+    /* NSS is an internal crypto module with an established SO-session
+     * exception to the standard private-object rules. Keep that compatibility
+     * behavior while F-8650 tightens only the default PKCS#11 build. */
+    if (ret == CKR_OK) {
+        ret = funcList->C_Login(session, CKU_SO, soPin, soPinLen);
+        CHECK_CKR(ret, "Login SO for NSS private object test");
+    }
+
+    if (ret == CKR_OK) {
+        tmpl[4].pValue = &nssSession;
+        ret = funcList->C_CreateObject(session, tmpl, tmplCnt, &nssObj);
+        CHECK_CKR(ret, "NSS SO creates private session object");
+    }
+
+    if (ret == CKR_OK) {
+        ret = funcList->C_GetAttributeValue(session, nssObj, &getTmpl, 1);
+        CHECK_CKR(ret, "NSS SO resolves private session object");
+    }
+
+    if (nssObj != CK_INVALID_HANDLE) {
+        funcList->C_DestroyObject(session, nssObj);
+        nssObj = CK_INVALID_HANDLE;
+    }
+    tmpl[4].pValue = &ckTrue;
+
+    if (ret == CKR_OK) {
+        ret = funcList->C_Logout(session);
+        CHECK_CKR(ret, "Logout SO for NSS private object test");
+    }
+#endif
+
+    if (ret == CKR_OK) {
+        /* Login as user. */
         ret = funcList->C_Login(session, CKU_USER, userPin, userPinLen);
         CHECK_CKR(ret, "Login for private object test");
     }
@@ -15754,6 +17204,1015 @@ static CK_RV test_private_object_access(void* args)
     return ret;
 }
 
+#ifndef WOLFPKCS11_NSS
+static CK_RV test_private_object_handle_access(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_RV ret;
+    CK_OBJECT_HANDLE obj = CK_INVALID_HANDLE;
+    static byte keyData[] = { 0x01, 0x02, 0x03, 0x04 };
+    CK_BBOOL isPrivate = CK_TRUE;
+    CK_ATTRIBUTE tmpl[] = {
+        { CKA_CLASS,             &secretKeyClass,   sizeof(secretKeyClass)    },
+        { CKA_KEY_TYPE,          &genericKeyType,   sizeof(genericKeyType)    },
+        { CKA_VALUE,             keyData,           sizeof(keyData)           },
+        { CKA_PRIVATE,           &isPrivate,        sizeof(isPrivate)         },
+        { CKA_TOKEN,             &ckTrue,           sizeof(ckTrue)            },
+    };
+    CK_ULONG tmplCnt = sizeof(tmpl) / sizeof(*tmpl);
+    CK_ULONG valueLen = 0;
+    CK_ATTRIBUTE getValueTmpl = { CKA_VALUE_LEN, &valueLen, sizeof(valueLen) };
+    byte iv[16];
+    CK_MECHANISM mech;
+
+    memset(iv, 9, sizeof(iv));
+    mech.mechanism      = CKM_SHA256_HMAC;
+    mech.ulParameterLen = 0;
+    mech.pParameter     = NULL;
+
+    /* Create a private token object while logged in */
+    ret = funcList->C_CreateObject(session, tmpl, tmplCnt, &obj);
+    CHECK_CKR(ret, "Create Private Object for handle test");
+
+    if (ret == CKR_OK) {
+        ret = funcList->C_Logout(session);
+        CHECK_CKR(ret, "Logout for handle test");
+    }
+
+    /* Try direct handle access via C_GetAttributeValue — should fail */
+    if (ret == CKR_OK) {
+        ret = funcList->C_GetAttributeValue(session, obj, &getValueTmpl, 1);
+        CHECK_CKR_FAIL(ret, CKR_OBJECT_HANDLE_INVALID,
+                        "GetAttributeValue on private obj when not logged in");
+    }
+
+    /* Try direct handle access via C_SignInit — should fail */
+    if (ret == CKR_OK) {
+        ret = funcList->C_SignInit(session, &mech, obj);
+        CHECK_CKR_FAIL(ret, CKR_OBJECT_HANDLE_INVALID,
+                        "SignInit on private obj when not logged in");
+    }
+
+    /* Re-login and clean up */
+    if (ret == CKR_OK) {
+        ret = funcList->C_Login(session, CKU_USER, userPin, userPinLen);
+        CHECK_CKR(ret, "Re-login after handle test");
+    }
+
+    if (obj != CK_INVALID_HANDLE) {
+        funcList->C_DestroyObject(session, obj);
+    }
+
+    return ret;
+}
+#endif /* !WOLFPKCS11_NSS */
+
+/* C_GetAttributeValue must process all attributes in the template even when one
+ * returns an error, setting ulValueLen to (CK_ULONG)-1 for invalid types and
+ * returning the accumulated error. */
+static CK_RV test_get_attr_value_all_processed(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_RV ret;
+    CK_OBJECT_HANDLE obj;
+    static byte keyData[] = { 0x00 };
+    CK_ATTRIBUTE tmpl[] = {
+        { CKA_CLASS,             &secretKeyClass,   sizeof(secretKeyClass)    },
+        { CKA_KEY_TYPE,          &genericKeyType,   sizeof(genericKeyType)    },
+        { CKA_VALUE,             keyData,           sizeof(keyData)           },
+    };
+    CK_ULONG tmplCnt = sizeof(tmpl) / sizeof(*tmpl);
+    CK_ATTRIBUTE getTmpl[3];
+
+    ret = funcList->C_CreateObject(session, tmpl, tmplCnt, &obj);
+    CHECK_CKR(ret, "Create Object for get attr test");
+
+    if (ret == CKR_OK) {
+        /* Query: valid attr, invalid attr (0xFFFFFFFF), valid attr.
+         * Per PKCS#11 spec, all attrs should be processed. */
+        getTmpl[0].type = CKA_CLASS;
+        getTmpl[0].pValue = NULL;
+        getTmpl[0].ulValueLen = 0;
+        getTmpl[1].type = 0xFFFFFFFF;
+        getTmpl[1].pValue = NULL;
+        getTmpl[1].ulValueLen = 0;
+        getTmpl[2].type = CKA_KEY_TYPE;
+        getTmpl[2].pValue = NULL;
+        getTmpl[2].ulValueLen = 0;
+
+        ret = funcList->C_GetAttributeValue(session, obj, getTmpl, 3);
+        CHECK_CKR_FAIL(ret, CKR_ATTRIBUTE_TYPE_INVALID,
+                      "Get Attr Value with invalid type in middle");
+    }
+    if (ret == CKR_OK) {
+        /* First attr should have its size set */
+        CHECK_COND(getTmpl[0].ulValueLen == sizeof(CK_OBJECT_CLASS), ret,
+                   "First attr ulValueLen set");
+    }
+    if (ret == CKR_OK) {
+        /* Invalid attr should have ulValueLen set to (CK_ULONG)-1 */
+        CHECK_COND(getTmpl[1].ulValueLen == (CK_ULONG)-1, ret,
+                   "Invalid attr ulValueLen set to -1");
+    }
+    if (ret == CKR_OK) {
+        /* Third attr must also be processed (not skipped by early return) */
+        CHECK_COND(getTmpl[2].ulValueLen == sizeof(CK_KEY_TYPE), ret,
+                   "Third attr ulValueLen set (not skipped)");
+    }
+
+    return ret;
+}
+
+#ifndef WOLFPKCS11_NSS
+/* Creating, copying, destroying, and setting attributes on session objects
+ * should be allowed in read-only sessions per the PKCS#11 spec. Only token
+ * objects require a R/W session. */
+static CK_RV test_create_session_obj_ro_session(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_SESSION_HANDLE sessionRO = CK_INVALID_HANDLE;
+    CK_RV ret;
+
+    static byte keyData[] = { 0x00 };
+    CK_ATTRIBUTE tmpl[] = {
+        { CKA_CLASS,             &secretKeyClass,   sizeof(secretKeyClass)    },
+        { CKA_KEY_TYPE,          &genericKeyType,   sizeof(genericKeyType)    },
+        { CKA_VALUE,             keyData,           sizeof(keyData)           },
+    };
+    CK_ULONG tmplCnt = sizeof(tmpl) / sizeof(*tmpl);
+    CK_ATTRIBUTE tmplOnToken[] = {
+        { CKA_CLASS,             &secretKeyClass,   sizeof(secretKeyClass)    },
+        { CKA_KEY_TYPE,          &genericKeyType,   sizeof(genericKeyType)    },
+        { CKA_VALUE,             keyData,           sizeof(keyData)           },
+        { CKA_TOKEN,             &ckTrue,           sizeof(ckTrue)            },
+    };
+    CK_ULONG tmplOnTokenCnt = sizeof(tmplOnToken) / sizeof(*tmplOnToken);
+    CK_OBJECT_HANDLE obj = CK_INVALID_HANDLE, objOnToken = CK_INVALID_HANDLE;
+    CK_OBJECT_HANDLE copyObj = CK_INVALID_HANDLE, copyBad = CK_INVALID_HANDLE;
+    CK_ATTRIBUTE copyTmpl[] = {
+        { CKA_VALUE,             keyData,           sizeof(keyData)           },
+    };
+    CK_ULONG copyTmplCnt = sizeof(copyTmpl) / sizeof(*copyTmpl);
+    char newLabel[] = "updated";
+    CK_ATTRIBUTE setTmpl[] = {
+        { CKA_LABEL,             newLabel,          sizeof(newLabel)-1        },
+    };
+
+    ret = funcList->C_OpenSession(slot, CKF_SERIAL_SESSION, NULL, NULL,
+                                                                    &sessionRO);
+    CHECK_CKR(ret, "Open RO session");
+
+    /* Create session object in RO session - spec says this is allowed */
+    if (ret == CKR_OK) {
+        ret = funcList->C_CreateObject(sessionRO, tmpl, tmplCnt, &obj);
+        CHECK_CKR(ret, "Create session object in RO session");
+    }
+    /* Create token object in RO session - spec says this must fail */
+    if (ret == CKR_OK) {
+        ret = funcList->C_CreateObject(sessionRO, tmplOnToken, tmplOnTokenCnt,
+                                                                   &objOnToken);
+        CHECK_CKR_FAIL(ret, CKR_SESSION_READ_ONLY,
+                                    "Create token object in RO session blocked");
+    }
+    /* SetAttributeValue on session object from RO session */
+    if (ret == CKR_OK) {
+        ret = funcList->C_SetAttributeValue(sessionRO, obj, setTmpl, 1);
+        CHECK_CKR(ret, "SetAttributeValue session obj in RO session");
+    }
+    /* CopyObject session object in RO session */
+    if (ret == CKR_OK) {
+        ret = funcList->C_CopyObject(sessionRO, obj, copyTmpl, copyTmplCnt,
+                                                                      &copyObj);
+        CHECK_CKR(ret, "Copy session object in RO session");
+    }
+    /* CopyObject token object from RO session - must fail even with empty
+     * template, because copy inherits source's CKA_TOKEN. */
+    if (ret == CKR_OK) {
+        /* Create a token object via the RW session */
+        ret = funcList->C_CreateObject(session, tmplOnToken, tmplOnTokenCnt,
+                                                                   &objOnToken);
+        CHECK_CKR(ret, "Create token object via RW session");
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_CopyObject(sessionRO, objOnToken, copyTmpl,
+                                                          copyTmplCnt, &copyBad);
+        CHECK_CKR_FAIL(ret, CKR_SESSION_READ_ONLY,
+                                    "Copy token object in RO session blocked");
+    }
+    /* DestroyObject session object from RO session */
+    if (ret == CKR_OK) {
+        ret = funcList->C_DestroyObject(sessionRO, obj);
+        CHECK_CKR(ret, "Destroy session object in RO session");
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_DestroyObject(sessionRO, copyObj);
+        CHECK_CKR(ret, "Destroy copied session object in RO session");
+    }
+
+    if (sessionRO != CK_INVALID_HANDLE)
+        funcList->C_CloseSession(sessionRO);
+    if (objOnToken != CK_INVALID_HANDLE)
+        funcList->C_DestroyObject(session, objOnToken);
+
+    return ret;
+}
+#endif /* !WOLFPKCS11_NSS */
+
+#if defined(HAVE_AES_KEYWRAP) && !defined(WOLFPKCS11_NO_STORE) && \
+    !defined(WOLFPKCS11_NSS)
+/* C_WrapKey should not require a R/W session since it creates no new object.
+ * C_UnwrapKey should allow creating session objects in R/O sessions. */
+static CK_RV test_wrap_key_ro_session(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_SESSION_HANDLE sessionRO = CK_INVALID_HANDLE;
+    CK_RV ret;
+    CK_MECHANISM mech = { CKM_AES_KEY_WRAP, NULL, 0 };
+    CK_OBJECT_HANDLE wrappingKey = CK_INVALID_HANDLE;
+    CK_OBJECT_HANDLE key = CK_INVALID_HANDLE;
+    CK_OBJECT_HANDLE unwrappedKey = CK_INVALID_HANDLE;
+    byte wrappedKey[40], keyData[32];
+    CK_ULONG wrappedKeyLen;
+    unsigned char keyId[] = { 0xBB };
+    CK_ATTRIBUTE keyTmpl[] = {
+        { CKA_CLASS,             &secretKeyClass,   sizeof(secretKeyClass)    },
+        { CKA_KEY_TYPE,          &genericKeyType,   sizeof(genericKeyType)    },
+        { CKA_EXTRACTABLE,       &ckTrue,           sizeof(ckTrue)            },
+        { CKA_SIGN,              &ckTrue,           sizeof(ckTrue)            },
+        { CKA_VERIFY,            &ckTrue,           sizeof(ckTrue)            },
+        { CKA_VALUE,             keyData,           sizeof(keyData)           },
+        { CKA_TOKEN,             &ckTrue,           sizeof(ckTrue)            },
+        { CKA_ID,                keyId,             sizeof(keyId)             },
+    };
+    CK_ULONG keyTmplCnt = sizeof(keyTmpl) / sizeof(*keyTmpl);
+    CK_ATTRIBUTE unwrapTmpl[] = {
+        { CKA_CLASS,             &secretKeyClass,   sizeof(secretKeyClass)    },
+        { CKA_KEY_TYPE,          &aesKeyType,       sizeof(aesKeyType)        },
+    };
+    CK_ULONG unwrapTmplCnt = sizeof(unwrapTmpl) / sizeof(*unwrapTmpl);
+
+    memset(keyData, 7, sizeof(keyData));
+    wrappedKeyLen = sizeof(wrappedKey);
+
+    /* Use token-based keys so they're visible from the RO session */
+    {
+        unsigned char wrapId[] = { 0xAA };
+        ret = get_aes_128_key(session, wrapId, sizeof(wrapId), &wrappingKey);
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_CreateObject(session, keyTmpl, keyTmplCnt, &key);
+        CHECK_CKR(ret, "Create token key for wrap");
+    }
+
+    /* Open RO session */
+    if (ret == CKR_OK) {
+        ret = funcList->C_OpenSession(slot, CKF_SERIAL_SESSION, NULL, NULL,
+                                                                    &sessionRO);
+        CHECK_CKR(ret, "Open RO session for wrap");
+    }
+
+    /* Wrap using the RW session first */
+    if (ret == CKR_OK) {
+        ret = funcList->C_WrapKey(session, &mech, wrappingKey, key,
+                                                   wrappedKey, &wrappedKeyLen);
+        CHECK_CKR(ret, "WrapKey in RW session");
+    }
+
+    /* C_WrapKey from RO session should succeed (token keys visible) */
+    if (ret == CKR_OK) {
+        wrappedKeyLen = sizeof(wrappedKey);
+        ret = funcList->C_WrapKey(sessionRO, &mech, wrappingKey, key,
+                                                   wrappedKey, &wrappedKeyLen);
+        CHECK_CKR(ret, "WrapKey in RO session");
+    }
+
+    /* C_UnwrapKey creating session object from RO session should succeed */
+    if (ret == CKR_OK) {
+        ret = funcList->C_UnwrapKey(sessionRO, &mech, wrappingKey,
+                                    wrappedKey, wrappedKeyLen,
+                                    unwrapTmpl, unwrapTmplCnt, &unwrappedKey);
+        CHECK_CKR(ret, "UnwrapKey session object in RO session");
+    }
+
+    if (sessionRO != CK_INVALID_HANDLE)
+        funcList->C_CloseSession(sessionRO);
+    funcList->C_DestroyObject(session, wrappingKey);
+    if (key != CK_INVALID_HANDLE)
+        funcList->C_DestroyObject(session, key);
+    if (unwrappedKey != CK_INVALID_HANDLE)
+        funcList->C_DestroyObject(session, unwrappedKey);
+
+    return ret;
+}
+#endif
+
+#ifndef NO_AES
+#ifdef HAVE_AES_CBC
+/* Verify that C_Encrypt rejects data lengths that exceed word32 range on
+ * platforms where CK_ULONG is 64-bit (LP64). */
+static CK_RV test_encrypt_data_len_range(void* args)
+{
+#if SIZEOF_LONG > 4
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_RV ret;
+    CK_OBJECT_HANDLE key;
+    byte plain[16], enc[32], iv[16];
+    CK_ULONG encSz;
+    CK_MECHANISM mech;
+
+    memset(plain, 9, sizeof(plain));
+    memset(iv, 9, sizeof(iv));
+    encSz = sizeof(enc);
+
+    mech.mechanism      = CKM_AES_CBC;
+    mech.ulParameterLen = sizeof(iv);
+    mech.pParameter     = iv;
+
+    ret = get_aes_128_key(session, NULL, 0, &key);
+    if (ret == CKR_OK) {
+        ret = funcList->C_EncryptInit(session, &mech, key);
+        CHECK_CKR(ret, "AES-CBC Encrypt Init for data len range test");
+    }
+    /* Pass a data length that overflows word32 */
+    if (ret == CKR_OK) {
+        CK_ULONG bigLen = ((CK_ULONG)1 << 32) + 16;
+        ret = funcList->C_Encrypt(session, plain, bigLen, enc, &encSz);
+        CHECK_CKR_FAIL(ret, CKR_DATA_LEN_RANGE,
+                           "AES-CBC Encrypt rejects oversized data length");
+    }
+
+    return ret;
+#else
+    (void)args;
+    return CKR_SKIPPED;
+#endif
+}
+
+/* After an early-return error in C_Encrypt (e.g. CKR_DATA_LEN_RANGE) the
+ * session must be back to "no active operation" so that a fresh
+ * C_EncryptInit succeeds. Before the fix the session stayed in
+ * WP11_OP_ENCRYPT and re-init returned CKR_OPERATION_ACTIVE. */
+static CK_RV test_op_active_after_data_len_range(void* args)
+{
+#if SIZEOF_LONG > 4
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_RV ret;
+    CK_OBJECT_HANDLE key;
+    byte plain[16], enc[32], iv[16];
+    CK_ULONG encSz;
+    CK_MECHANISM mech;
+
+    memset(plain, 9, sizeof(plain));
+    memset(iv, 9, sizeof(iv));
+
+    mech.mechanism      = CKM_AES_CBC;
+    mech.ulParameterLen = sizeof(iv);
+    mech.pParameter     = iv;
+
+    ret = get_aes_128_key(session, NULL, 0, &key);
+    if (ret == CKR_OK) {
+        ret = funcList->C_EncryptInit(session, &mech, key);
+        CHECK_CKR(ret, "Encrypt Init for op-active recovery test");
+    }
+    if (ret == CKR_OK) {
+        CK_ULONG bigLen = ((CK_ULONG)1 << 32) + 16;
+        encSz = sizeof(enc);
+        ret = funcList->C_Encrypt(session, plain, bigLen, enc, &encSz);
+        CHECK_CKR_FAIL(ret, CKR_DATA_LEN_RANGE,
+                       "Encrypt rejects oversized data length");
+    }
+    /* Re-init must succeed: the previous error must have terminated the
+     * active operation. */
+    if (ret == CKR_OK) {
+        ret = funcList->C_EncryptInit(session, &mech, key);
+        CHECK_CKR(ret, "Encrypt Init succeeds after CKR_DATA_LEN_RANGE");
+    }
+    /* Clean up the active operation. */
+    if (ret == CKR_OK) {
+        encSz = sizeof(enc);
+        ret = funcList->C_Encrypt(session, plain, sizeof(plain), enc, &encSz);
+        CHECK_CKR(ret, "Encrypt completes normally after re-init");
+    }
+
+    return ret;
+#else
+    (void)args;
+    return CKR_SKIPPED;
+#endif
+}
+
+/* C_EncryptUpdate / C_DecryptUpdate must terminate the active op when they
+ * return CKR_DATA_LEN_RANGE so the next C_EncryptInit/C_DecryptInit succeeds.
+ * Forces the failure via the CK_ULONG_FITS_WORD32 path on AES-CBC (only
+ * meaningful on 64-bit). */
+static CK_RV test_op_active_after_update_data_len_range(void* args)
+{
+#if SIZEOF_LONG > 4
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_RV ret;
+    CK_OBJECT_HANDLE key;
+    byte plain[16], enc[32], iv[16];
+    CK_ULONG encSz;
+    CK_MECHANISM mech;
+    CK_ULONG bigLen = ((CK_ULONG)1 << 32) + 16;
+
+    memset(plain, 0xA5, sizeof(plain));
+    memset(iv, 0x5A, sizeof(iv));
+
+    mech.mechanism      = CKM_AES_CBC;
+    mech.ulParameterLen = sizeof(iv);
+    mech.pParameter     = iv;
+
+    ret = get_aes_128_key(session, NULL, 0, &key);
+
+    /* EncryptUpdate path */
+    if (ret == CKR_OK) {
+        ret = funcList->C_EncryptInit(session, &mech, key);
+        CHECK_CKR(ret, "EncryptInit for EncryptUpdate recovery test");
+    }
+    if (ret == CKR_OK) {
+        encSz = sizeof(enc);
+        ret = funcList->C_EncryptUpdate(session, plain, bigLen, enc, &encSz);
+        CHECK_CKR_FAIL(ret, CKR_DATA_LEN_RANGE,
+                       "EncryptUpdate rejects oversized part length");
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_EncryptInit(session, &mech, key);
+        CHECK_CKR(ret, "EncryptInit succeeds after EncryptUpdate failure");
+    }
+    if (ret == CKR_OK) {
+        encSz = sizeof(enc);
+        ret = funcList->C_Encrypt(session, plain, sizeof(plain), enc, &encSz);
+        CHECK_CKR(ret, "Encrypt drains the recovered op");
+    }
+
+    /* DecryptUpdate path */
+    if (ret == CKR_OK) {
+        ret = funcList->C_DecryptInit(session, &mech, key);
+        CHECK_CKR(ret, "DecryptInit for DecryptUpdate recovery test");
+    }
+    if (ret == CKR_OK) {
+        encSz = sizeof(enc);
+        ret = funcList->C_DecryptUpdate(session, plain, bigLen, enc, &encSz);
+        CHECK_CKR_FAIL(ret, CKR_DATA_LEN_RANGE,
+                       "DecryptUpdate rejects oversized part length");
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_DecryptInit(session, &mech, key);
+        CHECK_CKR(ret, "DecryptInit succeeds after DecryptUpdate failure");
+    }
+    /* Drain by aborting via a fresh init pair. */
+    if (ret == CKR_OK) {
+        ret = funcList->C_EncryptInit(session, &mech, key);
+        CHECK_CKR(ret, "EncryptInit drains pending decrypt op");
+    }
+    if (ret == CKR_OK) {
+        encSz = sizeof(enc);
+        ret = funcList->C_Encrypt(session, plain, sizeof(plain), enc, &encSz);
+        CHECK_CKR(ret, "Encrypt completes drain");
+    }
+
+    return ret;
+#else
+    (void)args;
+    return CKR_SKIPPED;
+#endif
+}
+#endif /* HAVE_AES_CBC */
+#endif /* !NO_AES */
+
+#ifndef NO_HMAC
+#ifndef NO_SHA256
+/* C_SignUpdate / C_VerifyUpdate must terminate the active op when they hit
+ * the unsupported-mechanism path so a fresh SignInit/VerifyInit succeeds.
+ * Force the failure by initializing the op with an RSA mechanism (which is
+ * single-part only; SignUpdate/VerifyUpdate's switch hits the default
+ * CKR_MECHANISM_INVALID branch). */
+#if !defined(NO_RSA)
+static CK_RV test_op_active_after_sign_verify_update_failure(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_RV ret;
+    CK_OBJECT_HANDLE priv = CK_INVALID_HANDLE;
+    CK_OBJECT_HANDLE pub = CK_INVALID_HANDLE;
+    CK_OBJECT_HANDLE hmacKey = CK_INVALID_HANDLE;
+    CK_MECHANISM rsaMech;
+    CK_MECHANISM hmacMech;
+    byte data[32];
+    byte sig[2048/8];
+    CK_ULONG sigSz = sizeof(sig);
+
+    memset(data, 0x5A, sizeof(data));
+    rsaMech.mechanism      = CKM_RSA_PKCS;
+    rsaMech.pParameter     = NULL;
+    rsaMech.ulParameterLen = 0;
+    hmacMech.mechanism     = CKM_SHA256_HMAC;
+    hmacMech.pParameter    = NULL;
+    hmacMech.ulParameterLen = 0;
+
+    ret = get_rsa_priv_key(session, NULL, 0, CK_FALSE, &priv);
+    if (ret == CKR_OK)
+        ret = get_rsa_pub_key(session, NULL, 0, &pub);
+    if (ret == CKR_OK)
+        ret = get_generic_key(session, data, sizeof(data), CK_TRUE, &hmacKey);
+
+    /* SignUpdate path: RSA-init then SignUpdate -> CKR_MECHANISM_INVALID. */
+    if (ret == CKR_OK) {
+        ret = funcList->C_SignInit(session, &rsaMech, priv);
+        CHECK_CKR(ret, "SignInit with RSA for SignUpdate recovery test");
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_SignUpdate(session, data, sizeof(data));
+        CHECK_CKR_FAIL(ret, CKR_MECHANISM_INVALID,
+                       "SignUpdate rejected for single-part-only mechanism");
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_SignInit(session, &hmacMech, hmacKey);
+        CHECK_CKR(ret, "SignInit succeeds after SignUpdate failure");
+    }
+    if (ret == CKR_OK) {
+        sigSz = sizeof(sig);
+        ret = funcList->C_Sign(session, data, sizeof(data), sig, &sigSz);
+        CHECK_CKR(ret, "Sign drains the recovered op");
+    }
+
+    /* VerifyUpdate path: same shape. */
+    if (ret == CKR_OK) {
+        ret = funcList->C_VerifyInit(session, &rsaMech, pub);
+        CHECK_CKR(ret, "VerifyInit with RSA for VerifyUpdate recovery test");
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_VerifyUpdate(session, data, sizeof(data));
+        CHECK_CKR_FAIL(ret, CKR_MECHANISM_INVALID,
+                       "VerifyUpdate rejected for single-part-only mechanism");
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_VerifyInit(session, &hmacMech, hmacKey);
+        CHECK_CKR(ret, "VerifyInit succeeds after VerifyUpdate failure");
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_Verify(session, data, sizeof(data), sig, sigSz);
+        CHECK_CKR(ret, "Verify drains the recovered op");
+    }
+
+    return ret;
+}
+#endif /* !NO_RSA */
+
+/* C_DigestKey must terminate the digest op on Object_Find failure so a
+ * fresh C_DigestInit succeeds. */
+static CK_RV test_op_active_after_digest_key_failure(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_RV ret;
+    CK_MECHANISM mech;
+    byte digest[32];
+    CK_ULONG digestSz;
+    byte data[16];
+
+    mech.mechanism      = CKM_SHA256;
+    mech.pParameter     = NULL;
+    mech.ulParameterLen = 0;
+    memset(data, 0xC3, sizeof(data));
+
+    ret = funcList->C_DigestInit(session, &mech);
+    CHECK_CKR(ret, "DigestInit for DigestKey recovery test");
+
+    if (ret == CKR_OK) {
+        /* Invalid object handle -> CKR_OBJECT_HANDLE_INVALID. The fix must
+         * also terminate the active digest. */
+        ret = funcList->C_DigestKey(session, CK_INVALID_HANDLE);
+        CHECK_CKR_FAIL(ret, CKR_OBJECT_HANDLE_INVALID,
+                       "DigestKey rejects invalid handle");
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_DigestInit(session, &mech);
+        CHECK_CKR(ret, "DigestInit succeeds after DigestKey failure");
+    }
+    if (ret == CKR_OK) {
+        digestSz = sizeof(digest);
+        ret = funcList->C_Digest(session, data, sizeof(data), digest, &digestSz);
+        CHECK_CKR(ret, "Digest drains the recovered op");
+    }
+
+    return ret;
+}
+
+#ifdef WOLFPKCS11_NO_STORE
+/* On WOLFPKCS11_NO_STORE builds, WP11_Digest_Key returns the positive
+ * CK_RV CKR_FUNCTION_NOT_SUPPORTED. C_DigestKey must propagate that code
+ * (not clobber it to CKR_FUNCTION_FAILED) and must still terminate the
+ * digest operation so a fresh DigestInit succeeds. */
+static CK_RV test_op_active_after_digest_key_no_store(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_RV ret;
+    CK_MECHANISM mech;
+    CK_OBJECT_HANDLE key = CK_INVALID_HANDLE;
+    CK_ULONG valueLen = 16;
+    byte keyData[16];
+    byte digest[32];
+    CK_ULONG digestSz;
+    byte data[16];
+    CK_ATTRIBUTE keyTmpl[] = {
+        { CKA_CLASS,     &secretKeyClass, sizeof(secretKeyClass) },
+        { CKA_KEY_TYPE,  &genericKeyType, sizeof(genericKeyType) },
+        { CKA_VALUE,     keyData,         sizeof(keyData)        },
+        { CKA_VALUE_LEN, &valueLen,       sizeof(valueLen)       },
+    };
+    CK_ULONG keyTmplCnt = sizeof(keyTmpl) / sizeof(*keyTmpl);
+
+    mech.mechanism      = CKM_SHA256;
+    mech.pParameter     = NULL;
+    mech.ulParameterLen = 0;
+    memset(data, 0xC3, sizeof(data));
+    memset(keyData, 0x5A, sizeof(keyData));
+
+    ret = funcList->C_CreateObject(session, keyTmpl, keyTmplCnt, &key);
+    CHECK_CKR(ret, "Create secret key for NO_STORE DigestKey test");
+
+    if (ret == CKR_OK) {
+        ret = funcList->C_DigestInit(session, &mech);
+        CHECK_CKR(ret, "DigestInit for NO_STORE DigestKey test");
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_DigestKey(session, key);
+        CHECK_CKR_FAIL(ret, CKR_FUNCTION_NOT_SUPPORTED,
+                       "DigestKey on NO_STORE build returns "
+                       "CKR_FUNCTION_NOT_SUPPORTED");
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_DigestInit(session, &mech);
+        CHECK_CKR(ret, "DigestInit succeeds after NO_STORE DigestKey failure");
+    }
+    if (ret == CKR_OK) {
+        digestSz = sizeof(digest);
+        ret = funcList->C_Digest(session, data, sizeof(data), digest, &digestSz);
+        CHECK_CKR(ret, "Digest drains the recovered op");
+    }
+
+    if (key != CK_INVALID_HANDLE)
+        funcList->C_DestroyObject(session, key);
+    return ret;
+}
+#endif /* WOLFPKCS11_NO_STORE */
+#endif /* !NO_SHA256 */
+#endif /* !NO_HMAC */
+
+/* CKA_COPYABLE=CK_FALSE must cause C_CopyObject to return
+ * CKR_ACTION_PROHIBITED (PKCS#11 v2.40 sec. 11.7.5). */
+static CK_RV test_copy_object_not_copyable(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_RV ret;
+    CK_OBJECT_HANDLE src = CK_INVALID_HANDLE;
+    CK_OBJECT_HANDLE copy = CK_INVALID_HANDLE;
+    CK_ULONG valueLen = 32;
+    byte keyData[32];
+    CK_BBOOL writableCopyable = CK_TRUE;
+    CK_ATTRIBUTE writableTmpl[] = {
+        { CKA_COPYABLE, &writableCopyable, sizeof(writableCopyable) },
+    };
+    CK_ATTRIBUTE tmpl[] = {
+        { CKA_CLASS,      &secretKeyClass, sizeof(secretKeyClass) },
+        { CKA_KEY_TYPE,   &genericKeyType, sizeof(genericKeyType) },
+        { CKA_VALUE,      keyData,         sizeof(keyData)        },
+        { CKA_VALUE_LEN,  &valueLen,       sizeof(valueLen)       },
+        { CKA_COPYABLE,   &ckFalse,        sizeof(ckFalse)        },
+    };
+    CK_ULONG tmplCnt = sizeof(tmpl) / sizeof(*tmpl);
+
+    memset(keyData, 0xA5, sizeof(keyData));
+
+    ret = funcList->C_CreateObject(session, tmpl, tmplCnt, &src);
+    CHECK_CKR(ret, "Create non-copyable object");
+    if (ret == CKR_OK) {
+        ret = funcList->C_CopyObject(session, src, NULL, 0, &copy);
+        CHECK_CKR_FAIL(ret, CKR_ACTION_PROHIBITED,
+                       "Copy of CKA_COPYABLE=FALSE object rejected");
+        if (copy != CK_INVALID_HANDLE)
+            funcList->C_DestroyObject(session, copy);
+        /* PKCS#11 v2.40 sec 4.4.1: FALSE->TRUE flip must be rejected. */
+        ret = funcList->C_SetAttributeValue(session, src, writableTmpl, 1);
+        CHECK_CKR_FAIL(ret, CKR_ATTRIBUTE_READ_ONLY,
+                       "Flip CKA_COPYABLE FALSE->TRUE rejected");
+    }
+    if (src != CK_INVALID_HANDLE)
+        funcList->C_DestroyObject(session, src);
+    return ret;
+}
+
+/* CKA_DESTROYABLE=CK_FALSE must cause C_DestroyObject to return
+ * CKR_ACTION_PROHIBITED, and a subsequent attempt to flip CKA_DESTROYABLE
+ * back to CK_TRUE must be rejected per PKCS#11 v2.40 sec. 4.4.1. The
+ * object is a session object, so the harness's C_CloseSession will free
+ * it on test teardown. */
+static CK_RV test_destroy_object_not_destroyable(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_RV ret;
+    CK_OBJECT_HANDLE obj = CK_INVALID_HANDLE;
+    CK_BBOOL writableDestroyable = CK_TRUE;
+    CK_ATTRIBUTE writableTmpl[] = {
+        { CKA_DESTROYABLE, &writableDestroyable, sizeof(writableDestroyable) },
+    };
+    CK_ULONG valueLen = 32;
+    byte keyData[32];
+    CK_ATTRIBUTE tmpl[] = {
+        { CKA_CLASS,         &secretKeyClass, sizeof(secretKeyClass) },
+        { CKA_KEY_TYPE,      &genericKeyType, sizeof(genericKeyType) },
+        { CKA_VALUE,         keyData,         sizeof(keyData)        },
+        { CKA_VALUE_LEN,     &valueLen,       sizeof(valueLen)       },
+        { CKA_DESTROYABLE,   &ckFalse,        sizeof(ckFalse)        },
+    };
+    CK_ULONG tmplCnt = sizeof(tmpl) / sizeof(*tmpl);
+
+    memset(keyData, 0x5A, sizeof(keyData));
+
+    ret = funcList->C_CreateObject(session, tmpl, tmplCnt, &obj);
+    CHECK_CKR(ret, "Create non-destroyable object");
+    if (ret == CKR_OK) {
+        ret = funcList->C_DestroyObject(session, obj);
+        CHECK_CKR_FAIL(ret, CKR_ACTION_PROHIBITED,
+                       "Destroy of CKA_DESTROYABLE=FALSE object rejected");
+        /* Verify FALSE->TRUE flip is also rejected. */
+        ret = funcList->C_SetAttributeValue(session, obj, writableTmpl, 1);
+        CHECK_CKR_FAIL(ret, CKR_ATTRIBUTE_READ_ONLY,
+                       "Flip CKA_DESTROYABLE FALSE->TRUE rejected");
+    }
+    return ret;
+}
+
+/* CKA_DERIVE=CK_FALSE must cause C_DeriveKey to reject the base key
+ * (CKR_KEY_FUNCTION_NOT_PERMITTED via the CheckOpSupported pattern).
+ * The check is skipped on WOLFPKCS11_NSS builds for NSS compatibility. */
+#if !defined(NO_DH) && !defined(WOLFPKCS11_NSS)
+static CK_RV test_derive_key_not_allowed(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_RV ret;
+    byte peer[32];
+    CK_OBJECT_HANDLE base = CK_INVALID_HANDLE;
+    CK_OBJECT_HANDLE secret = CK_INVALID_HANDLE;
+    CK_KEY_TYPE keyType = CKK_GENERIC_SECRET;
+    CK_ULONG secSz = 32;
+    CK_ATTRIBUTE outTmpl[] = {
+        { CKA_CLASS,     &secretKeyClass, sizeof(secretKeyClass) },
+        { CKA_KEY_TYPE,  &keyType,        sizeof(keyType)        },
+        { CKA_VALUE_LEN, &secSz,          sizeof(secSz)          },
+    };
+    CK_ULONG outTmplCnt = sizeof(outTmpl) / sizeof(*outTmpl);
+    CK_ATTRIBUTE baseTmpl[] = {
+        { CKA_CLASS,    &secretKeyClass, sizeof(secretKeyClass) },
+        { CKA_KEY_TYPE, &genericKeyType, sizeof(genericKeyType) },
+        { CKA_VALUE,    peer,            sizeof(peer)           },
+        { CKA_DERIVE,   &ckFalse,        sizeof(ckFalse)        },
+    };
+    CK_ULONG baseTmplCnt = sizeof(baseTmpl) / sizeof(*baseTmpl);
+    CK_MECHANISM mech;
+
+    memset(peer, 9, sizeof(peer));
+    mech.mechanism      = CKM_DH_PKCS_DERIVE;
+    mech.ulParameterLen = sizeof(peer);
+    mech.pParameter     = peer;
+
+    ret = funcList->C_CreateObject(session, baseTmpl, baseTmplCnt, &base);
+    CHECK_CKR(ret, "Create base key with CKA_DERIVE=FALSE");
+    if (ret == CKR_OK) {
+        ret = funcList->C_DeriveKey(session, &mech, base, outTmpl, outTmplCnt,
+                                    &secret);
+        CHECK_CKR_FAIL(ret, CKR_KEY_FUNCTION_NOT_PERMITTED,
+                       "DeriveKey rejected when base CKA_DERIVE=FALSE");
+        if (secret != CK_INVALID_HANDLE)
+            funcList->C_DestroyObject(session, secret);
+    }
+    if (base != CK_INVALID_HANDLE)
+        funcList->C_DestroyObject(session, base);
+    return ret;
+}
+#endif /* !NO_DH && !WOLFPKCS11_NSS */
+
+#if !defined(NO_RSA) && !defined(WC_NO_RSA_OAEP)
+/* Calling C_EncryptInit with OAEP twice in a row without completing the first
+ * operation exercises the re-initialization path in SetOaepParams. Any label
+ * from the first init must be freed before being overwritten. */
+static CK_RV test_oaep_reinit(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_RV ret;
+    CK_OBJECT_HANDLE pub = CK_INVALID_HANDLE;
+    CK_OBJECT_HANDLE priv = CK_INVALID_HANDLE;
+    CK_MECHANISM mech;
+    CK_RSA_PKCS_OAEP_PARAMS params;
+    byte plain[32], enc[2048/8];
+    CK_ULONG plainSz = sizeof(plain), encSz = sizeof(enc);
+    unsigned char label1[] = "first-label";
+    unsigned char label2[] = "second-label-longer";
+
+    ret = get_rsa_priv_key(session, NULL, 0, CK_FALSE, &priv);
+    if (ret == CKR_OK)
+        ret = get_rsa_pub_key(session, NULL, 0, &pub);
+
+    params.hashAlg = CKM_SHA256;
+    params.mgf = CKG_MGF1_SHA256;
+    params.source = CKZ_DATA_SPECIFIED;
+    params.pSourceData = label1;
+    params.ulSourceDataLen = sizeof(label1);
+
+    mech.mechanism      = CKM_RSA_PKCS_OAEP;
+    mech.ulParameterLen = sizeof(params);
+    mech.pParameter     = &params;
+
+    /* First init with label1 */
+    if (ret == CKR_OK) {
+        ret = funcList->C_EncryptInit(session, &mech, pub);
+        CHECK_CKR(ret, "OAEP Encrypt Init #1 with label");
+    }
+    /* Complete the first operation to release session state */
+    if (ret == CKR_OK) {
+        memset(plain, 9, sizeof(plain));
+        ret = funcList->C_Encrypt(session, plain, plainSz, enc, &encSz);
+        CHECK_CKR(ret, "OAEP Encrypt #1");
+    }
+    /* Second init with label2 — old label must be freed, not leaked */
+    if (ret == CKR_OK) {
+        params.pSourceData = label2;
+        params.ulSourceDataLen = sizeof(label2);
+        encSz = sizeof(enc);
+        ret = funcList->C_EncryptInit(session, &mech, pub);
+        CHECK_CKR(ret, "OAEP Encrypt Init #2 with different label (reinit)");
+    }
+    /* Complete the second operation */
+    if (ret == CKR_OK) {
+        ret = funcList->C_Encrypt(session, plain, plainSz, enc, &encSz);
+        CHECK_CKR(ret, "OAEP Encrypt after reinit");
+    }
+
+    return ret;
+}
+#endif
+
+#ifdef HAVE_AESGCM
+/* Calling C_EncryptInit with AES-GCM twice in a row without completing the
+ * first operation exercises the re-initialization path in SetGcmParams. Any
+ * AAD from the first init must be freed before being overwritten. */
+static CK_RV test_gcm_reinit(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_RV ret;
+    CK_OBJECT_HANDLE key;
+    CK_MECHANISM mech;
+    CK_GCM_PARAMS gcmParams;
+    byte iv[12], aad1[10], aad2[20];
+    byte plain[32], enc[48];
+    CK_ULONG plainSz = sizeof(plain), encSz = sizeof(enc);
+
+    memset(iv, 9, sizeof(iv));
+    memset(aad1, 1, sizeof(aad1));
+    memset(aad2, 2, sizeof(aad2));
+    memset(plain, 9, sizeof(plain));
+
+    gcmParams.pIv       = iv;
+    gcmParams.ulIvLen   = sizeof(iv);
+    gcmParams.pAAD      = aad1;
+    gcmParams.ulAADLen  = sizeof(aad1);
+    gcmParams.ulTagBits = 128;
+
+    mech.mechanism      = CKM_AES_GCM;
+    mech.ulParameterLen = sizeof(gcmParams);
+    mech.pParameter     = &gcmParams;
+
+    ret = get_aes_128_key(session, NULL, 0, &key);
+    /* First init with aad1 */
+    if (ret == CKR_OK) {
+        ret = funcList->C_EncryptInit(session, &mech, key);
+        CHECK_CKR(ret, "AES-GCM Encrypt Init #1 with AAD");
+    }
+    /* Complete the first operation to release session state */
+    if (ret == CKR_OK) {
+        ret = funcList->C_Encrypt(session, plain, plainSz, enc, &encSz);
+        CHECK_CKR(ret, "AES-GCM Encrypt #1");
+    }
+    /* Second init with aad2 — old AAD must be freed, not leaked */
+    if (ret == CKR_OK) {
+        gcmParams.pAAD = aad2;
+        gcmParams.ulAADLen = sizeof(aad2);
+        encSz = sizeof(enc);
+        ret = funcList->C_EncryptInit(session, &mech, key);
+        CHECK_CKR(ret, "AES-GCM Encrypt Init #2 with different AAD (reinit)");
+    }
+    /* Complete the second operation */
+    if (ret == CKR_OK) {
+        ret = funcList->C_Encrypt(session, plain, plainSz, enc, &encSz);
+        CHECK_CKR(ret, "AES-GCM Encrypt after reinit");
+    }
+
+    return ret;
+}
+#endif /* HAVE_AESGCM */
+
+#ifdef HAVE_AESCCM
+/* Same as GCM reinit test but for AES-CCM. */
+static CK_RV test_ccm_reinit(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_RV ret;
+    CK_OBJECT_HANDLE key;
+    CK_MECHANISM mech;
+    CK_CCM_PARAMS ccmParams;
+    byte iv[13], aad1[10], aad2[20];
+    byte plain[32], enc[48];
+    CK_ULONG plainSz = sizeof(plain), encSz = sizeof(enc);
+
+    memset(iv, 9, sizeof(iv));
+    memset(aad1, 1, sizeof(aad1));
+    memset(aad2, 2, sizeof(aad2));
+    memset(plain, 9, sizeof(plain));
+
+    ccmParams.ulDataLen = 0;
+    ccmParams.pIv       = iv;
+    ccmParams.ulIvLen   = sizeof(iv);
+    ccmParams.pAAD      = aad1;
+    ccmParams.ulAADLen  = sizeof(aad1);
+    ccmParams.ulMacLen  = 16;
+
+    mech.mechanism      = CKM_AES_CCM;
+    mech.ulParameterLen = sizeof(ccmParams);
+    mech.pParameter     = &ccmParams;
+
+    ret = gen_aes_key(session, 16, NULL, 0, 0, &key);
+    /* First init with aad1 */
+    if (ret == CKR_OK) {
+        ret = funcList->C_EncryptInit(session, &mech, key);
+        CHECK_CKR(ret, "AES-CCM Encrypt Init #1 with AAD");
+    }
+    /* Complete the first operation to release session state */
+    if (ret == CKR_OK) {
+        ret = funcList->C_Encrypt(session, plain, plainSz, enc, &encSz);
+        CHECK_CKR(ret, "AES-CCM Encrypt #1");
+    }
+    /* Second init with aad2 — old AAD must be freed, not leaked */
+    if (ret == CKR_OK) {
+        ccmParams.pAAD = aad2;
+        ccmParams.ulAADLen = sizeof(aad2);
+        encSz = sizeof(enc);
+        ret = funcList->C_EncryptInit(session, &mech, key);
+        CHECK_CKR(ret, "AES-CCM Encrypt Init #2 with different AAD (reinit)");
+    }
+    /* Complete the second operation */
+    if (ret == CKR_OK) {
+        ret = funcList->C_Encrypt(session, plain, plainSz, enc, &encSz);
+        CHECK_CKR(ret, "AES-CCM Encrypt after reinit");
+    }
+
+    return ret;
+}
+#endif /* HAVE_AESCCM */
+
+#if !defined(NO_RSA) && defined(WC_RSA_DIRECT)
+/* C_VerifyRecoverInit should return CKR_OPERATION_ACTIVE when called twice
+ * without completing the first operation. */
+static CK_RV test_verify_recover_init_double(void* args)
+{
+    CK_SESSION_HANDLE session = *(CK_SESSION_HANDLE*)args;
+    CK_RV ret;
+    CK_MECHANISM verifyMech = { CKM_RSA_PKCS, NULL, 0 };
+    CK_OBJECT_HANDLE pubKey;
+    CK_ATTRIBUTE pubTmpl[] = {
+        { CKA_CLASS,             &pubKeyClass,      sizeof(pubKeyClass)       },
+        { CKA_KEY_TYPE,          &rsaKeyType,       sizeof(rsaKeyType)        },
+        { CKA_VERIFY,            &ckTrue,           sizeof(ckTrue)            },
+        { CKA_VERIFY_RECOVER,    &ckTrue,           sizeof(ckTrue)            },
+        { CKA_MODULUS,           rsa_2048_modulus,   sizeof(rsa_2048_modulus)  },
+        { CKA_PUBLIC_EXPONENT,   rsa_2048_pub_exp,  sizeof(rsa_2048_pub_exp)  },
+    };
+    CK_ULONG pubTmplCnt = sizeof(pubTmpl) / sizeof(*pubTmpl);
+
+    ret = funcList->C_CreateObject(session, pubTmpl, pubTmplCnt, &pubKey);
+    CHECK_CKR(ret, "Create RSA public key for verify recover");
+
+    if (ret == CKR_OK) {
+        ret = funcList->C_VerifyRecoverInit(session, &verifyMech, pubKey);
+        CHECK_CKR(ret, "First C_VerifyRecoverInit");
+    }
+    if (ret == CKR_OK) {
+        ret = funcList->C_VerifyRecoverInit(session, &verifyMech, pubKey);
+        CHECK_CKR_FAIL(ret, CKR_OPERATION_ACTIVE,
+                        "Second C_VerifyRecoverInit without completing first");
+    }
+    /* Clean up active verify-recover operation */
+    {
+        byte sig[256], data[256];
+        CK_ULONG dataLen = sizeof(data);
+        XMEMSET(sig, 0, sizeof(sig));
+        (void)funcList->C_VerifyRecover(session, sig, sizeof(sig),
+                                        data, &dataLen);
+    }
+
+    return ret;
+}
+#endif
+
 static TEST_FUNC testFunc[] = {
     PKCS11TEST_FUNC_NO_INIT_DECL(test_get_function_list),
     PKCS11TEST_FUNC_NO_INIT_DECL(test_not_initialized),
@@ -15776,7 +18235,15 @@ static TEST_FUNC testFunc[] = {
 #endif
     PKCS11TEST_FUNC_SESS_DECL(test_op_state_fail),
     PKCS11TEST_FUNC_SESS_DECL(test_object),
+#ifndef WOLFPKCS11_NSS
+    PKCS11TEST_FUNC_SESS_DECL(test_create_session_obj_ro_session),
+#endif
     PKCS11TEST_FUNC_SESS_DECL(test_copy_object_deep_copy),
+    PKCS11TEST_FUNC_SESS_DECL(test_copy_object_not_copyable),
+    PKCS11TEST_FUNC_SESS_DECL(test_destroy_object_not_destroyable),
+#if !defined(NO_DH) && !defined(WOLFPKCS11_NSS)
+    PKCS11TEST_FUNC_SESS_DECL(test_derive_key_not_allowed),
+#endif
 #if (!defined(NO_RSA) && !defined(WOLFPKCS11_TPM) && defined(WOLFSSL_KEY_GEN))
     PKCS11TEST_FUNC_SESS_DECL(test_copy_object_rsa_key),
 #endif
@@ -15790,6 +18257,7 @@ static TEST_FUNC testFunc[] = {
     PKCS11TEST_FUNC_SESS_DECL(test_attribute),
     PKCS11TEST_FUNC_SESS_DECL(test_attribute_types),
     PKCS11TEST_FUNC_SESS_DECL(test_attribute_get),
+    PKCS11TEST_FUNC_SESS_DECL(test_extractable_set_false_to_true),
     PKCS11TEST_FUNC_SESS_DECL(test_data_object),
     PKCS11TEST_FUNC_SESS_DECL(test_data_object_null_value),
     PKCS11TEST_FUNC_SESS_DECL(test_attributes_secret),
@@ -15802,29 +18270,60 @@ static TEST_FUNC testFunc[] = {
 #ifndef NO_DH
     PKCS11TEST_FUNC_SESS_DECL(test_attributes_dh),
 #endif
+    PKCS11TEST_FUNC_SESS_DECL(test_get_attr_value_all_processed),
     PKCS11TEST_FUNC_SESS_DECL(test_find_objects),
+    PKCS11TEST_FUNC_SESS_DECL(test_find_objects_many),
     PKCS11TEST_FUNC_SESS_DECL(test_private_object_access),
+#ifndef WOLFPKCS11_NSS
+    PKCS11TEST_FUNC_SESS_DECL(test_private_object_handle_access),
+#endif
     PKCS11TEST_FUNC_SESS_DECL(test_encrypt_decrypt),
+#ifndef NO_AES
+    PKCS11TEST_FUNC_SESS_DECL(test_encrypt_decrypt_op_not_supported),
+#endif
     PKCS11TEST_FUNC_SESS_DECL(test_digest_fail),
+#ifndef NO_SHA256
+    PKCS11TEST_FUNC_SESS_DECL(test_digest_single_size_query),
+#endif
     PKCS11TEST_FUNC_SESS_DECL(test_sign_verify),
+    PKCS11TEST_FUNC_SESS_DECL(test_sign_verify_op_not_supported),
     PKCS11TEST_FUNC_SESS_DECL(test_recover),
 #if !defined(NO_RSA) && defined(WC_RSA_DIRECT)
     PKCS11TEST_FUNC_SESS_DECL(test_verify_recover_pkcs),
     PKCS11TEST_FUNC_SESS_DECL(test_verify_recover_x509),
+    PKCS11TEST_FUNC_SESS_DECL(test_verify_recover_init_double),
+#endif
+#ifndef NO_RSA
+    PKCS11TEST_FUNC_SESS_DECL(test_verify_recover_op_not_supported),
 #endif
     PKCS11TEST_FUNC_SESS_DECL(test_encdec_digest),
     PKCS11TEST_FUNC_SESS_DECL(test_encdec_signverify),
     PKCS11TEST_FUNC_SESS_DECL(test_generate_key),
 #if !defined(NO_RSA) && defined(WOLFSSL_KEY_GEN)
     PKCS11TEST_FUNC_SESS_DECL(test_generate_key_pair),
+#ifndef WOLFPKCS11_NSS
+    PKCS11TEST_FUNC_SESS_DECL(test_private_key_secure_defaults),
+#endif
 #endif
 #if defined(HAVE_AES_KEYWRAP) && !defined(WOLFPKCS11_NO_STORE)
     PKCS11TEST_FUNC_SESS_DECL(test_aes_wrap_unwrap_key),
     PKCS11TEST_FUNC_SESS_DECL(test_aes_wrap_unwrap_pad_key),
     PKCS11TEST_FUNC_SESS_DECL(test_wrap_unwrap_key),
+    PKCS11TEST_FUNC_SESS_DECL(test_wrap_key_unextractable),
+    PKCS11TEST_FUNC_SESS_DECL(test_wrap_unwrap_op_not_supported),
+    PKCS11TEST_FUNC_SESS_DECL(test_wrap_key_wrap_with_trusted),
+#if !defined(WOLFPKCS11_NSS)
+    PKCS11TEST_FUNC_SESS_DECL(test_wrap_key_ro_session),
+#endif
 #endif /* HAVE_AES_KEYWRAP && !WOLFPKCS11_NO_STORE */
 #if (!defined(NO_RSA) && !defined(WOLFPKCS11_NO_STORE))
     PKCS11TEST_FUNC_SESS_DECL(test_rsa_wrap_unwrap_key),
+#endif
+#if defined(WOLFPKCS11_KEYPAIR_GEN_COMMON_LABEL) && \
+    defined(HAVE_AES_KEYWRAP) && !defined(WOLFPKCS11_NO_STORE) && \
+    !defined(NO_RSA) && !defined(NO_AES) && \
+    (defined(WOLFSSL_KEY_GEN) || defined(OPENSSL_EXTRA))
+    PKCS11TEST_FUNC_SESS_DECL(test_rsa_unwrap_companion_pub_cka_wrap),
 #endif
 #ifndef NO_DH
     PKCS11TEST_FUNC_SESS_DECL(test_derive_key),
@@ -15836,6 +18335,7 @@ static TEST_FUNC testFunc[] = {
     PKCS11TEST_FUNC_SESS_DECL(test_rsa_fixed_keys_pkcs15_enc),
 #ifndef WC_NO_RSA_OAEP
     PKCS11TEST_FUNC_SESS_DECL(test_rsa_fixed_keys_oaep),
+    PKCS11TEST_FUNC_SESS_DECL(test_oaep_reinit),
 #endif
 #ifdef WC_RSA_DIRECT
     PKCS11TEST_FUNC_SESS_DECL(test_rsa_fixed_keys_x_509_sig),
@@ -15846,6 +18346,9 @@ static TEST_FUNC testFunc[] = {
 #endif
     PKCS11TEST_FUNC_SESS_DECL(test_rsa_fixed_keys_store_token),
     PKCS11TEST_FUNC_SESS_DECL(test_rsa_x_509_fail),
+#ifdef WC_RSA_DIRECT
+    PKCS11TEST_FUNC_SESS_DECL(test_rsa_x_509_verify_lock),
+#endif
     PKCS11TEST_FUNC_SESS_DECL(test_rsa_pkcs_encdec_fail),
 #ifndef WC_NO_RSA_OAEP
     PKCS11TEST_FUNC_SESS_DECL(test_rsa_pkcs_oaep_encdec_fail),
@@ -15863,9 +18366,7 @@ static TEST_FUNC testFunc[] = {
 #endif
 #endif /* !NO_RSA */
 #ifdef HAVE_ECC
-#ifndef WOLFPKCS11_TPM
     PKCS11TEST_FUNC_SESS_DECL(test_ecc_curve),
-#endif
     PKCS11TEST_FUNC_SESS_DECL(test_ecc_key_erase_bug),
     PKCS11TEST_FUNC_SESS_DECL(test_ecc_create_key_fail),
     PKCS11TEST_FUNC_SESS_DECL(test_ecc_fixed_keys_ecdh),
@@ -15884,6 +18385,7 @@ static TEST_FUNC testFunc[] = {
 #ifndef NO_AES
 #ifdef HAVE_AES_CBC
     PKCS11TEST_FUNC_SESS_DECL(test_aes_cbc_pad_len_test),
+    PKCS11TEST_FUNC_SESS_DECL(test_aes_cbc_pad_block_aligned_size),
     PKCS11TEST_FUNC_SESS_DECL(test_aes_cbc_fixed_key),
     PKCS11TEST_FUNC_SESS_DECL(test_aes_cbc_fail),
     PKCS11TEST_FUNC_SESS_DECL(test_aes_cbc_gen_key),
@@ -15892,6 +18394,9 @@ static TEST_FUNC testFunc[] = {
     PKCS11TEST_FUNC_SESS_DECL(test_aes_cbc_pad_fail),
     PKCS11TEST_FUNC_SESS_DECL(test_aes_cbc_pad_gen_key),
     PKCS11TEST_FUNC_SESS_DECL(test_aes_cbc_pad_gen_key_id),
+    PKCS11TEST_FUNC_SESS_DECL(test_encrypt_data_len_range),
+    PKCS11TEST_FUNC_SESS_DECL(test_op_active_after_data_len_range),
+    PKCS11TEST_FUNC_SESS_DECL(test_op_active_after_update_data_len_range),
 #endif
 #ifdef HAVE_AESCTR
     PKCS11TEST_FUNC_SESS_DECL(test_aes_ctr_fixed_key),
@@ -15901,9 +18406,11 @@ static TEST_FUNC testFunc[] = {
     PKCS11TEST_FUNC_SESS_DECL(test_aes_gcm_fail),
     PKCS11TEST_FUNC_SESS_DECL(test_aes_gcm_gen_key),
     PKCS11TEST_FUNC_SESS_DECL(test_aes_gcm_gen_key_id),
+    PKCS11TEST_FUNC_SESS_DECL(test_gcm_reinit),
 #endif
 #ifdef HAVE_AESCCM
     PKCS11TEST_FUNC_SESS_DECL(test_aes_ccm_gen_key),
+    PKCS11TEST_FUNC_SESS_DECL(test_ccm_reinit),
 #endif
 #ifdef HAVE_AESCTS
     PKCS11TEST_FUNC_SESS_DECL(test_aes_cts_fixed_key),
@@ -15950,6 +18457,14 @@ static TEST_FUNC testFunc[] = {
 #ifndef NO_SHA256
     PKCS11TEST_FUNC_SESS_DECL(test_hmac_sha256),
     PKCS11TEST_FUNC_SESS_DECL(test_hmac_sha256_fail),
+    PKCS11TEST_FUNC_SESS_DECL(test_hmac_sha256_truncated_sig),
+#if !defined(NO_RSA)
+    PKCS11TEST_FUNC_SESS_DECL(test_op_active_after_sign_verify_update_failure),
+#endif
+    PKCS11TEST_FUNC_SESS_DECL(test_op_active_after_digest_key_failure),
+#ifdef WOLFPKCS11_NO_STORE
+    PKCS11TEST_FUNC_SESS_DECL(test_op_active_after_digest_key_no_store),
+#endif
 #endif
 #ifdef WOLFSSL_SHA384
     PKCS11TEST_FUNC_SESS_DECL(test_hmac_sha384),
@@ -15982,6 +18497,7 @@ static TEST_FUNC testFunc[] = {
     PKCS11TEST_FUNC_SESS_DECL(test_hkdf_derive_expand_with_extract_null_salt),
     PKCS11TEST_FUNC_SESS_DECL(test_hkdf_derive_extract_with_expand_salt_key),
     PKCS11TEST_FUNC_SESS_DECL(test_hkdf_gen_key),
+    PKCS11TEST_FUNC_SESS_DECL(test_hkdf_derive_expand_null_value_len),
 #endif
 #ifdef WOLFSSL_HAVE_PRF
 #ifndef NO_MD5

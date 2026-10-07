@@ -36,6 +36,14 @@
 #define WOLFPKCS11_STORE_CERT           0x09
 #define WOLFPKCS11_STORE_TRUST          0x0A
 #define WOLFPKCS11_STORE_DATA           0x0B
+#define WOLFPKCS11_STORE_MLDSAKEY_PRIV  0x0C
+#define WOLFPKCS11_STORE_MLDSAKEY_PUB   0x0D
+#define WOLFPKCS11_STORE_MLKEMKEY_PRIV  0x0E
+#define WOLFPKCS11_STORE_MLKEMKEY_PUB   0x0F
+#define WOLFPKCS11_STORE_HSSKEY_PRIV    0x10 /* Reserved for future use */
+#define WOLFPKCS11_STORE_HSSKEY_PUB     0x11
+#define WOLFPKCS11_STORE_XMSSKEY_PRIV   0x12 /* Reserved for future use */
+#define WOLFPKCS11_STORE_XMSSKEY_PUB    0x13
 
 /*
  * Opens access to location to read/write token data.

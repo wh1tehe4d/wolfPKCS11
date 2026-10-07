@@ -118,8 +118,13 @@ extern "C" {
 #define CKF_EC_UNCOMPRESS                     0x01000000UL
 #define CKF_EC_COMPRESS                       0x02000000UL
 
+#define CKF_ENCAPSULATE                       0x10000000UL
+#define CKF_DECAPSULATE                       0x20000000UL
+
 #define CKF_LIBRARY_CANT_CREATE_OS_THREADS    0x00000001UL
 #define CKF_OS_LOCKING_OK                     0x00000002UL
+
+#define CKF_DONT_BLOCK                        0x00000001UL
 
 #define CKF_RNG                               0x00000001UL
 #define CKF_WRITE_PROTECTED                   0x00000002UL
@@ -173,6 +178,11 @@ extern "C" {
 #define CKK_AES                               0x0000001FUL
 #define CKK_DES3                              0x00000015UL /* not supported */
 #define CKK_HKDF                              0x00000042UL
+#define CKK_HSS                               0x00000046UL
+#define CKK_XMSS                              0x00000047UL
+#define CKK_XMSSMT                            0x00000048UL
+#define CKK_ML_KEM                            0x00000049UL
+#define CKK_ML_DSA                            0x0000004AUL
 
 #ifdef WOLFPKCS11_NSS
 /* Not defined by NSS, but we need one */
@@ -183,6 +193,7 @@ extern "C" {
 #define CKA_TOKEN                             0x00000001UL
 #define CKA_PRIVATE                           0x00000002UL
 #define CKA_LABEL                             0x00000003UL
+#define CKA_UNIQUE_ID                         0x00000004UL
 #define CKA_APPLICATION                       0x00000010UL
 #define CKA_VALUE                             0x00000011UL
 #define CKA_OBJECT_ID                         0x00000012UL
@@ -251,6 +262,20 @@ extern "C" {
 #define CKA_DERIVE_TEMPLATE                   0x40000213UL
 #define CKA_ALLOWED_MECHANISMS                0x40000600UL
 
+/* new post-quantum (general) */
+#define CKA_PARAMETER_SET                     0x0000061DUL
+#define CKA_SEED                              0x00000637UL
+/* KEM */
+#define CKA_ENCAPSULATE                       0x00000633UL
+#define CKA_DECAPSULATE                       0x00000634UL
+/* LMS/HSS (RFC 8554) */
+#define CKA_HSS_LEVELS                        0x00000617UL
+#define CKA_HSS_LMS_TYPE                      0x00000618UL
+#define CKA_HSS_LMOTS_TYPE                    0x00000619UL
+#define CKA_HSS_LMS_TYPES                     0x0000061AUL
+#define CKA_HSS_LMOTS_TYPES                   0x0000061BUL
+#define CKA_HSS_KEYS_REMAINING                0x0000061CUL
+
 #ifdef WOLFPKCS11_NSS
 #define CKA_NSS_EMAIL                         (CKA_NSS + 2)
 #define CKA_TRUST                             (CKA_NSS + 0x2000)
@@ -294,6 +319,7 @@ extern "C" {
 #define CKM_SHA512_RSA_PKCS_PSS               0x00000045UL
 #define CKM_SHA224_RSA_PKCS                   0x00000046UL
 #define CKM_SHA224_RSA_PKCS_PSS               0x00000047UL
+#define CKM_SHA512_256                        0x0000004CUL
 #define CKM_MD5                               0x00000210UL
 #define CKM_MD5_HMAC                          0x00000211UL
 #define CKM_SHA1                              0x00000220UL
@@ -347,6 +373,19 @@ extern "C" {
 #define CKM_HKDF_DERIVE                       0x0000402AUL
 #define CKM_HKDF_DATA                         0x0000402BUL
 #define CKM_HKDF_KEY_GEN                      0x0000402CUL
+#define CKM_ML_KEM_KEY_PAIR_GEN               0x0000000FUL
+#define CKM_ML_KEM                            0x00000017UL
+#define CKM_ML_DSA_KEY_PAIR_GEN               0x0000001CUL
+#define CKM_ML_DSA                            0x0000001DUL
+#define CKM_HASH_ML_DSA                       0x0000001FUL
+/* Stateful hash-based signature mechanisms (RFC 8554 HSS, RFC 8391 XMSS /
+ * XMSS^MT). */
+#define CKM_HSS_KEY_PAIR_GEN                  0x00004032UL
+#define CKM_HSS                               0x00004033UL
+#define CKM_XMSS_KEY_PAIR_GEN                 0x00004034UL
+#define CKM_XMSSMT_KEY_PAIR_GEN               0x00004035UL
+#define CKM_XMSS                              0x00004036UL
+#define CKM_XMSSMT                            0x00004037UL
 
 #ifdef WOLFPKCS11_NSS
 #define CKM_NSS_TLS_PRF_GENERAL_SHA256            (CKM_NSS + 21)
@@ -483,6 +522,12 @@ typedef void*             CK_VOID_PTR;
 typedef CK_VOID_PTR*      CK_VOID_PTR_PTR;
 typedef CK_ULONG          CK_CERTIFICATE_TYPE;
 typedef CK_ULONG          CK_RV;
+
+
+/* PKCS#11 on Windows uses 1-byte struct packing; see issue 208. */
+#if defined(_WIN32) && !defined(WOLFPKCS11_NO_PACKED_STRUCTS)
+    #pragma pack(push, 1)
+#endif
 
 
 typedef struct CK_VERSION {
@@ -827,6 +872,65 @@ typedef struct CK_ASYNC_DATA {
 typedef CK_ASYNC_DATA* CK_ASYNC_DATA_PTR;
 
 
+/* generic PQ mechanism parameters */
+typedef CK_ULONG CK_HEDGE_TYPE;
+#define CKH_HEDGE_PREFERRED        0x00000000UL
+#define CKH_HEDGE_REQUIRED         0x00000001UL
+#define CKH_DETERMINISTIC_REQUIRED 0x00000002UL
+
+typedef struct CK_SIGN_ADDITIONAL_CONTEXT {
+     CK_HEDGE_TYPE   hedgeVariant;
+     CK_BYTE_PTR     pContext;
+     CK_ULONG        ulContextLen;
+} CK_SIGN_ADDITIONAL_CONTEXT;
+
+typedef struct CK_HASH_SIGN_ADDITIONAL_CONTEXT {
+     CK_HEDGE_TYPE     hedgeVariant;
+     CK_BYTE_PTR       pContext;
+     CK_ULONG          ulContextLen;
+     CK_MECHANISM_TYPE hash;
+} CK_HASH_SIGN_ADDITIONAL_CONTEXT;
+
+
+/* ML-DSA values for CKA_PARAMETER_SET */
+typedef CK_ULONG CK_ML_DSA_PARAMETER_SET_TYPE;
+#define CKP_ML_DSA_44          0x00000001UL
+#define CKP_ML_DSA_65          0x00000002UL
+#define CKP_ML_DSA_87          0x00000003UL
+
+/* ML-KEM values for CKA_PARAMETER_SET */
+typedef CK_ULONG CK_ML_KEM_PARAMETER_SET_TYPE;
+#define CKP_ML_KEM_512         0x00000001UL
+#define CKP_ML_KEM_768         0x00000002UL
+#define CKP_ML_KEM_1024        0x00000003UL
+
+/* HSS / LMS / LMOTS algorithm identifiers (RFC 8554). The HSS key parameters
+ * are carried by the CKA_HSS_LEVELS / CKA_HSS_LMS_TYPE(S) / CKA_HSS_LMOTS_TYPE(S)
+ * key attributes (PKCS#11 v3.3 HSS profile). */
+typedef CK_ULONG CK_HSS_LEVELS;
+typedef CK_ULONG CK_LMS_TYPE;
+typedef CK_ULONG CK_LMOTS_TYPE;
+
+/* RFC 8554 LMS typecodes (subset supported by wolfSSL) */
+#define CKL_LMS_SHA256_M32_H5      0x00000005UL
+#define CKL_LMS_SHA256_M32_H10     0x00000006UL
+#define CKL_LMS_SHA256_M32_H15     0x00000007UL
+#define CKL_LMS_SHA256_M32_H20     0x00000008UL
+#define CKL_LMS_SHA256_M32_H25     0x00000009UL
+
+/* RFC 8554 LMOTS typecodes (subset supported by wolfSSL) */
+#define CKL_LMOTS_SHA256_N32_W1    0x00000001UL
+#define CKL_LMOTS_SHA256_N32_W2    0x00000002UL
+#define CKL_LMOTS_SHA256_N32_W4    0x00000003UL
+#define CKL_LMOTS_SHA256_N32_W8    0x00000004UL
+
+/* XMSS / XMSS^MT parameter-set identifier types (PKCS#11 v3.3). The value is
+ * the numeric algorithm OID (per NIST SP800-208), also carried in the leading
+ * 4 bytes of the public key. */
+typedef CK_ULONG CK_XMSS_PARAMETER_SET_TYPE;
+typedef CK_ULONG CK_XMSSMT_PARAMETER_SET_TYPE;
+
+
 /* Function list types. */
 typedef struct CK_FUNCTION_LIST CK_FUNCTION_LIST;
 typedef struct CK_FUNCTION_LIST_3_0 CK_FUNCTION_LIST_3_0;
@@ -1109,12 +1213,12 @@ CK_RV C_MessageVerifyFinal(CK_SESSION_HANDLE hSession);
 /* PKCS#11 V 3.2 functions */
 CK_RV C_EncapsulateKey(CK_SESSION_HANDLE hSession, CK_MECHANISM_PTR pMechanism,
                        CK_OBJECT_HANDLE hPublicKey, CK_ATTRIBUTE_PTR pTemplate,
-                       CK_ULONG ulAttributeCount, CK_OBJECT_HANDLE_PTR phKey,
-                       CK_BYTE_PTR pCiphertext, CK_ULONG_PTR pulCiphertextLen);
+                       CK_ULONG ulAttributeCount, CK_BYTE_PTR pCiphertext,
+                       CK_ULONG_PTR pulCiphertextLen, CK_OBJECT_HANDLE_PTR phKey);
 CK_RV C_DecapsulateKey(CK_SESSION_HANDLE hSession, CK_MECHANISM_PTR pMechanism,
-                       CK_OBJECT_HANDLE hPrivateKey, CK_BYTE_PTR pCiphertext,
-                       CK_ULONG ulCiphertextLen, CK_ATTRIBUTE_PTR pTemplate,
-                       CK_ULONG ulAttributeCount, CK_OBJECT_HANDLE_PTR phKey);
+                       CK_OBJECT_HANDLE hPrivateKey, CK_ATTRIBUTE_PTR pTemplate,
+                       CK_ULONG ulAttributeCount, CK_BYTE_PTR pCiphertext,
+                       CK_ULONG ulCiphertextLen, CK_OBJECT_HANDLE_PTR phKey);
 CK_RV C_VerifySignatureInit(CK_SESSION_HANDLE hSession, CK_MECHANISM_PTR pMechanism,
                             CK_OBJECT_HANDLE hKey, CK_BYTE_PTR pSignature,
                             CK_ULONG ulSignatureLen);
@@ -1820,12 +1924,12 @@ struct CK_FUNCTION_LIST_3_2 {
     /* PKCS#11 V 3.2 functions */
     CK_RV (*C_EncapsulateKey)(CK_SESSION_HANDLE hSession, CK_MECHANISM_PTR pMechanism,
                               CK_OBJECT_HANDLE hPublicKey, CK_ATTRIBUTE_PTR pTemplate,
-                              CK_ULONG ulAttributeCount, CK_OBJECT_HANDLE_PTR phKey,
-                              CK_BYTE_PTR pCiphertext, CK_ULONG_PTR pulCiphertextLen);
+                              CK_ULONG ulAttributeCount, CK_BYTE_PTR pCiphertext,
+                              CK_ULONG_PTR pulCiphertextLen, CK_OBJECT_HANDLE_PTR phKey);
     CK_RV (*C_DecapsulateKey)(CK_SESSION_HANDLE hSession, CK_MECHANISM_PTR pMechanism,
-                              CK_OBJECT_HANDLE hPrivateKey, CK_BYTE_PTR pCiphertext,
-                              CK_ULONG ulCiphertextLen, CK_ATTRIBUTE_PTR pTemplate,
-                              CK_ULONG ulAttributeCount, CK_OBJECT_HANDLE_PTR phKey);
+                              CK_OBJECT_HANDLE hPrivateKey, CK_ATTRIBUTE_PTR pTemplate,
+                              CK_ULONG ulAttributeCount, CK_BYTE_PTR pCiphertext,
+                              CK_ULONG ulCiphertextLen, CK_OBJECT_HANDLE_PTR phKey);
     CK_RV (*C_VerifySignatureInit)(CK_SESSION_HANDLE hSession, CK_MECHANISM_PTR pMechanism,
                                    CK_OBJECT_HANDLE hKey, CK_BYTE_PTR pSignature,
                                    CK_ULONG ulSignatureLen);
@@ -1843,6 +1947,10 @@ struct CK_FUNCTION_LIST_3_2 {
     CK_RV (*C_AsyncJoin)(CK_SESSION_HANDLE hSession, CK_UTF8CHAR_PTR pFunctionName,
                          CK_ULONG ulID, CK_BYTE_PTR pData, CK_ULONG ulData);
 };
+
+#if defined(_WIN32) && !defined(WOLFPKCS11_NO_PACKED_STRUCTS)
+    #pragma pack(pop)
+#endif
 
 /* Debug control functions */
 #ifdef DEBUG_WOLFPKCS11

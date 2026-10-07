@@ -42,6 +42,9 @@
 #include <wolfssl/wolfcrypt/aes.h>
 #include <wolfssl/wolfcrypt/cmac.h>
 #include <wolfssl/wolfcrypt/kdf.h>
+#ifdef WOLFPKCS11_MLKEM
+#include <wolfssl/wolfcrypt/wc_mlkem.h>
+#endif
 
 #if !defined(WOLFPKCS11_NO_STORE) && !defined(WOLFPKCS11_CUSTOM_STORE)
 /* OS-specific includes for directory creation */
@@ -254,8 +257,20 @@ struct WP11_Object {
     #ifdef HAVE_ECC
         ecc_key* ecKey;                /* EC key object                       */
     #endif
+    #ifdef WOLFPKCS11_MLDSA
+        wc_MlDsaKey* mldsaKey;            /* ML-DSA key object                   */
+    #endif
     #ifndef NO_DH
         WP11_DhKey* dhKey;             /* DH parameters object                */
+    #endif
+    #ifdef WOLFPKCS11_MLKEM
+        MlKemKey* mlKemKey;            /* ML-KEM key object                   */
+    #endif
+    #ifdef WOLFPKCS11_LMS
+        LmsKey* lmsKey;                /* LMS/HSS key object (verify)         */
+    #endif
+    #ifdef WOLFPKCS11_XMSS
+        XmssKey* xmssKey;              /* XMSS/XMSS^MT key object (verify)    */
     #endif
         WP11_Data* symmKey;            /* Symmetric key object                */
         WP11_GenericData genericData;  /* Generic data object                 */
@@ -318,10 +333,11 @@ struct WP11_Object {
 
 typedef struct WP11_Find {
     int state;                         /* Whether operation is initialized    */
-    CK_OBJECT_HANDLE found[WP11_FIND_MAX];
+    CK_OBJECT_HANDLE* found;
                                        /* List of object handles found        */
     int count;                         /* Count of object handles             */
     int curr;                          /* Index of last object returned       */
+    int capacity;                      /* Allocated entries in found          */
 } WP11_Find;
 
 #ifndef NO_RSA
@@ -343,6 +359,15 @@ typedef struct WP11_PssParams {
 #endif
 #endif
 
+#ifdef WOLFPKCS11_MLDSA
+typedef struct WP11_MldsaParams {
+    enum wc_HashType preHashType;
+    word32 hedgeType;
+    byte ctx[256];
+    byte ctxSz;
+} WP11_MldsaParams;
+#endif
+
 #ifndef NO_AES
 #ifdef HAVE_AES_CBC
 typedef struct WP11_CbcParams {
@@ -350,13 +375,21 @@ typedef struct WP11_CbcParams {
     Aes aes;                           /* AES object from wolfCrypt           */
     unsigned char partial[AES_BLOCK_SIZE];
                                        /* Partial block when streaming        */
+    unsigned char final[AES_BLOCK_SIZE];
+                                       /* Decrypted final block for retry     */
     byte partialSz;                    /* Size of partial block data          */
+    byte finalReady;                   /* Final block has been decrypted      */
 } WP11_CbcParams;
 #endif
 
 #ifdef HAVE_AESCTR
 typedef struct WP11_CtrParams {
     Aes aes;                           /* AES object from wolfCrypt           */
+    unsigned char counter[AES_BLOCK_SIZE];
+                                       /* Next counter block to use           */
+    byte counterBits;                  /* Bits in counter field               */
+    byte offset;                       /* Bytes used in current stream block  */
+    byte exhausted;                    /* Counter field has wrapped           */
 } WP11_CtrParams;
 #endif
 
@@ -370,8 +403,15 @@ typedef struct WP11_GcmParams {
     int tagBits;                       /* Authentication tag size in bits     */
     unsigned char authTag[WP11_MAX_GCM_TAG_SZ];
                                        /* Authentication tag calculated       */
-    unsigned char* enc;                /* Encrypted data - cached for decrypt */
-    int encSz;                         /* Size of encrypted data in bytes     */
+    unsigned char* enc;                /* Cached data for multi-part: buffered */
+                                       /* ciphertext (decrypt) or, without     */
+                                       /* streaming GCM, plaintext (encrypt)   */
+    int encSz;                         /* Size of cached data in bytes         */
+#ifdef WOLFSSL_AESGCM_STREAM
+    Aes aes;                           /* Streaming context for multi-part    */
+                                       /* encrypt                             */
+    int streamInit;                    /* Streaming context is initialized    */
+#endif
 } WP11_GcmParams;
 #endif
 
@@ -449,6 +489,9 @@ struct WP11_Session {
     #ifdef WC_RSA_PSS
         WP11_PssParams pss;            /* RSA-PSS parameters                  */
     #endif
+#endif
+#ifdef WOLFPKCS11_MLDSA
+        WP11_MldsaParams mldsa;        /* ML-DSA parameters                   */
 #endif
 #ifndef NO_AES
     #ifdef HAVE_AES_CBC
@@ -592,6 +635,40 @@ static WC_RNG globalRandom;
 static int libraryInitCount = 0;
 /* Lock for globals including global random. */
 static WP11_Lock globalLock;
+
+#if !defined(SINGLE_THREADED) && defined(WOLFSSL_MUTEX_INITIALIZER) && \
+    defined(WOLFSSL_MUTEX_INITIALIZER_CLAUSE)
+/* Permanently-live mutex that serializes WP11_Library_Init,
+ * WP11_Library_Final, and WP11_Library_IsInitialized. Needed because
+ * globalLock above is created inside Init and destroyed inside Final, so
+ * concurrent C_Initialize / C_Finalize / any-C_-call would otherwise race
+ * on globalLock's lifetime (Fenrir F-4798, F-4799). Static init avoids the
+ * chicken-and-egg of needing a lock to protect lock creation.
+ *
+ * WOLFSSL_MUTEX_INITIALIZER_CLAUSE expands to "= WOLFSSL_MUTEX_INITIALIZER(...)"
+ * on builds that support a static mutex initializer. Older wolfSSL (e.g.
+ * v5.6.6) exposes only the object-like WOLFSSL_MUTEX_INITIALIZER with no
+ * lockname argument and lacks the _CLAUSE wrapper; gating on _CLAUSE keeps
+ * those builds on the non-static fallback path below rather than failing to
+ * compile. */
+static wolfSSL_Mutex libraryInitLock
+    WOLFSSL_MUTEX_INITIALIZER_CLAUSE(libraryInitLock);
+#define WP11_HAVE_LIBRARY_INIT_LOCK
+#endif
+
+#if !defined(SINGLE_THREADED) && defined(WOLFSSL_MUTEX_INITIALIZER) && \
+    defined(WOLFSSL_MUTEX_INITIALIZER_CLAUSE) && \
+    !defined(WOLFPKCS11_TPM_STORE) && defined(WOLFPKCS11_NSS)
+/* Permanently-live leaf mutex serializing the module-global storeDir, which
+ * is set at C_Initialize (before globalLock exists), read in
+ * wolfPKCS11_Store_Name, and freed in WP11_Library_Final after globalLock is
+ * released. Without it the free races the set/read (Fenrir F-5868, F-5150).
+ * Static init mirrors libraryInitLock. It is always acquired as a leaf (no
+ * other lock is taken while it is held), so it cannot invert any ordering. */
+static wolfSSL_Mutex storeDirLock
+    WOLFSSL_MUTEX_INITIALIZER_CLAUSE(storeDirLock);
+#define WP11_HAVE_STORE_DIR_LOCK
+#endif
 
 
 #ifndef SINGLE_THREADED
@@ -874,7 +951,7 @@ static void wp11_Session_Final(WP11_Session* session)
         /* Free objects in session. */
         while ((obj = session->object) != NULL) {
             /* ignore return value, logged in function */
-            (void)WP11_Session_RemoveObject(session, obj);
+            WP11_Session_RemoveObject(session, obj);
             WP11_Object_Free(obj);
         }
         session->inUse = 0;
@@ -890,7 +967,7 @@ static void wp11_Session_Final(WP11_Session* session)
         session->params.oaep.label = NULL;
     }
 #endif
-#ifndef NO_RSA
+#ifndef NO_AES
 #ifdef HAVE_AES_CBC
     if ((session->mechanism == CKM_AES_CBC ||
                       session->mechanism == CKM_AES_CBC_PAD) && session->init) {
@@ -914,11 +991,24 @@ static void wp11_Session_Final(WP11_Session* session)
             XFREE(session->params.gcm.enc, NULL, DYNAMIC_TYPE_TMP_BUFFER);
             session->params.gcm.enc = NULL;
         }
+#ifdef WOLFSSL_AESGCM_STREAM
+        if (session->params.gcm.streamInit) {
+            wc_AesFree(&session->params.gcm.aes);
+            session->params.gcm.streamInit = 0;
+        }
+#endif
     }
 #endif
 #ifdef HAVE_AESCTS
     if (session->mechanism == CKM_AES_CTS && session->init) {
         wc_AesFree(&session->params.cts.aes);
+        session->init = 0;
+    }
+#endif
+#ifdef HAVE_AES_KEYWRAP
+    if ((session->mechanism == CKM_AES_KEY_WRAP ||
+                  session->mechanism == CKM_AES_KEY_WRAP_PAD) && session->init) {
+        wc_AesFree(&session->params.kw.aes);
         session->init = 0;
     }
 #endif
@@ -931,6 +1021,32 @@ static void wp11_Session_Final(WP11_Session* session)
     }
 #endif
 #endif
+#ifndef NO_HMAC
+    if ((session->init & ~WP11_INIT_DIGEST_MASK) == WP11_INIT_HMAC_SIGN ||
+        (session->init & ~WP11_INIT_DIGEST_MASK) == WP11_INIT_HMAC_VERIFY) {
+        wc_HmacFree(&session->params.hmac.hmac);
+        session->init &= WP11_INIT_DIGEST_MASK;
+    }
+#endif
+#ifdef HAVE_AESCMAC
+    if ((session->init & ~WP11_INIT_DIGEST_MASK) == WP11_INIT_AES_CMAC_SIGN ||
+        (session->init & ~WP11_INIT_DIGEST_MASK) == WP11_INIT_AES_CMAC_VERIFY) {
+#if (!defined(HAVE_FIPS) || FIPS_VERSION_GE(5, 3))
+        (void)wc_CmacFree(&session->params.cmac.cmac);
+#else
+        wc_ForceZero(&session->params.cmac.cmac,
+                      sizeof(session->params.cmac.cmac));
+#endif
+        session->init &= WP11_INIT_DIGEST_MASK;
+    }
+#endif
+    if ((session->init & ~WP11_INIT_DIGEST_MASK) == WP11_INIT_DIGEST) {
+        wc_HashFree(&session->params.digest.hash,
+                     session->params.digest.hashType);
+        session->init &= ~WP11_INIT_DIGEST_MASK;
+    }
+    /* Ensure no stale bits remain after all cleanup. */
+    session->init = 0;
 }
 
 #ifndef WOLFPKCS11_NO_STORE
@@ -1011,8 +1127,12 @@ static int wolfPKCS11_Store_GetMaxSize(int type, int variableSz)
                 sizeof(word32) + /* issuerLen */
                 sizeof(word32) + /* serialLen */
                 sizeof(word32) + /* subjectLen */
+#ifdef WOLFPKCS11_NSS
+                sizeof(word32) + /* emailLen */
+#endif
                 FIELD_SIZE(WP11_Object, category) +
-                variableSz /* keyIdLen + labelLen + issuerLen + serialLen + subjectLen */
+                variableSz /* keyIdLen + labelLen + issuerLen + serialLen +
+                            * subjectLen + emailLen */
             ;
             break;
         case WOLFPKCS11_STORE_DATA:
@@ -1062,17 +1182,30 @@ static char* storeDir = NULL;
 
 int WP11_SetStoreDir(const char *dir, size_t dirSz)
 {
+    int ret = 0;
+#ifdef WP11_HAVE_STORE_DIR_LOCK
+    /* Serialize against the free in WP11_Library_Final and any concurrent set
+     * so the XFREE/XMALLOC/XMEMCPY sequence is not raced (F-5868). */
+    if (wc_LockMutex(&storeDirLock) != 0)
+        return BAD_MUTEX_E;
+#endif
     if (storeDir != NULL)
         XFREE(storeDir, NULL, DYNAMIC_TYPE_TMP_BUFFER);
     storeDir = NULL;
     if (dir != NULL) {
         storeDir = (char*) XMALLOC(dirSz + 1, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-        if (storeDir == NULL)
-            return MEMORY_E;
-        XMEMCPY(storeDir, dir, dirSz);
-        storeDir[dirSz] = '\0'; /* Ensure null termination */
+        if (storeDir == NULL) {
+            ret = MEMORY_E;
+        }
+        else {
+            XMEMCPY(storeDir, dir, dirSz);
+            storeDir[dirSz] = '\0'; /* Ensure null termination */
+        }
     }
-    return 0;
+#ifdef WP11_HAVE_STORE_DIR_LOCK
+    wc_UnLockMutex(&storeDirLock);
+#endif
+    return ret;
 }
 #endif
 
@@ -1265,6 +1398,9 @@ static int wolfPKCS11_Store_Name(int type, CK_ULONG id1, CK_ULONG id2, char* nam
      */
     enum { WP11_STORE_SUFFIX_RESERVE = 48 };
     char homePath[256];
+#ifdef WP11_HAVE_STORE_DIR_LOCK
+    char storeDirCopy[WP11_STORE_MAX_PATH];
+#endif
 
     /* Path order:
      * 1. Environment variable WOLFPKCS11_TOKEN_PATH
@@ -1278,8 +1414,27 @@ static int wolfPKCS11_Store_Name(int type, CK_ULONG id1, CK_ULONG id2, char* nam
 #endif
 
 #ifdef WOLFPKCS11_NSS
-    if (str == NULL)
+    if (str == NULL) {
+#ifdef WP11_HAVE_STORE_DIR_LOCK
+        /* Copy storeDir into a local under storeDirLock so a concurrent
+         * WP11_Library_Final free cannot leave str dangling while we format
+         * the path below (F-5150). The lock is released before use. */
+        if (wc_LockMutex(&storeDirLock) != 0)
+            return -1;
+        if (storeDir != NULL) {
+            size_t sdLen = XSTRLEN(storeDir);
+            if (sdLen >= sizeof(storeDirCopy)) {
+                wc_UnLockMutex(&storeDirLock);
+                return -1;
+            }
+            XMEMCPY(storeDirCopy, storeDir, sdLen + 1);
+            str = storeDirCopy;
+        }
+        wc_UnLockMutex(&storeDirLock);
+#else
         str = storeDir;
+#endif
+    }
 #endif
 
     if (str == NULL) {
@@ -1372,6 +1527,36 @@ static int wolfPKCS11_Store_Name(int type, CK_ULONG id1, CK_ULONG id2, char* nam
             ret = XSNPRINTF(name, nameLen, "%s/wp11_data_%016lx_%016lx",
                     str, id1, id2);
             break;
+        case WOLFPKCS11_STORE_MLDSAKEY_PRIV:
+            ret = XSNPRINTF(name, nameLen, "%s/wp11_mldsakey_priv_%016lx_%016lx",
+                    str, id1, id2);
+            break;
+        case WOLFPKCS11_STORE_MLDSAKEY_PUB:
+            ret = XSNPRINTF(name, nameLen, "%s/wp11_mldsakey_pub_%016lx_%016lx",
+                    str, id1, id2);
+            break;
+#ifdef WOLFPKCS11_MLKEM
+        case WOLFPKCS11_STORE_MLKEMKEY_PRIV:
+            ret = XSNPRINTF(name, nameLen, "%s/wp11_mlkemkey_priv_%016lx_%016lx",
+                    str, id1, id2);
+            break;
+        case WOLFPKCS11_STORE_MLKEMKEY_PUB:
+            ret = XSNPRINTF(name, nameLen, "%s/wp11_mlkemkey_pub_%016lx_%016lx",
+                    str, id1, id2);
+            break;
+#endif
+#ifdef WOLFPKCS11_LMS
+        case WOLFPKCS11_STORE_HSSKEY_PUB:
+            ret = XSNPRINTF(name, nameLen, "%s/wp11_hsskey_pub_%016lx_%016lx",
+                    str, id1, id2);
+            break;
+#endif
+#ifdef WOLFPKCS11_XMSS
+        case WOLFPKCS11_STORE_XMSSKEY_PUB:
+            ret = XSNPRINTF(name, nameLen, "%s/wp11_xmsskey_pub_%016lx_%016lx",
+                    str, id1, id2);
+            break;
+#endif
 
         default:
             ret = -1;
@@ -2014,10 +2199,10 @@ static int wp11_storage_read_word32(void* storage, word32* val)
     ret = wp11_storage_read(storage, num, sizeof(num));
     if (ret == 0) {
         /* Convert to 32-bit value. */
-        *val = ((int)num[0] << 24) |
-               ((int)num[1] << 16) |
-               ((int)num[2] <<  8) |
-               ((int)num[3] <<  0);
+        *val = ((word32)num[0] << 24) |
+               ((word32)num[1] << 16) |
+               ((word32)num[2] <<  8) |
+               ((word32)num[3] <<  0);
     }
 
     return ret;
@@ -2442,6 +2627,63 @@ int wp11_Object_AllocateTypeData(WP11_Object* object)
                 }
                 break;
             #endif
+            #ifdef WOLFPKCS11_MLDSA
+            case CKK_ML_DSA:
+                if (object->data.mldsaKey == NULL) {
+                    object->data.mldsaKey = (wc_MlDsaKey*)XMALLOC(
+                        sizeof(wc_MlDsaKey), NULL, DYNAMIC_TYPE_MLDSA);
+                    if (object->data.mldsaKey == NULL) {
+                        ret = MEMORY_E;
+                    }
+                    else {
+                        XMEMSET(object->data.mldsaKey, 0, sizeof(wc_MlDsaKey));
+                    }
+                }
+                break;
+            #endif
+            #ifdef WOLFPKCS11_MLKEM
+            case CKK_ML_KEM:
+                if (object->data.mlKemKey == NULL) {
+                    object->data.mlKemKey = (MlKemKey*)XMALLOC(
+                        sizeof(MlKemKey), NULL, DYNAMIC_TYPE_KEY);
+                    if (object->data.mlKemKey == NULL) {
+                        ret = MEMORY_E;
+                    }
+                    else {
+                        XMEMSET(object->data.mlKemKey, 0, sizeof(MlKemKey));
+                    }
+                }
+                break;
+            #endif
+            #ifdef WOLFPKCS11_LMS
+            case CKK_HSS:
+                if (object->data.lmsKey == NULL) {
+                    object->data.lmsKey = (LmsKey*)XMALLOC(
+                        sizeof(LmsKey), NULL, DYNAMIC_TYPE_KEY);
+                    if (object->data.lmsKey == NULL) {
+                        ret = MEMORY_E;
+                    }
+                    else {
+                        XMEMSET(object->data.lmsKey, 0, sizeof(LmsKey));
+                    }
+                }
+                break;
+            #endif
+            #ifdef WOLFPKCS11_XMSS
+            case CKK_XMSS:
+            case CKK_XMSSMT:
+                if (object->data.xmssKey == NULL) {
+                    object->data.xmssKey = (XmssKey*)XMALLOC(
+                        sizeof(XmssKey), NULL, DYNAMIC_TYPE_KEY);
+                    if (object->data.xmssKey == NULL) {
+                        ret = MEMORY_E;
+                    }
+                    else {
+                        XMEMSET(object->data.xmssKey, 0, sizeof(XmssKey));
+                    }
+                }
+                break;
+            #endif
             #ifndef NO_DH
             case CKK_DH:
                 if (object->data.dhKey == NULL) {
@@ -2509,7 +2751,7 @@ static long GetRsaExponentValue(unsigned char* eData, word32 eSz)
     long e = 0;
 
     /* Convert big-endian data into number. */
-    for (i = eSz - 1; i >= 0; i--) {
+    for (i = 0; i < (int)eSz; i++) {
         e <<= 8;
         e |= eData[i];
     }
@@ -2519,18 +2761,55 @@ static long GetRsaExponentValue(unsigned char* eData, word32 eSz)
 
 #define OBJ_COPY_DATA(src, dest, field)                                        \
     do {                                                                       \
-        if (src->field != NULL) {                                              \
-            dest->field = (unsigned char*)XMALLOC(src->field##Len, NULL,       \
-                    DYNAMIC_TYPE_TMP_BUFFER);                                  \
-            if (dest->field == NULL)                                           \
-                return MEMORY_E;                                               \
-            XMEMCPY(dest->field, src->field, src->field##Len);                 \
-            dest->field##Len = src->field##Len;                                \
-        } else {                                                               \
-            dest->field = NULL;                                                \
-            dest->field##Len = 0;                                              \
+        if (ret == 0) {                                                        \
+            if (src->field != NULL) {                                          \
+                dest->field = (unsigned char*)XMALLOC(src->field##Len, NULL,   \
+                        DYNAMIC_TYPE_TMP_BUFFER);                              \
+                if (dest->field == NULL)                                       \
+                    ret = MEMORY_E;                                            \
+                else {                                                         \
+                    XMEMCPY(dest->field, src->field, src->field##Len);         \
+                    dest->field##Len = src->field##Len;                        \
+                }                                                              \
+            } else {                                                          \
+                dest->field = NULL;                                            \
+                dest->field##Len = 0;                                          \
+            }                                                                  \
         }                                                                      \
     } while (0)
+
+/**
+ * Duplicate a length-prefixed buffer for object copying. On success the
+ * destination owns a freshly allocated copy; on allocation failure the
+ * destination is left NULL and the caller frees any earlier copies through
+ * WP11_Object_Free.
+ */
+static int wp11_Object_CopyBuffer(byte* src, word32 srcLen, byte** dst,
+                                  word32* dstLen)
+{
+    int ret = 0;
+
+    /* A NULL buffer with a non-zero length is an inconsistent source; reject
+     * it rather than silently producing an empty copy. */
+    if (src == NULL && srcLen != 0)
+        return BAD_FUNC_ARG;
+
+    if (src != NULL && srcLen > 0) {
+        *dst = (byte*)XMALLOC(srcLen, NULL, DYNAMIC_TYPE_CERT);
+        if (*dst == NULL)
+            ret = MEMORY_E;
+        else {
+            XMEMCPY(*dst, src, srcLen);
+            *dstLen = srcLen;
+        }
+    }
+    else {
+        *dst = NULL;
+        *dstLen = 0;
+    }
+
+    return ret;
+}
 
 /**
  * Copy an object. Not all fields are supported.
@@ -2547,6 +2826,12 @@ int WP11_Object_Copy(WP11_Object *src, WP11_Object *dest)
         return BAD_FUNC_ARG;
 
     /* We save data copying for the last step */
+
+    /* Copy the common mutable fields, and a data object's payload, under the
+     * source lock so a concurrent C_SetAttributeValue cannot free any of them
+     * mid-copy. */
+    if (src->onToken)
+        WP11_Lock_LockRO(src->lock);
 
     dest->size = src->size;
 #ifndef WOLFPKCS11_NO_STORE
@@ -2568,6 +2853,30 @@ int WP11_Object_Copy(WP11_Object *src, WP11_Object *dest)
     dest->category = src->category;
     dest->devId    = src->devId;
 
+    if (ret == 0 && src->objClass == CKO_DATA) {
+        ret = wp11_Object_CopyBuffer(src->data.genericData.data,
+            src->data.genericData.dataLen,
+            &dest->data.genericData.data, &dest->data.genericData.dataLen);
+        if (ret == 0) {
+            ret = wp11_Object_CopyBuffer(src->data.genericData.application,
+                src->data.genericData.applicationLen,
+                &dest->data.genericData.application,
+                &dest->data.genericData.applicationLen);
+        }
+        if (ret == 0) {
+            ret = wp11_Object_CopyBuffer(src->data.genericData.objectId,
+                src->data.genericData.objectIdLen,
+                &dest->data.genericData.objectId,
+                &dest->data.genericData.objectIdLen);
+        }
+    }
+
+    if (src->onToken)
+        WP11_Lock_UnlockRO(src->lock);
+
+    if (ret != 0)
+        return ret;
+
     if (src->objClass == CKO_CERTIFICATE) {
         return BAD_FUNC_ARG;
     }
@@ -2576,6 +2885,9 @@ int WP11_Object_Copy(WP11_Object *src, WP11_Object *dest)
         return BAD_FUNC_ARG;
     }
 #endif
+    else if (src->objClass == CKO_DATA) {
+        /* Payload copied above under the source lock. */
+    }
     else {
 #ifdef WOLFPKCS11_TPM
         /* Handle TPM keys - copy tpmKey structure directly */
@@ -2630,6 +2942,15 @@ int WP11_Object_Copy(WP11_Object *src, WP11_Object *dest)
         else
 #endif
         {
+#ifndef WOLFPKCS11_NO_STORE
+            /* When the source key is encoded (encrypted at rest), the crypto
+             * key struct has been freed. The keyData blob is already copied
+             * above via OBJ_COPY_DATA, so skip the deep key copy. */
+            if (src->encoded) {
+                dest->type = src->type;
+            }
+            else
+#endif
             switch (src->type) {
 #ifndef NO_RSA
                 case CKK_RSA: {
@@ -2693,7 +3014,10 @@ int WP11_Object_Copy(WP11_Object *src, WP11_Object *dest)
                         }
                     }
 
-                    XFREE(derBuf, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+                    if (derBuf != NULL) {
+                        wc_ForceZero(derBuf, derSz);
+                        XFREE(derBuf, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+                    }
 
                     /* Free destination key on failure */
                     if (ret != 0) {
@@ -2766,7 +3090,7 @@ int WP11_Object_Copy(WP11_Object *src, WP11_Object *dest)
 
                     /* Clean up */
                     if (derBuf != NULL) {
-                        XMEMSET(derBuf, 0, derSz); /* Clear sensitive data */
+                        wc_ForceZero(derBuf, derSz);
                         XFREE(derBuf, NULL, DYNAMIC_TYPE_TMP_BUFFER);
                     }
 
@@ -2778,8 +3102,153 @@ int WP11_Object_Copy(WP11_Object *src, WP11_Object *dest)
                     break;
                 }
 #endif
+#ifdef WOLFPKCS11_MLDSA
+                case CKK_ML_DSA: {
+                    byte* buf = NULL;
+                    word32 bufSz = 0;
+                    byte level = 0;
+
+                    /* Get the level from the source key */
+                    ret = wc_MlDsaKey_GetParams(src->data.mldsaKey, &level);
+
+                    /* Determine raw key size */
+                    if (ret == 0) {
+                        if (src->objClass == CKO_PRIVATE_KEY) {
+                            ret = wc_MlDsaKey_GetPrivLen(src->data.mldsaKey,
+                                (int*)&bufSz);
+                        }
+                        else {
+                            ret = wc_MlDsaKey_GetPubLen(src->data.mldsaKey,
+                                (int*)&bufSz);
+                        }
+                    }
+                    if (ret == 0) {
+                        buf = (byte*)XMALLOC(bufSz, NULL,
+                            DYNAMIC_TYPE_TMP_BUFFER);
+                        if (buf == NULL)
+                            ret = MEMORY_E;
+                    }
+
+                    /* Export raw key from source */
+                    if (ret == 0) {
+                        if (src->objClass == CKO_PRIVATE_KEY) {
+                            ret = wc_MlDsaKey_ExportPrivRaw(src->data.mldsaKey,
+                                buf, &bufSz);
+                        }
+                        else {
+                            ret = wc_MlDsaKey_ExportPubRaw(src->data.mldsaKey,
+                                buf, &bufSz);
+                        }
+                    }
+
+                    /* Init destination key and import */
+                    if (ret == 0) {
+                        ret = wc_MlDsaKey_Init(dest->data.mldsaKey, NULL,
+                            dest->devId);
+                    }
+                    if (ret == 0) {
+                        ret = wc_MlDsaKey_SetParams(dest->data.mldsaKey, level);
+                        if (ret != 0)
+                            wc_MlDsaKey_Free(dest->data.mldsaKey);
+                    }
+                    if (ret == 0) {
+                        if (src->objClass == CKO_PRIVATE_KEY) {
+                            ret = wc_MlDsaKey_ImportPrivRaw(dest->data.mldsaKey,
+                                buf, bufSz);
+                        }
+                        else {
+                            ret = wc_MlDsaKey_ImportPubRaw(dest->data.mldsaKey,
+                                buf, bufSz);
+                        }
+                        if (ret != 0)
+                            wc_MlDsaKey_Free(dest->data.mldsaKey);
+                    }
+
+                    if (buf != NULL) {
+                        wc_ForceZero(buf, bufSz);
+                        XFREE(buf, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+                    }
+
+                    break;
+                }
+#endif
+#ifdef WOLFPKCS11_MLKEM
+                case CKK_ML_KEM: {
+                    byte* buf = NULL;
+                    word32 bufSz = 0;
+                    int level = src->data.mlKemKey->type;
+
+                    /* Determine encoded key size */
+                    if (src->objClass == CKO_PRIVATE_KEY) {
+                        ret = wc_MlKemKey_PrivateKeySize(src->data.mlKemKey,
+                            &bufSz);
+                    }
+                    else {
+                        ret = wc_MlKemKey_PublicKeySize(src->data.mlKemKey,
+                            &bufSz);
+                    }
+                    if (ret == 0) {
+                        buf = (byte*)XMALLOC(bufSz, NULL,
+                            DYNAMIC_TYPE_TMP_BUFFER);
+                        if (buf == NULL)
+                            ret = MEMORY_E;
+                    }
+
+                    /* Encode source key */
+                    if (ret == 0) {
+                        if (src->objClass == CKO_PRIVATE_KEY) {
+                            ret = wc_MlKemKey_EncodePrivateKey(
+                                src->data.mlKemKey, buf, bufSz);
+                        }
+                        else {
+                            ret = wc_MlKemKey_EncodePublicKey(
+                                src->data.mlKemKey, buf, bufSz);
+                        }
+                    }
+
+                    /* Init destination key and decode */
+                    if (ret == 0) {
+                        ret = wc_MlKemKey_Init(dest->data.mlKemKey, level,
+                            NULL, dest->devId);
+                    }
+                    if (ret == 0) {
+                        if (src->objClass == CKO_PRIVATE_KEY) {
+                            ret = wc_MlKemKey_DecodePrivateKey(
+                                dest->data.mlKemKey, buf, bufSz);
+                        }
+                        else {
+                            ret = wc_MlKemKey_DecodePublicKey(
+                                dest->data.mlKemKey, buf, bufSz);
+                        }
+                        if (ret != 0)
+                            wc_MlKemKey_Free(dest->data.mlKemKey);
+                    }
+
+                    if (buf != NULL) {
+                        wc_ForceZero(buf, bufSz);
+                        XFREE(buf, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+                    }
+
+                    break;
+                }
+#endif
 #ifndef NO_DH
                 case CKK_DH:
+                    return BAD_FUNC_ARG;
+#endif
+#ifdef WOLFPKCS11_LMS
+                case CKK_HSS:
+#endif
+#ifdef WOLFPKCS11_XMSS
+                case CKK_XMSS:
+                case CKK_XMSSMT:
+#endif
+#if defined(WOLFPKCS11_LMS) || defined(WOLFPKCS11_XMSS)
+                    /* Copying is prohibited for all LMS/XMSS keys. Public keys
+                     * carry no secret state, but future sign-capable builds add
+                     * private keys whose one-time signature state must never be
+                     * duplicated; rejecting every HBS key copy keeps that
+                     * invariant uniform across key classes. */
                     return BAD_FUNC_ARG;
 #endif
 #ifndef NO_AES
@@ -2831,6 +3300,7 @@ static int wp11_EncryptData(byte* out, byte* data, int len, byte* key,
         ret = wc_AesGcmEncrypt(&aes, out, data, len, iv, ivSz, out + len,
                                                        AES_BLOCK_SIZE, NULL, 0);
     }
+    wc_AesFree(&aes);
 
     return ret;
 }
@@ -2865,6 +3335,7 @@ static int wp11_DecryptData(byte* out, byte* data, int len, byte* key,
         ret = wc_AesGcmDecrypt(&aes, out, data, len, iv, ivSz, data + len,
                                                        AES_BLOCK_SIZE, NULL, 0);
     }
+    wc_AesFree(&aes);
 
     return ret;
 }
@@ -3013,8 +3484,11 @@ static int wp11_Object_Load_Data(WP11_Object* object, int tokenId, int objId)
 #ifdef WOLFSSL_MAXQ10XX_CRYPTO
 #ifdef MAXQ10XX_PRODUCTION_KEY
 #include "maxq10xx_key.h"
-#else
-/* TEST KEY. This must be changed for production environments!! */
+#elif defined(WOLFPKCS11_MAXQ10XX_TEST_KEY)
+/* INSECURE TEST KEY. The private scalar (last 32 bytes) is public in the
+ * source, so anyone can forge a valid MXQ_ImportRootCert provisioning
+ * signature for an arbitrary root certificate. For development against the
+ * MAXQ10xx evaluation kit only - never ship this. */
 static mxq_u1 KeyPairImport[] = {
     0xd0,0x97,0x31,0xc7,0x63,0xc0,0x9e,0xe3,0x9a,0xb4,0xd0,0xce,0xa7,0x89,0xab,
     0x52,0xc8,0x80,0x3a,0x91,0x77,0x29,0xc3,0xa0,0x79,0x2e,0xe6,0x61,0x8b,0x2d,
@@ -3024,6 +3498,8 @@ static mxq_u1 KeyPairImport[] = {
     0x72,0x5e,0x88,0xaf,0xc2,0xee,0x8b,0x6f,0xe5,0x36,0xe3,0x60,0x7c,0xf8,0x2c,
     0xea,0x3a,0x4f,0xe3,0x6d,0x73
 };
+#else
+#error "MAXQ10xx root-cert provisioning key is undefined. Define MAXQ10XX_PRODUCTION_KEY (with a real maxq10xx_key.h) for production, or WOLFPKCS11_MAXQ10XX_TEST_KEY to explicitly opt into the built-in INSECURE test key for evaluation-kit development."
 #endif /* MAXQ10XX_PRODUCTION_KEY */
 
 static int crypto_sha256(const byte *buf, word32 len, byte *hash,
@@ -3354,31 +3830,51 @@ static int WP11_Object_DecodeTpmKey(WP11_Object* object)
 {
     int ret = 0;
     word32 idx = 0;
+    word32 keyDataLen;
     UINT16 pubAreaSize = 0;
-    byte pubAreaBuffer[sizeof(TPM2B_PUBLIC)];
+    /* Largest valid marshalled public area: the TPM2B_PUBLIC payload, i.e. the
+     * structure without its UINT16 size prefix. */
+    const word32 maxPubAreaSize = (word32)sizeof(TPM2B_PUBLIC) -
+                                  (word32)sizeof(UINT16);
 
     if (object == NULL || object->keyData == NULL || object->slot == NULL) {
         return BAD_FUNC_ARG;
     }
+    /* keyData is loaded from on-disk storage and is not covered by the token
+     * master key, so treat keyDataLen as untrusted and bounds-check every
+     * read against it. Layout: pubAreaSize | public(2+pubAreaSize) |
+     * priv.size | priv.buffer(priv.size). */
+    if (object->keyDataLen < 0)
+        return BUFFER_E;
+    keyDataLen = (word32)object->keyDataLen;
 
     /* Extract public size */
+    if (keyDataLen < idx + (word32)sizeof(pubAreaSize))
+        return BUFFER_E;
     XMEMCPY(&pubAreaSize, object->keyData, sizeof(pubAreaSize));
     idx += sizeof(pubAreaSize);
-    if (pubAreaSize <= (UINT16)sizeof(pubAreaBuffer)) {
-        /* Parse public */
-        /* TODO: pass: sizeof(UINT16) + pubAreaSize (see wolfTPM PR 419) */
+    if ((word32)pubAreaSize <= maxPubAreaSize) {
+        /* Parse public. The public blob is sizeof(UINT16) + pubAreaSize bytes;
+         * pass the remaining keyData length so the parser cannot read past the
+         * blob. */
         int parsedPubSize = pubAreaSize;
+        if (keyDataLen < idx + (word32)sizeof(UINT16) + (word32)pubAreaSize)
+            return BUFFER_E;
         ret = TPM2_ParsePublic(&object->tpmKey->pub, object->keyData + idx,
-            sizeof(object->tpmKey->pub), &parsedPubSize);
+            keyDataLen - idx, &parsedPubSize);
         if (ret == 0) {
             idx += sizeof(UINT16) + pubAreaSize;
 
+            if (keyDataLen < idx + (word32)sizeof(object->tpmKey->priv.size))
+                return BUFFER_E;
             XMEMCPY(&object->tpmKey->priv.size, object->keyData + idx,
                 sizeof(object->tpmKey->priv.size));
             if (object->tpmKey->priv.size <
                                     (int)sizeof(object->tpmKey->priv.buffer)) {
                 idx += sizeof(object->tpmKey->priv.size);
                 /* Extract private size and private */
+                if (keyDataLen < idx + (word32)object->tpmKey->priv.size)
+                    return BUFFER_E;
                 XMEMCPY(object->tpmKey->priv.buffer, object->keyData + idx,
                     object->tpmKey->priv.size);
             }
@@ -3417,6 +3913,38 @@ static int WP11_Object_DecodeTpmKey(WP11_Object* object)
 
     return ret;
 }
+
+#ifdef DEBUG_WOLFPKCS11
+/**
+ * Test hook: run WP11_Object_DecodeTpmKey against a caller-supplied keyData
+ * blob to exercise the storage-blob bounds checks without a live TPM. A
+ * truncated blob must return BUFFER_E rather than read past the buffer.
+ *
+ * @param  slotId      [in]  Slot id (1-based).
+ * @param  keyData     [in]  Encoded TPM key blob (possibly truncated).
+ * @param  keyDataLen  [in]  Length of keyData in bytes.
+ * @return  decode status; BUFFER_E for a short/truncated blob.
+ */
+WP11_API int WP11_Test_DecodeTpmKey(CK_SLOT_ID slotId, unsigned char* keyData,
+    int keyDataLen)
+{
+    WP11_Slot* slot = NULL;
+    WP11_Object object;
+    WOLFTPM2_KEYBLOB blob;
+
+    if (WP11_Slot_Get(slotId, &slot) != 0 || slot == NULL)
+        return BAD_FUNC_ARG;
+
+    XMEMSET(&object, 0, sizeof(object));
+    XMEMSET(&blob, 0, sizeof(blob));
+    object.slot = slot;
+    object.tpmKey = &blob;
+    object.keyData = keyData;
+    object.keyDataLen = keyDataLen;
+
+    return WP11_Object_DecodeTpmKey(&object);
+}
+#endif /* DEBUG_WOLFPKCS11 */
 
 static int WP11_Object_WrapTpmKey(WP11_Object* object); /* forward declaration */
 
@@ -3569,7 +4097,7 @@ static int wp11_Object_Decode_RsaKey(WP11_Object* object)
         if (ret == 0) {
             /* Decode RSA private key. */
             ret = wc_RsaPrivateKeyDecode(der, &idx, key, len);
-            XMEMSET(der, 0, len);
+            wc_ForceZero(der, len);
         }
         if (der != NULL)
             XFREE(der, NULL, DYNAMIC_TYPE_TMP_BUFFER);
@@ -3785,8 +4313,10 @@ int WP11_Rsa_SerializeKeyPTPKC8(WP11_Object* object, byte* output, word32* pouts
         ret = 0;
 
 end_func:
-    if (NULL != der)
+    if (NULL != der) {
+        wc_ForceZero(der, dersz);
         XFREE(der, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+    }
 
     return ret;
 }
@@ -3913,12 +4443,9 @@ static int wp11_Object_Decode_EccKey(WP11_Object* object)
                                     sizeof(object->iv), object->devId);
         }
         if (ret == 0) {
-            ret = wc_ecc_init_ex(key, NULL, object->devId);
-        }
-        if (ret == 0) {
             /* Decode ECC private key. */
             ret = wc_EccPrivateKeyDecode(der, &idx, key, len);
-            XMEMSET(der, 0, len);
+            wc_ForceZero(der, len);
         }
         if (der != NULL)
             XFREE(der, NULL, DYNAMIC_TYPE_TMP_BUFFER);
@@ -4095,6 +4622,254 @@ static int wp11_Object_Store_EccKey(WP11_Object* object, int tokenId, int objId)
     return ret;
 }
 #endif /* HAVE_ECC */
+
+#ifdef WOLFPKCS11_MLDSA
+static int MldsaKeyTryDecode(wc_MlDsaKey* key, byte level, byte* data,
+                             word32 len, CK_OBJECT_CLASS class)
+{
+    int ret = 0;
+    word32 idx = 0;
+
+    /* Init key */
+    ret = wc_MlDsaKey_Init(key, NULL, INVALID_DEVID);
+
+    if (ret == 0) {
+        /* Set level */
+        ret = wc_MlDsaKey_SetParams(key, level);
+    }
+    if (ret == 0) {
+        if (class == CKO_PRIVATE_KEY) {
+            /* Decode ML-DSA private key. */
+            ret = wc_MlDsaKey_PrivateKeyDecode(key, data, len, &idx);
+        }
+        else {
+            /* Decode ML-DSA public key. */
+            ret = wc_MlDsaKey_PublicKeyDecode(key, data, len, &idx);
+        }
+    }
+
+    if (ret != 0) {
+        wc_MlDsaKey_Free(key);
+    }
+
+    return ret;
+}
+
+/**
+ * Decode the ML-DSA key.
+ *
+ * Encoded private keys are encrypted.
+ *
+ * @param [in, out]  object  ML-DSA key object.
+ * @return  0 on success.
+ * @return  -ve on failure.
+ */
+static int wp11_Object_Decode_MldsaKey(WP11_Object* object)
+{
+    int ret = 0;
+
+    if (object->objClass == CKO_PRIVATE_KEY) {
+        unsigned char* der;
+        int len = object->keyDataLen - AES_BLOCK_SIZE;
+
+        der = (unsigned char*)XMALLOC(len, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+        if (der == NULL) {
+            ret = MEMORY_E;
+        }
+        if (ret == 0) {
+            ret = wp11_DecryptData(der, object->keyData, len,
+                                   object->slot->token.key,
+                                   sizeof(object->slot->token.key), object->iv,
+                                   sizeof(object->iv), object->devId);
+        }
+        if (ret == 0) {
+            /* Decode ML-DSA private key. */
+            ret = MldsaKeyTryDecode(object->data.mldsaKey, WC_ML_DSA_44,
+                                    der, len, object->objClass);
+            if (ret != 0) {
+                ret = MldsaKeyTryDecode(object->data.mldsaKey, WC_ML_DSA_65,
+                                        der, len, object->objClass);
+            }
+            if (ret != 0) {
+                ret = MldsaKeyTryDecode(object->data.mldsaKey, WC_ML_DSA_87,
+                                        der, len, object->objClass);
+            }
+            wc_ForceZero(der, len);
+        }
+        if (der != NULL)
+            XFREE(der, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+    }
+    else {
+        /* Decode ML-DSA public key. */
+        ret = MldsaKeyTryDecode(object->data.mldsaKey, WC_ML_DSA_44,
+                                object->keyData, object->keyDataLen,
+                                object->objClass);
+        if (ret != 0) {
+            ret = MldsaKeyTryDecode(object->data.mldsaKey, WC_ML_DSA_65,
+                                    object->keyData, object->keyDataLen,
+                                    object->objClass);
+        }
+        if (ret != 0) {
+            ret = MldsaKeyTryDecode(object->data.mldsaKey, WC_ML_DSA_87,
+                                    object->keyData, object->keyDataLen,
+                                    object->objClass);
+        }
+    }
+    object->encoded = (ret != 0);
+
+    return ret;
+}
+
+/**
+ * Encode the ML-DSA key.
+ *
+ * Private keys are encoded and then encrypted.
+ *
+ * @param [in, out]  object  ML-DSA key object.
+ * @return  0 on success.
+ * @return  -ve on failure.
+ */
+static int wp11_Object_Encode_MldsaKey(WP11_Object* object)
+{
+    int ret;
+
+    if (object->objClass == CKO_PRIVATE_KEY) {
+        /* Get length of encoded private key. */
+        ret = wc_MlDsaKey_PrivateKeyToDer(object->data.mldsaKey, NULL, 0);
+        if (ret >= 0) {
+            object->keyDataLen = ret + AES_BLOCK_SIZE;
+            ret = 0;
+        }
+    }
+    else {
+        /* Get length of encoded public key. */
+        ret = wc_MlDsaKey_PublicKeyToDer(object->data.mldsaKey, NULL, 0, 1);
+        if (ret >= 0) {
+            object->keyDataLen = ret;
+            ret = 0;
+        }
+    }
+
+    if (ret == 0) {
+        XFREE(object->keyData, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+        /* Allocate buffer to hold encoded key. */
+        object->keyData = (unsigned char*)XMALLOC(object->keyDataLen, NULL,
+                                                  DYNAMIC_TYPE_TMP_BUFFER);
+        if (object->keyData == NULL)
+            ret = MEMORY_E;
+    }
+
+    if (ret == 0 && object->objClass == CKO_PRIVATE_KEY) {
+        /* Encode private key. */
+        ret = wc_MlDsaKey_PrivateKeyToDer(object->data.mldsaKey,
+                                          object->keyData,
+                                          object->keyDataLen);
+        if (ret >= 0) {
+            ret = wp11_EncryptData(object->keyData, object->keyData, ret,
+                                    object->slot->token.key,
+                                    sizeof(object->slot->token.key), object->iv,
+                                    sizeof(object->iv), object->devId);
+        }
+    }
+    else if (ret == 0 && object->objClass == CKO_PUBLIC_KEY) {
+        /* Encode public key. */
+        ret = wc_MlDsaKey_PublicKeyToDer(object->data.mldsaKey,
+                                         object->keyData,
+                                         object->keyDataLen, 1);
+        if (ret >= 0) {
+            ret = 0;
+        }
+    }
+
+    if (ret != 0) {
+        XFREE(object->keyData, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+        object->keyData = NULL;
+        object->keyDataLen = 0;
+    }
+
+    return ret;
+}
+
+/**
+ * Load a ML-DSA key from storage.
+ *
+ * @param [in, out]  object   ML-DSA key object.
+ * @param [in]       tokenId  Id of token this key belongs to.
+ * @param [in]       objId    Id of object for token.
+ * @return  0 on success.
+ * @return  MEMORY_E when dynamic memory allocation fails.
+ * @return  BUFFER_E when loading fails.
+ * @return  NOT_AVAILABLE_E when unable to locate data.
+ */
+static int wp11_Object_Load_MldsaKey(WP11_Object* object, int tokenId,
+                                     int objId)
+{
+    int ret;
+    void* storage = NULL;
+    int storeType;
+
+    /* Determine store type - private keys may be encrypted. */
+    if (object->objClass == CKO_PRIVATE_KEY)
+        storeType = WOLFPKCS11_STORE_MLDSAKEY_PRIV;
+    else
+        storeType = WOLFPKCS11_STORE_MLDSAKEY_PUB;
+
+    /* Open access to ML-DSA key. */
+    ret = wp11_storage_open_readonly(storeType, tokenId, objId, &storage);
+    if (ret == 0) {
+        /* Read DER encoded ML-DSA key. */
+        ret = wp11_storage_read_alloc_array(storage, &object->keyData,
+                                                           &object->keyDataLen);
+        wp11_storage_close(storage);
+    }
+
+    return ret;
+}
+
+/**
+ * Store a ML-DSA key to storage.
+ *
+ * @param [in]  object   ML-DSA key object.
+ * @param [in]  tokenId  Id of token this key belongs to.
+ * @param [in]  objId    Id of object for token.
+ * @return  0 on success.
+ * @return  MEMORY_E when dynamic memory allocation fails.
+ * @return  BUFFER_E when storing fails.
+ * @return  NOT_AVAILABLE_E when unable to write data.
+ */
+static int wp11_Object_Store_MldsaKey(WP11_Object* object, int tokenId,
+                                      int objId)
+{
+    int ret = 0;
+    void* storage = NULL;
+    int storeType;
+
+    if (object->keyData == NULL) {
+        ret = wp11_Object_Encode_MldsaKey(object);
+    }
+
+    /* Determine store type - private keys may be encrypted. */
+    if (object->objClass == CKO_PRIVATE_KEY)
+        storeType = WOLFPKCS11_STORE_MLDSAKEY_PRIV;
+    else
+        storeType = WOLFPKCS11_STORE_MLDSAKEY_PUB;
+
+    if (ret == 0) {
+        /* Open access to ML-DSA key. */
+        ret = wp11_storage_open(storeType, tokenId, objId, object->keyDataLen,
+                                &storage);
+    }
+    if (ret == 0) {
+        /* Write encoded ML-DSA key to storage. */
+        ret = wp11_storage_write_array(storage, object->keyData,
+                                                            object->keyDataLen);
+
+        wp11_storage_close(storage);
+    }
+
+    return ret;
+}
+#endif /* WOLFPKCS11_MLDSA */
 
 #ifndef NO_DH
 /**
@@ -4431,6 +5206,1054 @@ static int wp11_Object_Store_DhKey(WP11_Object* object, int tokenId, int objId)
 }
 #endif /* !NO_DH */
 
+#ifdef WOLFPKCS11_MLKEM
+static int MlKemKeyTryDecode(MlKemKey* key, int level, byte* data, word32 len,
+                             int devId, CK_OBJECT_CLASS objClass)
+{
+    int ret;
+
+    ret = wc_MlKemKey_Init(key, level, NULL, devId);
+    if (ret == 0) {
+        if (objClass == CKO_PRIVATE_KEY) {
+            ret = wc_MlKemKey_DecodePrivateKey(key, data, len);
+        }
+        else {
+            ret = wc_MlKemKey_DecodePublicKey(key, data, len);
+        }
+        if (ret != 0) {
+            wc_MlKemKey_Free(key);
+        }
+    }
+
+    return ret;
+}
+
+/**
+ * Decode the ML-KEM key.
+ *
+ * Encoded private keys are encrypted.
+ *
+ * @param [in, out]  object  ML-KEM key object.
+ * @return  0 on success.
+ * @return  -ve on failure.
+ */
+static int wp11_Object_Decode_MlKemKey(WP11_Object* object)
+{
+    int ret = 0;
+
+    if (object->objClass == CKO_PRIVATE_KEY) {
+        unsigned char* der;
+        int len;
+
+        if (object->keyDataLen <= AES_BLOCK_SIZE)
+            return BAD_FUNC_ARG;
+        len = object->keyDataLen - AES_BLOCK_SIZE;
+
+        der = (unsigned char*)XMALLOC(len, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+        if (der == NULL) {
+            ret = MEMORY_E;
+        }
+        if (ret == 0) {
+            ret = wp11_DecryptData(der, object->keyData, len,
+                                   object->slot->token.key,
+                                   sizeof(object->slot->token.key), object->iv,
+                                   sizeof(object->iv), object->devId);
+        }
+        if (ret == 0) {
+            ret = MlKemKeyTryDecode(object->data.mlKemKey, WC_ML_KEM_512,
+                                    der, len, object->devId, object->objClass);
+            if (ret != 0) {
+                ret = MlKemKeyTryDecode(object->data.mlKemKey, WC_ML_KEM_768,
+                                        der, len, object->devId,
+                                        object->objClass);
+            }
+            if (ret != 0) {
+                ret = MlKemKeyTryDecode(object->data.mlKemKey, WC_ML_KEM_1024,
+                                        der, len, object->devId,
+                                        object->objClass);
+            }
+        }
+        if (der != NULL) {
+            wc_ForceZero(der, len);
+            XFREE(der, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+        }
+    }
+    else {
+        ret = MlKemKeyTryDecode(object->data.mlKemKey, WC_ML_KEM_512,
+                                object->keyData, object->keyDataLen,
+                                object->devId, object->objClass);
+        if (ret != 0) {
+            ret = MlKemKeyTryDecode(object->data.mlKemKey, WC_ML_KEM_768,
+                                    object->keyData, object->keyDataLen,
+                                    object->devId, object->objClass);
+        }
+        if (ret != 0) {
+            ret = MlKemKeyTryDecode(object->data.mlKemKey, WC_ML_KEM_1024,
+                                    object->keyData, object->keyDataLen,
+                                    object->devId, object->objClass);
+        }
+    }
+    object->encoded = (ret != 0);
+
+    return ret;
+}
+
+/**
+ * Encode the ML-KEM key.
+ *
+ * Private keys are encoded and then encrypted.
+ *
+ * @param [in, out]  object  ML-KEM key object.
+ * @return  0 on success.
+ * @return  -ve on failure.
+ */
+static int wp11_Object_Encode_MlKemKey(WP11_Object* object)
+{
+    int ret;
+    word32 keyLen = 0;
+
+    if (object->objClass == CKO_PRIVATE_KEY) {
+        ret = wc_MlKemKey_PrivateKeySize(object->data.mlKemKey, &keyLen);
+        if (ret == 0) {
+            object->keyDataLen = keyLen + AES_BLOCK_SIZE;
+        }
+    }
+    else {
+        ret = wc_MlKemKey_PublicKeySize(object->data.mlKemKey, &keyLen);
+        if (ret == 0) {
+            object->keyDataLen = keyLen;
+        }
+    }
+
+    if (ret == 0) {
+        XFREE(object->keyData, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+        object->keyData = (unsigned char*)XMALLOC(object->keyDataLen, NULL,
+                                                  DYNAMIC_TYPE_TMP_BUFFER);
+        if (object->keyData == NULL)
+            ret = MEMORY_E;
+    }
+
+    if (ret == 0 && object->objClass == CKO_PRIVATE_KEY) {
+        ret = wc_MlKemKey_EncodePrivateKey(object->data.mlKemKey,
+                                           object->keyData, keyLen);
+        if (ret == 0) {
+            ret = wp11_EncryptData(object->keyData, object->keyData, keyLen,
+                                   object->slot->token.key,
+                                   sizeof(object->slot->token.key), object->iv,
+                                   sizeof(object->iv), object->devId);
+        }
+    }
+    else if (ret == 0 && object->objClass == CKO_PUBLIC_KEY) {
+        ret = wc_MlKemKey_EncodePublicKey(object->data.mlKemKey,
+                                          object->keyData, keyLen);
+    }
+
+    if (ret != 0) {
+        if (object->keyData != NULL)
+            wc_ForceZero(object->keyData, object->keyDataLen);
+        XFREE(object->keyData, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+        object->keyData = NULL;
+        object->keyDataLen = 0;
+    }
+
+    return ret;
+}
+
+/**
+ * Load a ML-KEM key from storage.
+ *
+ * @param [in, out]  object   ML-KEM key object.
+ * @param [in]       tokenId  Id of token this key belongs to.
+ * @param [in]       objId    Id of object for token.
+ * @return  0 on success.
+ * @return  MEMORY_E when dynamic memory allocation fails.
+ * @return  BUFFER_E when loading fails.
+ * @return  NOT_AVAILABLE_E when unable to locate data.
+ */
+static int wp11_Object_Load_MlKemKey(WP11_Object* object, int tokenId,
+                                     int objId)
+{
+    int ret;
+    void* storage = NULL;
+    int storeType;
+
+    if (object->objClass == CKO_PRIVATE_KEY)
+        storeType = WOLFPKCS11_STORE_MLKEMKEY_PRIV;
+    else
+        storeType = WOLFPKCS11_STORE_MLKEMKEY_PUB;
+
+    ret = wp11_storage_open_readonly(storeType, tokenId, objId, &storage);
+    if (ret == 0) {
+        ret = wp11_storage_read_alloc_array(storage, &object->keyData,
+                                            &object->keyDataLen);
+        wp11_storage_close(storage);
+    }
+
+    return ret;
+}
+
+/**
+ * Store a ML-KEM key to storage.
+ *
+ * @param [in]  object   ML-KEM key object.
+ * @param [in]  tokenId  Id of token this key belongs to.
+ * @param [in]  objId    Id of object for token.
+ * @return  0 on success.
+ * @return  MEMORY_E when dynamic memory allocation fails.
+ * @return  BUFFER_E when storing fails.
+ * @return  NOT_AVAILABLE_E when unable to write data.
+ */
+static int wp11_Object_Store_MlKemKey(WP11_Object* object, int tokenId,
+                                      int objId)
+{
+    int ret = 0;
+    void* storage = NULL;
+    int storeType;
+
+    if (object->keyData == NULL) {
+        ret = wp11_Object_Encode_MlKemKey(object);
+        if (ret != 0)
+            return ret;
+    }
+
+    if (object->objClass == CKO_PRIVATE_KEY)
+        storeType = WOLFPKCS11_STORE_MLKEMKEY_PRIV;
+    else
+        storeType = WOLFPKCS11_STORE_MLKEMKEY_PUB;
+
+    ret = wp11_storage_open(storeType, tokenId, objId, object->keyDataLen,
+                            &storage);
+    if (ret == 0) {
+        ret = wp11_storage_write_array(storage, object->keyData,
+                                       object->keyDataLen);
+        wp11_storage_close(storage);
+    }
+
+    return ret;
+}
+#endif /* WOLFPKCS11_MLKEM */
+
+#ifdef WOLFPKCS11_LMS
+/* ===========================================================================
+ * LMS/HSS (RFC 8554): verification and public-key import.
+ *
+ * Verify-only: this build imports raw HSS public keys and verifies
+ * signatures. There is no private-key/keygen/sign or persisted signature
+ * state here. The public key is self-describing, so wolfSSL derives the
+ * parameter set from the key bytes on import; the CKA_HSS_LEVELS /
+ * CKA_HSS_LMS_TYPE / CKA_HSS_LMOTS_TYPE attributes are optional and, when
+ * supplied, are validated against the imported key.
+ * ========================================================================= */
+
+/* Map tree height -> RFC 8554 LMS typecode. Returns 0 on unknown height. */
+static CK_LMS_TYPE wp11_HssHeightToLmsType(int h)
+{
+    switch (h) {
+        case 5:  return CKL_LMS_SHA256_M32_H5;
+        case 10: return CKL_LMS_SHA256_M32_H10;
+        case 15: return CKL_LMS_SHA256_M32_H15;
+        case 20: return CKL_LMS_SHA256_M32_H20;
+        case 25: return CKL_LMS_SHA256_M32_H25;
+        default: return 0;
+    }
+}
+
+/* Map Winternitz -> LMOTS typecode. Returns 0 on unknown. */
+static CK_LMOTS_TYPE wp11_HssWToLmotsType(int w)
+{
+    switch (w) {
+        case 1: return CKL_LMOTS_SHA256_N32_W1;
+        case 2: return CKL_LMOTS_SHA256_N32_W2;
+        case 4: return CKL_LMOTS_SHA256_N32_W4;
+        case 8: return CKL_LMOTS_SHA256_N32_W8;
+        default: return 0;
+    }
+}
+
+/* Import a raw HSS public key into the given wolfSSL LmsKey. wolfSSL derives
+ * the parameter set from the key bytes (RFC 8554 self-describing public key),
+ * so no parameters need to be set first. On failure the (partially
+ * initialized) key is NOT freed here; the caller owns it. */
+static int wp11_HssImportPub(LmsKey* key, int devId, const byte* pub,
+    word32 pubLen)
+{
+    int ret;
+
+    ret = wc_LmsKey_Init(key, NULL, devId);
+    if (ret == 0)
+        ret = wc_LmsKey_ImportPubRaw(key, pub, pubLen);
+    return ret;
+}
+
+/* Validate caller-supplied HSS parameter attributes against the parameters
+ * wolfSSL derived from the just-imported public key. Per the PKCS#11 v3.3 HSS
+ * profile the public-key parameters are the individual CK_ULONG attributes
+ * CKA_HSS_LEVELS, CKA_HSS_LMS_TYPE (top-level tree height encoding) and
+ * CKA_HSS_LMOTS_TYPE (Winternitz encoding). Each is optional; a supplied value
+ * that does not match the key is rejected with BAD_FUNC_ARG. levelsAttr,
+ * lmsAttr and lmotsAttr are the raw attribute buffers (NULL when absent) with
+ * lengths levelsLen/lmsLen/lmotsLen. */
+static int wp11_HssCheckParamAttrs(LmsKey* key,
+    const byte* levelsAttr, word32 levelsLen,
+    const byte* lmsAttr, word32 lmsLen,
+    const byte* lmotsAttr, word32 lmotsLen)
+{
+    int ret, levels = 0, height = 0, winternitz = 0;
+    CK_ULONG v;
+
+    ret = wc_LmsKey_GetParameters(key, &levels, &height, &winternitz);
+    if (ret != 0)
+        return ret;
+    if (levelsAttr != NULL) {
+        if (levelsLen != sizeof(v))
+            return BAD_FUNC_ARG;
+        XMEMCPY(&v, levelsAttr, sizeof(v));
+        if (v != (CK_ULONG)levels)
+            return BAD_FUNC_ARG;
+    }
+    if (lmsAttr != NULL) {
+        if (lmsLen != sizeof(v))
+            return BAD_FUNC_ARG;
+        XMEMCPY(&v, lmsAttr, sizeof(v));
+        if (v != (CK_ULONG)wp11_HssHeightToLmsType(height))
+            return BAD_FUNC_ARG;
+    }
+    if (lmotsAttr != NULL) {
+        if (lmotsLen != sizeof(v))
+            return BAD_FUNC_ARG;
+        XMEMCPY(&v, lmotsAttr, sizeof(v));
+        if (v != (CK_ULONG)wp11_HssWToLmotsType(winternitz))
+            return BAD_FUNC_ARG;
+    }
+    return 0;
+}
+
+/* Serialize the public key: keyData holds the raw RFC 8554 HSS public key. */
+static int wp11_Object_Encode_HssKey(WP11_Object* object)
+{
+    int ret;
+    word32 pubLen = 0;
+
+    if (object->objClass != CKO_PUBLIC_KEY)
+        return NOT_AVAILABLE_E;  /* verify-only: no private-key objects */
+
+    ret = wc_LmsKey_GetPubLen(object->data.lmsKey, &pubLen);
+    if (ret == 0) {
+        XFREE(object->keyData, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+        object->keyData = (unsigned char*)XMALLOC(pubLen, NULL,
+            DYNAMIC_TYPE_TMP_BUFFER);
+        if (object->keyData == NULL)
+            ret = MEMORY_E;
+    }
+    if (ret == 0) {
+        ret = wc_LmsKey_ExportPubRaw(object->data.lmsKey, object->keyData,
+            &pubLen);
+        if (ret == 0)
+            object->keyDataLen = (int)pubLen;
+    }
+    /* On failure release the buffer so a later store does not skip re-encoding
+     * (keyData != NULL) and persist an uninitialised buffer with a stale
+     * length. This is public key material only, so no zeroization is needed. */
+    if (ret != 0) {
+        XFREE(object->keyData, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+        object->keyData = NULL;
+        object->keyDataLen = 0;
+    }
+    return ret;
+}
+
+/* Reconstruct the live wolfSSL key from the serialized public key in keyData. */
+static int wp11_Object_Decode_HssKey(WP11_Object* object)
+{
+    int ret;
+
+    if (object->objClass != CKO_PUBLIC_KEY)
+        return NOT_AVAILABLE_E;
+
+    /* Reload from the stored raw public key; wolfSSL re-derives the parameter
+     * set from the key bytes (no separate parameters are persisted). */
+    ret = wp11_HssImportPub(object->data.lmsKey, object->devId,
+        object->keyData, (word32)object->keyDataLen);
+    /* The object owns the live key on all paths (the import helper never frees
+     * it), so encoded stays 0 for WP11_Object_Free to do the single free. */
+    object->encoded = 0;
+    return ret;
+}
+
+static int wp11_Object_Load_HssKey(WP11_Object* object, int tokenId, int objId)
+{
+    int ret;
+    void* storage = NULL;
+
+    ret = wp11_storage_open_readonly(WOLFPKCS11_STORE_HSSKEY_PUB, tokenId,
+        objId, &storage);
+    if (ret == 0) {
+        ret = wp11_storage_read_alloc_array(storage, &object->keyData,
+            &object->keyDataLen);
+        wp11_storage_close(storage);
+    }
+    return ret;
+}
+
+static int wp11_Object_Store_HssKey(WP11_Object* object, int tokenId, int objId)
+{
+    int ret = 0;
+    void* storage = NULL;
+
+    if (object->keyData == NULL)
+        ret = wp11_Object_Encode_HssKey(object);
+    if (ret == 0)
+        ret = wp11_storage_open(WOLFPKCS11_STORE_HSSKEY_PUB, tokenId, objId,
+            object->keyDataLen, &storage);
+    if (ret == 0) {
+        ret = wp11_storage_write_array(storage, object->keyData,
+            object->keyDataLen);
+        wp11_storage_close(storage);
+    }
+    return ret;
+}
+
+/* Import an HSS public key from a C_CreateObject template. Following the
+ * PKCS#11 v3.3 HSS profile the collected attributes are data[0]=CKA_HSS_LEVELS,
+ * data[1]=CKA_HSS_LMS_TYPE, data[2]=CKA_HSS_LMOTS_TYPE (all optional CK_ULONG)
+ * and data[3]=CKA_VALUE, the raw RFC 8554 public key. wolfSSL derives the
+ * parameter set from the key bytes; any supplied CKA_HSS_* attribute is
+ * validated against the derived parameters and a mismatch is rejected.
+ * Private-key import is rejected: caller-supplied stateful private material is
+ * a forgery vector and out of scope for verify-only support. */
+int WP11_Object_SetHssKey(WP11_Object* object, unsigned char** data,
+                          CK_ULONG* len)
+{
+    int ret = 0;
+    LmsKey* newKey = NULL;
+
+    if (object == NULL || data == NULL || len == NULL)
+        return BAD_FUNC_ARG;
+    if (object->objClass != CKO_PUBLIC_KEY)
+        return BAD_FUNC_ARG;
+    /* A public key must carry its value. There is no keygen path in a
+     * verify-only build that would populate it later, so an absent
+     * CKA_VALUE is an incomplete template rather than a deferred import;
+     * reject it instead of creating an unusable object. */
+    if (data[3] == NULL)
+        return BAD_FUNC_ARG;
+
+    if (object->onToken)
+        WP11_Lock_LockRW(object->lock);
+
+    /* Import into a temporary key and swap it in only after it fully validates,
+     * so a failed re-import (C_SetAttributeValue with a new CKA_VALUE) leaves
+     * the existing key unchanged as PKCS#11 requires. */
+    newKey = (LmsKey*)XMALLOC(sizeof(LmsKey), NULL, DYNAMIC_TYPE_KEY);
+    if (newKey == NULL)
+        ret = MEMORY_E;
+    if (ret == 0) {
+        XMEMSET(newKey, 0, sizeof(LmsKey));
+        ret = wp11_HssImportPub(newKey, object->devId, data[3],
+            (word32)len[3]);
+    }
+    if (ret == 0) {
+        ret = wp11_HssCheckParamAttrs(newKey, data[0], (word32)len[0],
+            data[1], (word32)len[1], data[2], (word32)len[2]);
+    }
+    if (ret == 0) {
+        /* Replace the live key and drop the cached serialization so a later
+         * store re-encodes from the new key instead of persisting stale bytes. */
+        if (object->data.lmsKey != NULL) {
+            if (!object->encoded)
+                wc_LmsKey_Free(object->data.lmsKey);
+            XFREE(object->data.lmsKey, NULL, DYNAMIC_TYPE_KEY);
+        }
+        object->data.lmsKey = newKey;
+        object->encoded = 0;
+        newKey = NULL;
+        XFREE(object->keyData, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+        object->keyData = NULL;
+        object->keyDataLen = 0;
+    }
+    if (newKey != NULL) {
+        wc_LmsKey_Free(newKey);
+        XFREE(newKey, NULL, DYNAMIC_TYPE_KEY);
+    }
+
+    if (object->onToken)
+        WP11_Lock_UnlockRW(object->lock);
+    return ret;
+}
+
+/* Verify an HSS signature over a raw message. Stateless on the verifier. */
+int WP11_Hss_Verify(unsigned char* sig, word32 sigLen, unsigned char* data,
+                    word32 dataLen, int* stat, WP11_Object* pub)
+{
+    int ret;
+    word32 expSigLen = 0;
+
+    if (pub == NULL || pub->data.lmsKey == NULL || stat == NULL)
+        return BAD_FUNC_ARG;
+
+    /* Verification only reads the key: wc_LmsKey_Verify works from a locally
+     * allocated LmsState, so a shared RO lock is safe for concurrent verifies
+     * on the same token object. */
+    if (pub->onToken)
+        WP11_Lock_LockRO(pub->lock);
+
+    /* A signature whose length does not match the key's parameter set cannot
+     * be valid; report it as an invalid signature (stat = 0 ->
+     * CKR_SIGNATURE_INVALID) rather than letting wolfSSL's length check
+     * surface as a function failure. */
+    if (wc_LmsKey_GetSigLen(pub->data.lmsKey, &expSigLen) == 0 &&
+            sigLen != expSigLen) {
+        *stat = 0;
+        ret = 0;
+    }
+    else {
+        /* Unlike XMSS, whose wolfSSL verify rejects a zero-length message with
+         * BAD_FUNC_ARG, wc_LmsKey_Verify accepts an empty message, so HSS needs
+         * no dataLen == 0 special-case here (see WP11_Xmss_Verify). */
+        ret = wc_LmsKey_Verify(pub->data.lmsKey, sig, sigLen, data,
+            (int)dataLen);
+        /* Only a genuine verification mismatch (SIG_VERIFY_E) maps to stat=0.
+         * Remaining argument/state errors surface as a function failure so
+         * they are not silently reported as an invalid signature. */
+        if (ret == 0) {
+            *stat = 1;
+        }
+        else if (ret == SIG_VERIFY_E) {
+            *stat = 0;
+            ret = 0;
+        }
+        else {
+            *stat = 0;
+        }
+    }
+
+    if (pub->onToken)
+        WP11_Lock_UnlockRO(pub->lock);
+
+    return ret;
+}
+
+/* Serve HSS-specific attributes from a public-key object. */
+static int HssObject_GetAttr(WP11_Object* object, CK_ATTRIBUTE_TYPE type,
+                             byte* data, CK_ULONG* len)
+{
+    int ret = 0;
+    int levels = 0, height = 0, winternitz = 0;
+
+    if (object == NULL || object->data.lmsKey == NULL || len == NULL)
+        return BAD_FUNC_ARG;
+
+    switch (type) {
+        case CKA_HSS_LEVELS: {
+            CK_ULONG v;
+            ret = wc_LmsKey_GetParameters(object->data.lmsKey, &levels,
+                &height, &winternitz);
+            if (ret == 0) {
+                v = (CK_ULONG)levels;
+                if (data == NULL)
+                    *len = sizeof(v);
+                else if (*len < sizeof(v)) {
+                    *len = sizeof(v);
+                    ret = BUFFER_E;
+                }
+                else {
+                    XMEMCPY(data, &v, sizeof(v));
+                    *len = sizeof(v);
+                }
+            }
+            break;
+        }
+        case CKA_HSS_LMS_TYPE: {
+            CK_LMS_TYPE v;
+            ret = wc_LmsKey_GetParameters(object->data.lmsKey, &levels,
+                &height, &winternitz);
+            if (ret == 0) {
+                v = wp11_HssHeightToLmsType(height);
+                if (v == 0)
+                    ret = NOT_AVAILABLE_E;
+                else if (data == NULL)
+                    *len = sizeof(v);
+                else if (*len < sizeof(v)) {
+                    *len = sizeof(v);
+                    ret = BUFFER_E;
+                }
+                else {
+                    XMEMCPY(data, &v, sizeof(v));
+                    *len = sizeof(v);
+                }
+            }
+            break;
+        }
+        case CKA_HSS_LMOTS_TYPE: {
+            CK_LMOTS_TYPE v;
+            ret = wc_LmsKey_GetParameters(object->data.lmsKey, &levels,
+                &height, &winternitz);
+            if (ret == 0) {
+                v = wp11_HssWToLmotsType(winternitz);
+                if (v == 0)
+                    ret = NOT_AVAILABLE_E;
+                else if (data == NULL)
+                    *len = sizeof(v);
+                else if (*len < sizeof(v)) {
+                    *len = sizeof(v);
+                    ret = BUFFER_E;
+                }
+                else {
+                    XMEMCPY(data, &v, sizeof(v));
+                    *len = sizeof(v);
+                }
+            }
+            break;
+        }
+        case CKA_HSS_LMS_TYPES:
+        case CKA_HSS_LMOTS_TYPES: {
+            /* wolfSSL uses uniform LMS/LMOTS parameters across all HSS levels, so
+             * every array entry is the top-level type. Per-level types (allowed
+             * by the PKCS#11 v3.3 profile) are not expressible by wolfSSL and are
+             * not supported here. */
+            CK_ULONG total;
+            CK_ULONG fill;
+            int i;
+            ret = wc_LmsKey_GetParameters(object->data.lmsKey, &levels,
+                &height, &winternitz);
+            if (ret == 0) {
+                total = (CK_ULONG)(sizeof(CK_ULONG) * levels);
+                fill = (type == CKA_HSS_LMS_TYPES)
+                    ? wp11_HssHeightToLmsType(height)
+                    : wp11_HssWToLmotsType(winternitz);
+                if (fill == 0)
+                    ret = NOT_AVAILABLE_E;
+                else if (data == NULL)
+                    *len = total;
+                else if (*len < total) {
+                    *len = total;
+                    ret = BUFFER_E;
+                }
+                else {
+                    for (i = 0; i < levels; i++)
+                        XMEMCPY(data + i * sizeof(CK_ULONG), &fill,
+                            sizeof(CK_ULONG));
+                    *len = total;
+                }
+            }
+            break;
+        }
+        case CKA_HSS_KEYS_REMAINING:
+            /* Remaining-signature count is a private-key/state property; not
+             * available in a verify-only build. Return NOT_AVAILABLE_E like the
+             * default arm; C_GetAttributeValue then sets ulValueLen. */
+            ret = NOT_AVAILABLE_E;
+            break;
+        case CKA_VALUE:
+            if (object->objClass == CKO_PUBLIC_KEY) {
+                word32 pubLen = 0;
+                ret = wc_LmsKey_GetPubLen(object->data.lmsKey, &pubLen);
+                if (ret == 0) {
+                    if (data == NULL)
+                        *len = pubLen;
+                    else if (*len < pubLen) {
+                        *len = pubLen;
+                        ret = BUFFER_E;
+                    }
+                    else {
+                        ret = wc_LmsKey_ExportPubRaw(object->data.lmsKey,
+                            data, &pubLen);
+                        if (ret == 0)
+                            *len = pubLen;
+                    }
+                }
+            }
+            else {
+                *len = CK_UNAVAILABLE_INFORMATION;
+                ret = NOT_AVAILABLE_E;
+            }
+            break;
+        default:
+            ret = NOT_AVAILABLE_E;
+            break;
+    }
+    return ret;
+}
+
+/* Validate a supplied CKA_HSS_LMS_TYPES / CKA_HSS_LMOTS_TYPES array against the
+ * imported public key. wolfSSL uses uniform LMS/LMOTS parameters across all HSS
+ * levels, so a conforming array holds one CK_ULONG per level, each equal to the
+ * single top-level type served by HssObject_GetAttr. A wrong length or any
+ * differing entry is rejected so a malformed or mismatched template is not
+ * silently accepted; a matching array (as read back from this key) is accepted.
+ * Returns 0 when the array matches, BAD_FUNC_ARG otherwise. The caller holds the
+ * object lock. */
+static int wp11_HssCheckTypesAttr(WP11_Object* object, CK_ATTRIBUTE_TYPE type,
+                                  const byte* data, CK_ULONG len)
+{
+    int ret;
+    int levels = 0;
+    int height = 0;
+    int winternitz = 0;
+    int i;
+    CK_ULONG expected;
+    CK_ULONG entry;
+
+    if (object->data.lmsKey == NULL || data == NULL)
+        return BAD_FUNC_ARG;
+
+    ret = wc_LmsKey_GetParameters(object->data.lmsKey, &levels, &height,
+        &winternitz);
+    if (ret != 0)
+        return ret;
+
+    expected = (type == CKA_HSS_LMS_TYPES)
+        ? (CK_ULONG)wp11_HssHeightToLmsType(height)
+        : (CK_ULONG)wp11_HssWToLmotsType(winternitz);
+    if (expected == 0)
+        return BAD_FUNC_ARG;
+    if (len != (CK_ULONG)(sizeof(CK_ULONG) * levels))
+        return BAD_FUNC_ARG;
+
+    for (i = 0; i < levels; i++) {
+        XMEMCPY(&entry, data + i * sizeof(CK_ULONG), sizeof(entry));
+        if (entry != expected)
+            return BAD_FUNC_ARG;
+    }
+
+    return 0;
+}
+#endif /* WOLFPKCS11_LMS */
+
+#ifdef WOLFPKCS11_XMSS
+/* ===========================================================================
+ * XMSS/XMSS^MT (RFC 8391): verification and public-key import.
+ *
+ * Verify-only. One wolfSSL XmssKey type serves both XMSS and XMSS^MT; the
+ * PKCS#11 key type (CKK_XMSS vs CKK_XMSSMT) selects which via the is_xmssmt
+ * flag. The raw public key carries the parameter-set OID in its leading
+ * bytes, so wc_XmssKey_ImportPubRaw_ex derives the parameter set on import.
+ * A CKA_PARAMETER_SET attribute is optional and, when supplied, is validated
+ * against the OID in the key.
+ * ========================================================================= */
+
+/* Length of the parameter-set OID prefix in a raw RFC 8391 public key. wolfSSL
+ * only exposes XMSS_OID_LEN when built with WOLFSSL_HAVE_XMSS and it is absent
+ * from some released headers, so define our own to keep the build independent
+ * of the wolfSSL version. */
+#define WP11_XMSS_OID_LEN 4
+
+/* Big-endian 32-bit read from a byte buffer (used to read the XMSS OID). */
+static word32 wp11_HbsReadU32(const byte* p)
+{
+    return ((word32)p[0] << 24) | ((word32)p[1] << 16)
+         | ((word32)p[2] << 8)  |  (word32)p[3];
+}
+
+/* Import a raw XMSS/XMSS^MT public key into the given wolfSSL XmssKey, deriving
+ * the parameter set from the embedded OID. is_xmssmt disambiguates the XMSS and
+ * XMSS^MT OID namespaces (which overlap) and comes from the PKCS#11 key type.
+ * When the caller supplies a CKA_PARAMETER_SET (params != NULL, the OID as a
+ * CK_ULONG) it must match the OID in the public key. On failure the key is NOT
+ * freed here; the caller owns it. */
+static int wp11_XmssImportPub(XmssKey* key, int is_xmssmt, int devId,
+    const byte* pub, word32 pubLen, const byte* params, word32 paramsLen)
+{
+    int ret;
+
+    ret = wc_XmssKey_Init(key, NULL, devId);
+    if (ret == 0 && params != NULL) {
+        CK_ULONG userOid;
+        if (paramsLen != sizeof(CK_ULONG) || pubLen < WP11_XMSS_OID_LEN) {
+            ret = BAD_FUNC_ARG;
+        }
+        else {
+            XMEMCPY(&userOid, params, sizeof(userOid));
+            if (userOid != (CK_ULONG)wp11_HbsReadU32(pub))
+                ret = BAD_FUNC_ARG;
+        }
+    }
+    if (ret == 0)
+        ret = wc_XmssKey_ImportPubRaw_ex(key, pub, pubLen, is_xmssmt);
+    return ret;
+}
+
+/* Serialize the public key: keyData holds the raw RFC 8391 public key. */
+static int wp11_Object_Encode_XmssKey(WP11_Object* object)
+{
+    int ret;
+    word32 pubLen = 0;
+
+    if (object->objClass != CKO_PUBLIC_KEY)
+        return NOT_AVAILABLE_E;
+
+    ret = wc_XmssKey_GetPubLen(object->data.xmssKey, &pubLen);
+    if (ret == 0) {
+        XFREE(object->keyData, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+        object->keyData = (unsigned char*)XMALLOC(pubLen, NULL,
+            DYNAMIC_TYPE_TMP_BUFFER);
+        if (object->keyData == NULL)
+            ret = MEMORY_E;
+    }
+    if (ret == 0) {
+        ret = wc_XmssKey_ExportPubRaw(object->data.xmssKey, object->keyData,
+            &pubLen);
+        if (ret == 0)
+            object->keyDataLen = (int)pubLen;
+    }
+    /* On failure release the buffer so a later store does not skip re-encoding
+     * (keyData != NULL) and persist an uninitialised buffer with a stale
+     * length. This is public key material only, so no zeroization is needed. */
+    if (ret != 0) {
+        XFREE(object->keyData, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+        object->keyData = NULL;
+        object->keyDataLen = 0;
+    }
+    return ret;
+}
+
+static int wp11_Object_Decode_XmssKey(WP11_Object* object)
+{
+    int ret;
+
+    if (object->objClass != CKO_PUBLIC_KEY)
+        return NOT_AVAILABLE_E;
+
+    /* Reload from the stored raw public key; wolfSSL re-derives the parameter
+     * set from the embedded OID (no separate parameter set is persisted). */
+    ret = wp11_XmssImportPub(object->data.xmssKey,
+        (object->type == CKK_XMSSMT) ? 1 : 0, object->devId, object->keyData,
+        (word32)object->keyDataLen, NULL, 0);
+    /* Object owns the key on all paths; encoded stays 0 for the single free in
+     * WP11_Object_Free. See wp11_Object_Decode_HssKey. */
+    object->encoded = 0;
+    return ret;
+}
+
+static int wp11_Object_Load_XmssKey(WP11_Object* object, int tokenId, int objId)
+{
+    int ret;
+    void* storage = NULL;
+
+    ret = wp11_storage_open_readonly(WOLFPKCS11_STORE_XMSSKEY_PUB, tokenId,
+        objId, &storage);
+    if (ret == 0) {
+        ret = wp11_storage_read_alloc_array(storage, &object->keyData,
+            &object->keyDataLen);
+        wp11_storage_close(storage);
+    }
+    return ret;
+}
+
+static int wp11_Object_Store_XmssKey(WP11_Object* object, int tokenId,
+    int objId)
+{
+    int ret = 0;
+    void* storage = NULL;
+
+    if (object->keyData == NULL)
+        ret = wp11_Object_Encode_XmssKey(object);
+    if (ret == 0)
+        ret = wp11_storage_open(WOLFPKCS11_STORE_XMSSKEY_PUB, tokenId, objId,
+            object->keyDataLen, &storage);
+    if (ret == 0) {
+        ret = wp11_storage_write_array(storage, object->keyData,
+            object->keyDataLen);
+        wp11_storage_close(storage);
+    }
+    return ret;
+}
+
+/* Import an XMSS/XMSS^MT public key from a C_CreateObject template. data[1] is
+ * the raw RFC 8391 public key; data[0] (CKA_PARAMETER_SET, the OID as a
+ * CK_ULONG) is optional and, when present, is validated against the key.
+ * Private-key import is rejected. */
+int WP11_Object_SetXmssKey(WP11_Object* object, unsigned char** data,
+                           CK_ULONG* len)
+{
+    int ret = 0;
+    XmssKey* newKey = NULL;
+
+    if (object == NULL || data == NULL || len == NULL)
+        return BAD_FUNC_ARG;
+    if (object->objClass != CKO_PUBLIC_KEY)
+        return BAD_FUNC_ARG;
+    /* A public key must carry its value; an absent CKA_VALUE is an
+     * incomplete template (no keygen path fills it later). Reject it. */
+    if (data[1] == NULL)
+        return BAD_FUNC_ARG;
+
+    if (object->onToken)
+        WP11_Lock_LockRW(object->lock);
+
+    /* Import into a temporary key and swap it in only after it validates, so a
+     * failed re-import leaves the existing key unchanged (PKCS#11 requires a
+     * failed C_SetAttributeValue to be a no-op). */
+    newKey = (XmssKey*)XMALLOC(sizeof(XmssKey), NULL, DYNAMIC_TYPE_KEY);
+    if (newKey == NULL)
+        ret = MEMORY_E;
+    if (ret == 0) {
+        XMEMSET(newKey, 0, sizeof(XmssKey));
+        ret = wp11_XmssImportPub(newKey, (object->type == CKK_XMSSMT) ? 1 : 0,
+            object->devId, data[1], (word32)len[1], data[0], (word32)len[0]);
+    }
+    if (ret == 0) {
+        /* Replace the live key and drop the cached serialization so a later
+         * store re-encodes from the new key. */
+        if (object->data.xmssKey != NULL) {
+            if (!object->encoded)
+                wc_XmssKey_Free(object->data.xmssKey);
+            XFREE(object->data.xmssKey, NULL, DYNAMIC_TYPE_KEY);
+        }
+        object->data.xmssKey = newKey;
+        object->encoded = 0;
+        newKey = NULL;
+        XFREE(object->keyData, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+        object->keyData = NULL;
+        object->keyDataLen = 0;
+    }
+    if (newKey != NULL) {
+        wc_XmssKey_Free(newKey);
+        XFREE(newKey, NULL, DYNAMIC_TYPE_KEY);
+    }
+
+    if (object->onToken)
+        WP11_Lock_UnlockRW(object->lock);
+    return ret;
+}
+
+/* Verify an XMSS/XMSS^MT signature over a raw message. Stateless. */
+int WP11_Xmss_Verify(unsigned char* sig, word32 sigLen, unsigned char* data,
+                     word32 dataLen, int* stat, WP11_Object* pub)
+{
+    int ret;
+    word32 expSigLen = 0;
+
+    if (pub == NULL || pub->data.xmssKey == NULL || stat == NULL)
+        return BAD_FUNC_ARG;
+
+    /* Verification only reads the key: wc_XmssKey_Verify works from a locally
+     * allocated XmssState, so a shared RO lock is safe for concurrent verifies
+     * on the same token object. */
+    if (pub->onToken)
+        WP11_Lock_LockRO(pub->lock);
+
+    /* A wrong-length signature cannot be valid for this key; report it as an
+     * invalid signature rather than a function failure. wolfSSL's XMSS verify
+     * also rejects a zero-length message with BAD_FUNC_ARG; treat that the same
+     * way (an invalid verification, not an internal failure). */
+    if (wc_XmssKey_GetSigLen(pub->data.xmssKey, &expSigLen) == 0 &&
+            sigLen != expSigLen) {
+        *stat = 0;
+        ret = 0;
+    }
+    else if (dataLen == 0) {
+        *stat = 0;
+        ret = 0;
+    }
+    else {
+        ret = wc_XmssKey_Verify(pub->data.xmssKey, sig, sigLen, data,
+            (int)dataLen);
+        /* Only SIG_VERIFY_E maps to stat=0; other argument/state errors
+         * surface as a function failure so they are not silently reported as
+         * an invalid signature. */
+        if (ret == 0) {
+            *stat = 1;
+        }
+        else if (ret == SIG_VERIFY_E) {
+            *stat = 0;
+            ret = 0;
+        }
+        else {
+            *stat = 0;
+        }
+    }
+
+    if (pub->onToken)
+        WP11_Lock_UnlockRO(pub->lock);
+
+    return ret;
+}
+
+/* Serve XMSS-specific attributes from a public-key object. */
+static int XmssObject_GetAttr(WP11_Object* object, CK_ATTRIBUTE_TYPE type,
+                              byte* data, CK_ULONG* len)
+{
+    int ret = 0;
+
+    if (object == NULL || object->data.xmssKey == NULL || len == NULL)
+        return BAD_FUNC_ARG;
+
+    switch (type) {
+        case CKA_VALUE:
+            if (object->objClass == CKO_PUBLIC_KEY) {
+                word32 pubLen = 0;
+                ret = wc_XmssKey_GetPubLen(object->data.xmssKey, &pubLen);
+                if (ret == 0) {
+                    if (data == NULL)
+                        *len = pubLen;
+                    else if (*len < pubLen) {
+                        *len = pubLen;
+                        ret = BUFFER_E;
+                    }
+                    else {
+                        ret = wc_XmssKey_ExportPubRaw(object->data.xmssKey,
+                            data, &pubLen);
+                        if (ret == 0)
+                            *len = pubLen;
+                    }
+                }
+            }
+            else {
+                *len = CK_UNAVAILABLE_INFORMATION;
+                ret = NOT_AVAILABLE_E;
+            }
+            break;
+        case CKA_PARAMETER_SET: {
+            /* The XMSS parameter set is identified by the OID in the leading
+             * bytes of the raw public key; return it as a CK_ULONG. */
+            CK_ULONG v;
+            word32 pubLen = 0;
+            byte* raw;
+
+            if (object->objClass != CKO_PUBLIC_KEY) {
+                *len = CK_UNAVAILABLE_INFORMATION;
+                ret = NOT_AVAILABLE_E;
+                break;
+            }
+            if (data == NULL) {
+                *len = sizeof(v);
+                break;
+            }
+            if (*len < sizeof(v)) {
+                *len = sizeof(v);
+                ret = BUFFER_E;
+                break;
+            }
+            ret = wc_XmssKey_GetPubLen(object->data.xmssKey, &pubLen);
+            if (ret == 0 && pubLen < WP11_XMSS_OID_LEN)
+                ret = NOT_AVAILABLE_E;
+            if (ret == 0) {
+                raw = (byte*)XMALLOC(pubLen, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+                if (raw == NULL) {
+                    ret = MEMORY_E;
+                }
+                else {
+                    ret = wc_XmssKey_ExportPubRaw(object->data.xmssKey, raw,
+                        &pubLen);
+                    if (ret == 0) {
+                        v = (CK_ULONG)wp11_HbsReadU32(raw);
+                        XMEMCPY(data, &v, sizeof(v));
+                        *len = sizeof(v);
+                    }
+                    XFREE(raw, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+                }
+            }
+            break;
+        }
+        default:
+            ret = NOT_AVAILABLE_E;
+            break;
+    }
+    return ret;
+}
+#endif /* WOLFPKCS11_XMSS */
+
 /**
  * Decode the symmetric key - requires decryption.
  *
@@ -4442,7 +6265,15 @@ static int wp11_Object_Decode_SymmKey(WP11_Object* object)
 {
     int ret = 0;
 
-    if (object->keyDataLen - AES_BLOCK_SIZE > WP11_MAX_SYM_KEY_SZ)
+    /* keyDataLen is signed and covers the encrypted payload plus the trailing
+     * AES_BLOCK_SIZE tag. Reject lengths below the tag so the payload length
+     * below cannot go negative when used as an unsigned length. A length of
+     * exactly AES_BLOCK_SIZE is a valid zero-byte secret: the encoder writes
+     * symmKey->len + AES_BLOCK_SIZE, so a zero-length key must still load. */
+    if (object->keyDataLen < AES_BLOCK_SIZE)
+        ret = BAD_FUNC_ARG;
+    if (ret == 0 &&
+            (word32)(object->keyDataLen - AES_BLOCK_SIZE) > WP11_MAX_SYM_KEY_SZ)
         ret = BUFFER_E;
     if (ret == 0) {
         ret = wp11_DecryptData(object->data.symmKey->data, object->keyData,
@@ -4710,13 +6541,37 @@ static int wp11_Object_Load(WP11_Object* object, int tokenId, int objId)
                     ret = wp11_Object_Load_EccKey(object, tokenId, objId);
                     break;
             #endif
+            #ifdef WOLFPKCS11_MLDSA
+                case CKK_ML_DSA:
+                    ret = wp11_Object_Load_MldsaKey(object, tokenId, objId);
+                    break;
+            #endif
             #ifndef NO_DH
                 case CKK_DH:
                     ret = wp11_Object_Load_DhKey(object, tokenId, objId);
                     break;
             #endif
+            #ifdef WOLFPKCS11_MLKEM
+                case CKK_ML_KEM:
+                    ret = wp11_Object_Load_MlKemKey(object, tokenId, objId);
+                    break;
+            #endif
+            #ifdef WOLFPKCS11_LMS
+                case CKK_HSS:
+                    ret = wp11_Object_Load_HssKey(object, tokenId, objId);
+                    break;
+            #endif
+            #ifdef WOLFPKCS11_XMSS
+                case CKK_XMSS:
+                case CKK_XMSSMT:
+                    ret = wp11_Object_Load_XmssKey(object, tokenId, objId);
+                    break;
+            #endif
             #ifndef NO_AES
                 case CKK_AES:
+            #endif
+            #ifdef WOLFPKCS11_HKDF
+                case CKK_HKDF:
             #endif
                 case CKK_GENERIC_SECRET:
                     ret = wp11_Object_Load_SymmKey(object, tokenId, objId);
@@ -4848,14 +6703,6 @@ static int wp11_Object_Store(WP11_Object* object, int tokenId, int objId)
     /* Open access to key object. */
     ret = wp11_Object_Store_Object(object, tokenId, objId);
 
-    if (ret == 0 && object->keyData == NULL &&
-            (object->objClass == CKO_PRIVATE_KEY ||
-               object->type == CKK_AES ||
-               object->type == CKK_GENERIC_SECRET)) {
-        /* Generate new IV if needed */
-        ret = wc_RNG_GenerateBlock(&object->slot->token.rng, object->iv,
-                                                            sizeof(object->iv));
-    }
     if (ret == 0) {
         if (object->objClass == CKO_CERTIFICATE) {
             ret = wp11_Object_Store_Cert(object, tokenId, objId);
@@ -4881,13 +6728,37 @@ static int wp11_Object_Store(WP11_Object* object, int tokenId, int objId)
                     ret = wp11_Object_Store_EccKey(object, tokenId, objId);
                     break;
             #endif
+            #ifdef WOLFPKCS11_MLDSA
+                case CKK_ML_DSA:
+                    ret = wp11_Object_Store_MldsaKey(object, tokenId, objId);
+                    break;
+            #endif
             #ifndef NO_DH
                 case CKK_DH:
                     ret = wp11_Object_Store_DhKey(object, tokenId, objId);
                     break;
             #endif
+            #ifdef WOLFPKCS11_MLKEM
+                case CKK_ML_KEM:
+                    ret = wp11_Object_Store_MlKemKey(object, tokenId, objId);
+                    break;
+            #endif
+            #ifdef WOLFPKCS11_LMS
+                case CKK_HSS:
+                    ret = wp11_Object_Store_HssKey(object, tokenId, objId);
+                    break;
+            #endif
+            #ifdef WOLFPKCS11_XMSS
+                case CKK_XMSS:
+                case CKK_XMSSMT:
+                    ret = wp11_Object_Store_XmssKey(object, tokenId, objId);
+                    break;
+            #endif
             #ifndef NO_AES
                 case CKK_AES:
+            #endif
+            #ifdef WOLFPKCS11_HKDF
+                case CKK_HKDF:
             #endif
                 case CKK_GENERIC_SECRET:
                     ret = wp11_Object_Store_SymmKey(object, tokenId, objId);
@@ -4941,13 +6812,37 @@ static int wp11_Object_Decode(WP11_Object* object)
                 ret = wp11_Object_Decode_EccKey(object);
                 break;
         #endif
+        #ifdef WOLFPKCS11_MLDSA
+            case CKK_ML_DSA:
+                ret = wp11_Object_Decode_MldsaKey(object);
+                break;
+        #endif
         #ifndef NO_DH
             case CKK_DH:
                 ret = wp11_Object_Decode_DhKey(object);
                 break;
         #endif
+        #ifdef WOLFPKCS11_MLKEM
+            case CKK_ML_KEM:
+                ret = wp11_Object_Decode_MlKemKey(object);
+                break;
+        #endif
+        #ifdef WOLFPKCS11_LMS
+            case CKK_HSS:
+                ret = wp11_Object_Decode_HssKey(object);
+                break;
+        #endif
+        #ifdef WOLFPKCS11_XMSS
+            case CKK_XMSS:
+            case CKK_XMSSMT:
+                ret = wp11_Object_Decode_XmssKey(object);
+                break;
+        #endif
         #ifndef NO_AES
             case CKK_AES:
+        #endif
+        #ifdef WOLFPKCS11_HKDF
+            case CKK_HKDF:
         #endif
             case CKK_GENERIC_SECRET:
                 ret = wp11_Object_Decode_SymmKey(object);
@@ -4972,7 +6867,7 @@ static int wp11_Object_Decode(WP11_Object* object)
  * @return  0 on success.
  * @return  -ve on failure.
  */
-static int wp11_Object_Encode(WP11_Object* object, int protect)
+static int wp11_Object_EncodeData(WP11_Object* object, int protect)
 {
     int ret;
 
@@ -5006,22 +6901,54 @@ static int wp11_Object_Encode(WP11_Object* object, int protect)
                 }
                 break;
         #endif
+        #ifdef WOLFPKCS11_MLDSA
+            case CKK_ML_DSA:
+                ret = wp11_Object_Encode_MldsaKey(object);
+                if (protect && ret == 0 && object->objClass == CKO_PRIVATE_KEY) {
+                    wc_MlDsaKey_Free(object->data.mldsaKey);
+                    object->encoded = 1;
+                }
+                break;
+        #endif
         #ifndef NO_DH
             case CKK_DH:
                 ret = wp11_Object_Encode_DhKey(object);
                 if (protect && ret == 0 && object->objClass == CKO_PRIVATE_KEY) {
-                    XMEMSET(object->data.dhKey->key, 0, object->data.dhKey->len);
+                    wc_ForceZero(object->data.dhKey->key, object->data.dhKey->len);
                     object->encoded = 1;
                 }
+                break;
+        #endif
+        #ifdef WOLFPKCS11_MLKEM
+            case CKK_ML_KEM:
+                ret = wp11_Object_Encode_MlKemKey(object);
+                if (protect && ret == 0 && object->objClass == CKO_PRIVATE_KEY) {
+                    wc_MlKemKey_Free(object->data.mlKemKey);
+                    object->encoded = 1;
+                }
+                break;
+        #endif
+        #ifdef WOLFPKCS11_LMS
+            case CKK_HSS:
+                ret = wp11_Object_Encode_HssKey(object);
+                break;
+        #endif
+        #ifdef WOLFPKCS11_XMSS
+            case CKK_XMSS:
+            case CKK_XMSSMT:
+                ret = wp11_Object_Encode_XmssKey(object);
                 break;
         #endif
         #ifndef NO_AES
             case CKK_AES:
         #endif
+        #ifdef WOLFPKCS11_HKDF
+            case CKK_HKDF:
+        #endif
             case CKK_GENERIC_SECRET:
                 ret = wp11_Object_Encode_SymmKey(object);
                 if (protect && ret == 0) {
-                    XMEMSET(object->data.symmKey->data, 0, object->data.symmKey->len);
+                    wc_ForceZero(object->data.symmKey->data, object->data.symmKey->len);
                     object->encoded = 1;
                 }
                 break;
@@ -5029,6 +6956,32 @@ static int wp11_Object_Encode(WP11_Object* object, int protect)
                 ret = NOT_AVAILABLE_E;
         }
     }
+
+    return ret;
+}
+
+static int wp11_Object_Encode(WP11_Object* object, int protect)
+{
+    int ret = 0;
+    int encrypt = object->objClass == CKO_PRIVATE_KEY ||
+                  object->type == CKK_AES ||
+                  object->type == CKK_GENERIC_SECRET;
+
+#ifdef WOLFPKCS11_HKDF
+    encrypt = encrypt || object->type == CKK_HKDF;
+#endif
+
+    /* Every AES-GCM encryption under the token key needs a fresh nonce. Do
+     * this immediately before encoding, while the plaintext is still the
+     * source of the ciphertext that will be persisted. */
+    if (encrypt) {
+        WP11_Lock_LockRW(&object->slot->token.rngLock);
+        ret = wc_RNG_GenerateBlock(&object->slot->token.rng, object->iv,
+                                   sizeof(object->iv));
+        WP11_Lock_UnlockRW(&object->slot->token.rngLock);
+    }
+    if (ret == 0)
+        ret = wp11_Object_EncodeData(object, protect);
 
     return ret;
 }
@@ -5088,6 +7041,14 @@ static int wp11_Object_Unstore(WP11_Object* object, int tokenId, int objId)
                 storeObjType = WOLFPKCS11_STORE_ECCKEY_PUB;
             break;
     #endif
+    #ifdef WOLFPKCS11_MLDSA
+        case CKK_ML_DSA:
+            if (object->objClass == CKO_PRIVATE_KEY)
+                storeObjType = WOLFPKCS11_STORE_MLDSAKEY_PRIV;
+            else
+                storeObjType = WOLFPKCS11_STORE_MLDSAKEY_PUB;
+            break;
+    #endif
     #ifndef NO_DH
         case CKK_DH:
             if (object->objClass == CKO_PRIVATE_KEY)
@@ -5096,8 +7057,30 @@ static int wp11_Object_Unstore(WP11_Object* object, int tokenId, int objId)
                 storeObjType = WOLFPKCS11_STORE_DHKEY_PUB;
             break;
     #endif
+    #ifdef WOLFPKCS11_MLKEM
+        case CKK_ML_KEM:
+            if (object->objClass == CKO_PRIVATE_KEY)
+                storeObjType = WOLFPKCS11_STORE_MLKEMKEY_PRIV;
+            else
+                storeObjType = WOLFPKCS11_STORE_MLKEMKEY_PUB;
+            break;
+    #endif
+    #ifdef WOLFPKCS11_LMS
+        case CKK_HSS:
+            storeObjType = WOLFPKCS11_STORE_HSSKEY_PUB;
+            break;
+    #endif
+    #ifdef WOLFPKCS11_XMSS
+        case CKK_XMSS:
+        case CKK_XMSSMT:
+            storeObjType = WOLFPKCS11_STORE_XMSSKEY_PUB;
+            break;
+    #endif
     #ifndef NO_AES
         case CKK_AES:
+    #endif
+    #ifdef WOLFPKCS11_HKDF
+        case CKK_HKDF:
     #endif
         case CKK_GENERIC_SECRET:
             storeObjType = WOLFPKCS11_STORE_SYMMKEY;
@@ -5125,7 +7108,14 @@ static int wp11_Token_Init(WP11_Token* token, const char* label)
     if (ret == 0)
         ret = Rng_New(&globalRandom, &globalLock, &token->rng);
     if (ret == 0) {
-        token->state = WP11_TOKEN_STATE_INITIALIZED;
+        /* Do not set token->state = WP11_TOKEN_STATE_INITIALIZED here.
+         * wp11_Slot_Init calls this on every fresh slot, and the state must
+         * stay UNKNOWN until either C_InitToken provisions the token
+         * (WP11_Slot_TokenReset) or wp11_Token_Load successfully reads a
+         * persisted token. Otherwise C_GetTokenInfo would advertise
+         * CKF_TOKEN_INITIALIZED on a token that was never provisioned, and
+         * applications using that flag to skip provisioning would proceed
+         * with an unconfigured token (Fenrir 3407). */
         token->loginState = WP11_APP_STATE_RW_PUBLIC;
         token->nextObjId = 1;
         XMEMCPY(token->label, label, sizeof(token->label));
@@ -5791,6 +7781,12 @@ static int wp11_Slot_Load(WP11_Slot* slot, int id)
  */
 static int wp11_Slot_Store(WP11_Slot* slot, int id)
 {
+    /* Only persist tokens that have been explicitly provisioned. Otherwise
+     * a C_Initialize / C_Finalize cycle on a never-init'd slot would write
+     * a placeholder token file, which a subsequent C_Initialize would then
+     * load and treat as INITIALIZED (Fenrir 3407 regression). */
+    if (slot->token.state != WP11_TOKEN_STATE_INITIALIZED)
+        return 0;
     return wp11_Token_Store(&slot->token, id);
 }
 #endif
@@ -5807,6 +7803,15 @@ int WP11_Library_Init(void)
 {
     int ret = 0;
     int i;
+
+#ifdef WP11_HAVE_LIBRARY_INIT_LOCK
+    /* Serialize the entire init sequence: both the libraryInitCount==0
+     * check and globalLock construction must happen under a permanently
+     * live mutex so two concurrent C_Initialize calls don't both enter
+     * the construction branch. */
+    if (wc_LockMutex(&libraryInitLock) != 0)
+        return BAD_MUTEX_E;
+#endif
 
     if (libraryInitCount == 0) {
         ret = WP11_Lock_Init(&globalLock);
@@ -5847,6 +7852,10 @@ int WP11_Library_Init(void)
         WP11_Lock_UnlockRW(&globalLock);
     }
 
+#ifdef WP11_HAVE_LIBRARY_INIT_LOCK
+    wc_UnLockMutex(&libraryInitLock);
+#endif
+
     return ret;
 }
 
@@ -5858,6 +7867,14 @@ void WP11_Library_Final(void)
 {
     int i;
     int cnt;
+
+#ifdef WP11_HAVE_LIBRARY_INIT_LOCK
+    /* Hold the init lock across the count decrement and the conditional
+     * WP11_Lock_Free so a racing WP11_Library_IsInitialized can't observe
+     * count>0, then call WP11_Lock_LockRO on a freed globalLock. */
+    if (wc_LockMutex(&libraryInitLock) != 0)
+        return;
+#endif
 
     WP11_Lock_LockRW(&globalLock);
     cnt = --libraryInitCount;
@@ -5875,8 +7892,22 @@ void WP11_Library_Final(void)
             (void)ret; /* store failure cannot be returned, so log and ignore */
         }
 #if !defined (WOLFPKCS11_CUSTOM_STORE) && defined(WOLFPKCS11_NSS)
-        XFREE(storeDir, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-        storeDir = NULL;
+        /* Serialize the free against a concurrent WP11_SetStoreDir /
+         * wolfPKCS11_Store_Name (F-5868, F-5150). Nested inside libraryInitLock
+         * (held here); storeDirLock is a leaf so the fixed order
+         * libraryInitLock -> storeDirLock cannot deadlock. */
+        {
+#ifdef WP11_HAVE_STORE_DIR_LOCK
+            int storeDirLocked = (wc_LockMutex(&storeDirLock) == 0);
+#endif
+            XFREE(storeDir, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+            storeDir = NULL;
+#ifdef WP11_HAVE_STORE_DIR_LOCK
+            /* Only unlock if the lock was actually acquired. */
+            if (storeDirLocked)
+                wc_UnLockMutex(&storeDirLock);
+#endif
+        }
 #endif
 #endif
         /* Cleanup the slots. */
@@ -5887,6 +7918,10 @@ void WP11_Library_Final(void)
         WP11_Lock_Free(&globalLock);
         wolfCrypt_Cleanup();
     }
+
+#ifdef WP11_HAVE_LIBRARY_INIT_LOCK
+    wc_UnLockMutex(&libraryInitLock);
+#endif
 }
 
 /**
@@ -5897,7 +7932,25 @@ void WP11_Library_Final(void)
  */
 int WP11_Library_IsInitialized(void)
 {
-    int ret, locked = 0;
+    int ret;
+#ifdef WP11_HAVE_LIBRARY_INIT_LOCK
+    /* Read libraryInitCount and lock globalLock under the init mutex so a
+     * racing WP11_Library_Final can't free globalLock between the count
+     * check and WP11_Lock_LockRO. */
+    if (wc_LockMutex(&libraryInitLock) != 0)
+        return 0;
+    if (libraryInitCount > 0) {
+        WP11_Lock_LockRO(&globalLock);
+        ret = libraryInitCount > 0;
+        WP11_Lock_UnlockRO(&globalLock);
+    }
+    else {
+        ret = 0;
+    }
+    wc_UnLockMutex(&libraryInitLock);
+    return ret;
+#else
+    int locked = 0;
     if (libraryInitCount > 0) {
         /* cannot used globalLock before init */
         WP11_Lock_LockRO(&globalLock);
@@ -5908,6 +7961,7 @@ int WP11_Library_IsInitialized(void)
         WP11_Lock_UnlockRO(&globalLock);
     }
     return ret;
+#endif
 }
 
 /**
@@ -5946,8 +8000,13 @@ int WP11_GetSlotList(int tokenIn, CK_SLOT_ID* slotIdList, CK_ULONG* count)
 
     if (slotIdList == NULL)
         *count = slotCnt;
-    else if ((int)*count < slotCnt)
+    else if ((int)*count < slotCnt) {
+        /* PKCS#11 spec: report the required size so the caller can resize
+         * and retry. Without this, callers using the standard two-call size
+         * query pattern stall at BUFFER_TOO_SMALL. */
+        *count = slotCnt;
         ret = BUFFER_E;
+    }
     else {
         for (i = 0; i < slotCnt && i < (int)*count; i++)
             slotIdList[i] = i + 1;
@@ -6047,10 +8106,25 @@ int WP11_Slot_OpenSession(WP11_Slot* slot, unsigned long flags, void* app,
 void WP11_Slot_CloseSession(WP11_Slot* slot, WP11_Session* session)
 {
     int dynamic;
+    int stillLinked = 0;
     int noMore = 1;
     WP11_Session* curr;
 
     WP11_Lock_LockRW(&slot->lock);
+    /* Two threads holding the same session pointer (e.g. two C_CloseSession
+     * calls with the same handle) can both pass the lock-free WP11_Session_Get
+     * lookup. Re-validate inside the slot lock that the session is still in
+     * the list before doing anything with it. */
+    for (curr = slot->session; curr != NULL; curr = curr->next) {
+        if (curr == session) {
+            stillLinked = 1;
+            break;
+        }
+    }
+    if (!stillLinked) {
+        WP11_Lock_UnlockRW(&slot->lock);
+        return;
+    }
     /* Only free the session object if it is on top and there is more than the
      * minimum number of sessions associated with the slot.
      */
@@ -6084,16 +8158,26 @@ void WP11_Slot_CloseSessions(WP11_Slot* slot)
 {
     WP11_Session* curr;
 
+    /* Hold the slot lock across the entire walk so a concurrent
+     * C_OpenSession / C_CloseSession can't mutate slot->session between
+     * the NULL test and the free, or unlink the head we're about to free.
+     */
+    WP11_Lock_LockRW(&slot->lock);
     /* Free all sessions down to minimum. */
     while (slot->session != NULL &&
             SESS_HANDLE_SESS_ID(slot->session->handle) > WP11_SESSION_CNT_MIN) {
         wp11_Slot_FreeSession(slot, slot->session);
     }
-    WP11_Lock_LockRW(&slot->lock);
     /* Finalize the rest. */
     for (curr = slot->session; curr != NULL; curr = curr->next)
-        wp11_Session_Final(slot->session);
+        wp11_Session_Final(curr);
     WP11_Lock_UnlockRW(&slot->lock);
+
+    /* PKCS#11: closing an application's last session with a token logs the
+     * application out. Mirror the single-session close path and reset the
+     * token login state (outside the slot lock, as WP11_Slot_Logout takes it).
+     */
+    WP11_Slot_Logout(slot);
 }
 
 /**
@@ -6162,6 +8246,21 @@ static int HashPIN(char* pin, int pinLen, byte* seed, int seedLen, byte* hash,
                                     WP11_HASH_PIN_COST, WP11_HASH_PIN_BLOCKSIZE,
                                     WP11_HASH_PIN_PARALLEL, hashLen);
 #elif !defined(NO_SHA256)
+    /* Fallback: unsalted single-pass SHA-256 of the PIN. This provides no
+     * salt (the per-token seed is discarded) and no key stretching, so an
+     * attacker with the token-store file can brute-force a weak PIN offline
+     * and recover the token storage key. Configure WOLFPKCS11_PBKDF2 or
+     * HAVE_SCRYPT for a salted, stretched KDF. The selection is compile-time
+     * and otherwise silent, so warn integrators unless they opt out (F-6232).
+     * Note: changing this derivation would invalidate existing token stores,
+     * so hardening it in place is left as a deliberate maintainer decision. */
+#ifndef WOLFPKCS11_ALLOW_WEAK_PIN_KDF
+    #if defined(_MSC_VER)
+        #pragma message("wolfPKCS11: no PBKDF2/scrypt - PIN hashing and token key derivation use unsalted SHA-256; define WOLFPKCS11_PBKDF2 or HAVE_SCRYPT for a strong KDF, or WOLFPKCS11_ALLOW_WEAK_PIN_KDF to silence")
+    #elif defined(__GNUC__) || defined(__clang__)
+        #warning "wolfPKCS11: no PBKDF2/scrypt - PIN hashing and token key derivation use unsalted SHA-256; define WOLFPKCS11_PBKDF2 or HAVE_SCRYPT for a strong KDF, or WOLFPKCS11_ALLOW_WEAK_PIN_KDF to silence"
+    #endif
+#endif
     /* fallback to simple SHA2-256 hash of pin */
     (void)seed;
     (void)seedLen;
@@ -6200,6 +8299,10 @@ int WP11_Slot_TokenReset(WP11_Slot* slot, char* pin, int pinLen, char* label)
     token = &slot->token;
     wp11_Token_Final(token);
     wp11_Token_Init(token, label);
+    /* C_InitToken is the canonical provisioning step. Mark the token as
+     * initialized here rather than in wp11_Token_Init so a fresh slot stays
+     * UNKNOWN until either init or load (Fenrir 3407). */
+    token->state = WP11_TOKEN_STATE_INITIALIZED;
     WP11_Lock_UnlockRW(&slot->lock);
 
     /* Locking used in setting SO PIN. */
@@ -6228,13 +8331,28 @@ int WP11_Slot_CheckSOPin(WP11_Slot* slot, char* pin, int pinLen)
     WP11_Lock_LockRO(&slot->lock);
     token = &slot->token;
 
-    if (token->state != WP11_TOKEN_STATE_INITIALIZED)
-        ret = PIN_NOT_SET_E;
-    /* NSS PK11_InitPin tries to login with an empty pin before setting the pin.
-     * This is effectively a public access, so should be OK.
-     */
+    /* When the SO PIN has not been set, reject any PIN check; otherwise an
+     * empty PIN would constant-compare equal to the unset zero-length
+     * stored PIN and grant SO authentication. NSS's PK11_InitPin bootstraps
+     * a fresh database by calling C_Login(CKU_SO, "", 0) before any SO PIN
+     * exists and relies on that probe succeeding, so for NSS builds the
+     * empty-PIN path is left intact and only non-empty PINs are rejected.
+     *
+     * The redundant state-vs-INITIALIZED check that used to sit above this
+     * block was harmless when wp11_Token_Init unconditionally pre-marked
+     * fresh slots INITIALIZED, but now (Fenrir 3407) a fresh slot stays
+     * UNKNOWN until provisioning - and the NSS bootstrap needs the empty-PIN
+     * probe to succeed against an UNKNOWN-state token. The SO_PIN_SET flag
+     * is the authoritative signal here: it is set during the same
+     * WP11_Slot_TokenReset call that flips state to INITIALIZED, so any
+     * scenario the old state check would have caught is also caught here. */
+#ifdef WOLFPKCS11_NSS
     if (!(token->tokenFlags & WP11_TOKEN_FLAG_SO_PIN_SET) && pinLen > 0)
         ret = PIN_NOT_SET_E;
+#else
+    if (!(token->tokenFlags & WP11_TOKEN_FLAG_SO_PIN_SET))
+        ret = PIN_NOT_SET_E;
+#endif
 
     if (ret == 0) {
         WP11_Lock_UnlockRO(&slot->lock);
@@ -6248,6 +8366,78 @@ int WP11_Slot_CheckSOPin(WP11_Slot* slot, char* pin, int pinLen)
     if (ret == 0 && !WP11_ConstantCompare(hash, token->soPin, token->soPinLen))
         ret = PIN_INVALID_E;
     WP11_Lock_UnlockRO(&slot->lock);
+
+    wc_ForceZero(hash, sizeof(hash));
+
+    return ret;
+}
+
+/**
+ * Check the SO PIN with the failed-login lockout applied, but without logging
+ * in. C_InitToken must verify the SO PIN before wiping the token, and the
+ * verification needs the same WP11_MAX_LOGIN_FAILS_SO brute-force lockout that
+ * WP11_Slot_SOLogin enforces (Fenrir F-4632). Unlike WP11_Slot_SOLogin this
+ * does NOT set loginState or reject open read-only sessions: C_InitToken is not
+ * a login and re-initializes the token immediately afterwards, so those side
+ * effects would be wrong here.
+ *
+ * When WOLFPKCS11_NO_TIME is defined there is no lockout state to maintain and
+ * this collapses to a plain WP11_Slot_CheckSOPin, matching the historical
+ * behaviour exactly.
+ *
+ * @param  slot    [in]  Slot object.
+ * @param  pin     [in]  PIN to check.
+ * @param  pinLen  [in]  Length of PIN.
+ * @return  PIN_NOT_SET_E when the token is not initialized.
+ *          PIN_INVALID_E when the PIN is not correct or the SO is locked out.
+ *          Other -ve value when hashing PIN fails.
+ *          0 when PIN is correct.
+ */
+int WP11_Slot_CheckSOPinLockout(WP11_Slot* slot, char* pin, int pinLen)
+{
+    int ret;
+#ifndef WOLFPKCS11_NO_TIME
+    time_t now;
+    time_t allowed;
+
+    if (wc_GetTime(&now, sizeof(now)) != 0)
+        return PIN_INVALID_E;
+
+    /* Check for too many fails and whether the timeout has elapsed. */
+    WP11_Lock_LockRW(&slot->lock);
+    if (slot->token.soFailedLogin == WP11_MAX_LOGIN_FAILS_SO) {
+        allowed = slot->token.soLastFailedLogin +
+                                                 slot->token.soFailLoginTimeout;
+        if (allowed < now)
+            slot->token.soFailedLogin = 0;
+        else {
+            WP11_Lock_UnlockRW(&slot->lock);
+            return PIN_INVALID_E;
+        }
+    }
+    WP11_Lock_UnlockRW(&slot->lock);
+#endif
+
+    ret = WP11_Slot_CheckSOPin(slot, pin, pinLen);
+
+#ifndef WOLFPKCS11_NO_TIME
+    WP11_Lock_LockRW(&slot->lock);
+    /* PIN failed - update failure info. */
+    if (ret == PIN_INVALID_E) {
+        slot->token.soFailedLogin++;
+        if (slot->token.soFailedLogin == WP11_MAX_LOGIN_FAILS_SO) {
+            slot->token.soLastFailedLogin = now;
+            slot->token.soFailLoginTimeout += WP11_SO_LOGIN_FAIL_TIMEOUT;
+        }
+    }
+    /* Worked - clear failure info. */
+    else if (ret == 0) {
+        slot->token.soFailedLogin = 0;
+        slot->token.soLastFailedLogin = 0;
+        slot->token.soFailLoginTimeout = 0;
+    }
+    WP11_Lock_UnlockRW(&slot->lock);
+#endif
 
     return ret;
 }
@@ -6271,8 +8461,10 @@ int WP11_Slot_CheckUserPin(WP11_Slot* slot, char* pin, int pinLen)
 
     WP11_Lock_LockRO(&slot->lock);
     token = &slot->token;
-    if (token->state != WP11_TOKEN_STATE_INITIALIZED)
-        ret = PIN_NOT_SET_E;
+    /* USER_PIN_SET is the authoritative signal; the redundant
+     * state-vs-INITIALIZED check that used to sit above was harmless under
+     * the old eager-INITIALIZED semantics but now (Fenrir 3407) would
+     * spuriously reject probes on UNKNOWN-state fresh tokens. */
     if (!(token->tokenFlags & WP11_TOKEN_FLAG_USER_PIN_SET))
         ret = PIN_NOT_SET_E;
 
@@ -6289,6 +8481,8 @@ int WP11_Slot_CheckUserPin(WP11_Slot* slot, char* pin, int pinLen)
             !WP11_ConstantCompare(hash, token->userPin, token->userPinLen))
         ret = PIN_INVALID_E;
     WP11_Lock_UnlockRO(&slot->lock);
+
+    wc_ForceZero(hash, sizeof(hash));
 
     return ret;
 }
@@ -6321,11 +8515,15 @@ int WP11_Slot_SOLogin(WP11_Slot* slot, char* pin, int pinLen)
 
     WP11_Lock_LockRO(&slot->lock);
     if (ret == 0) {
-        /* Have we already logged in? */
+        /* SO already logged in is the same user type; a logged-in USER is a
+         * different one. */
         state = slot->token.loginState;
-        if (state == WP11_APP_STATE_RW_SO || state == WP11_APP_STATE_RO_USER ||
-                                              state == WP11_APP_STATE_RW_USER) {
+        if (state == WP11_APP_STATE_RW_SO) {
             ret = LOGGED_IN_E;
+        }
+        else if (state == WP11_APP_STATE_RO_USER ||
+                 state == WP11_APP_STATE_RW_USER) {
+            ret = LOGGED_IN_ANOTHER_E;
         }
     }
 #ifndef WOLFPKCS11_NO_TIME
@@ -6417,13 +8615,16 @@ int WP11_Slot_UserLogin(WP11_Slot* slot, char* pin, int pinLen)
 #endif
 
     WP11_Lock_LockRW(&slot->lock);
-    /* Have we already logged in? */
     if (ret == 0) {
-        /* Have we already logged in? */
+        /* USER already logged in is the same user type; a logged-in SO is a
+         * different one. */
         state = token->loginState;
-        if (state == WP11_APP_STATE_RW_SO || state == WP11_APP_STATE_RO_USER ||
-                                              state == WP11_APP_STATE_RW_USER) {
+        if (state == WP11_APP_STATE_RO_USER ||
+            state == WP11_APP_STATE_RW_USER) {
             ret = LOGGED_IN_E;
+        }
+        else if (state == WP11_APP_STATE_RW_SO) {
+            ret = LOGGED_IN_ANOTHER_E;
         }
     }
 #ifndef WOLFPKCS11_NO_TIME
@@ -6593,6 +8794,49 @@ int WP11_Slot_SetUserPin(WP11_Slot* slot, char* pin, int pinLen)
  *
  * @param  slot  [in]  Slot object referencing token.
  */
+/**
+ * Check whether any user is logged in to the token.
+ *
+ * @param  slot  [in]  Slot object referencing token.
+ * @return  1 when a user (SO or normal) is logged in.
+ *          0 when no user is logged in (public session).
+ */
+int WP11_Slot_IsLoggedIn(WP11_Slot* slot)
+{
+    int state;
+
+    WP11_Lock_LockRO(&slot->lock);
+    state = slot->token.loginState;
+    WP11_Lock_UnlockRO(&slot->lock);
+
+    return (state != WP11_APP_STATE_RO_PUBLIC &&
+            state != WP11_APP_STATE_RW_PUBLIC);
+}
+
+static int wp11_LoginStateIsUser(int state)
+{
+    return (state == WP11_APP_STATE_RO_USER ||
+            state == WP11_APP_STATE_RW_USER);
+}
+
+/**
+ * Check whether the normal user is logged in to the token.
+ *
+ * @param  slot  [in]  Slot object referencing token.
+ * @return  1 when the normal user is logged in.
+ *          0 when the session is public or the SO is logged in.
+ */
+int WP11_Slot_IsUserLoggedIn(WP11_Slot* slot)
+{
+    int state;
+
+    WP11_Lock_LockRO(&slot->lock);
+    state = slot->token.loginState;
+    WP11_Lock_UnlockRO(&slot->lock);
+
+    return wp11_LoginStateIsUser(state);
+}
+
 void WP11_Slot_Logout(WP11_Slot* slot)
 {
 #ifndef WOLFPKCS11_NO_STORE
@@ -6610,12 +8854,43 @@ void WP11_Slot_Logout(WP11_Slot* slot)
             ret = wp11_Object_Encode(object, 1);
             object = object->next;
         }
+        /* Zero token key only on user logout — SO logout must preserve it
+         * for subsequent object encryption (e.g., empty-PIN flow). */
+        wc_ForceZero(slot->token.key, sizeof(slot->token.key));
     }
 #endif
     slot->token.loginState = WP11_APP_STATE_RW_PUBLIC;
 
     WP11_Lock_UnlockRW(&slot->lock);
 }
+
+#ifdef DEBUG_WOLFPKCS11
+/**
+ * Test hook: report whether a slot's token object-encryption key is zeroized.
+ * Exposed only in debug builds so a white-box test can observe the logout
+ * scrub that has no PKCS#11-visible effect.
+ *
+ * @param  slotId  [in]  Slot id (1-based, as used by the PKCS#11 API).
+ * @return  1 when the key buffer is all zero, 0 when any byte is set,
+ *          -1 on a bad slot id.
+ */
+WP11_API int WP11_Slot_TokenKeyIsZero(CK_SLOT_ID slotId)
+{
+    WP11_Slot* slot = NULL;
+    size_t i;
+    byte acc = 0;
+
+    if (WP11_Slot_Get(slotId, &slot) != 0 || slot == NULL)
+        return -1;
+
+    WP11_Lock_LockRO(&slot->lock);
+    for (i = 0; i < sizeof(slot->token.key); i++)
+        acc |= slot->token.key[i];
+    WP11_Lock_UnlockRO(&slot->lock);
+
+    return acc == 0 ? 1 : 0;
+}
+#endif /* DEBUG_WOLFPKCS11 */
 
 /**
  * Retrieve the token's label.
@@ -6793,10 +9068,106 @@ int WP11_Session_IsOpInitialized(WP11_Session* session, int init)
     return (session->init & ~WP11_INIT_DIGEST_MASK) == init;
 }
 
+/**
+ * Get the operation category for an init value.
+ *
+ * @param  init  [in]  Init value (with digest bits masked out).
+ * @return  Operation category (WP11_OP_*), or -1 if unknown.
+ */
+static int wp11_init_get_op_category(int init)
+{
+    switch (init) {
+        case WP11_INIT_AES_CBC_ENC:
+        case WP11_INIT_AES_GCM_ENC:
+        case WP11_INIT_AES_CBC_PAD_ENC:
+        case WP11_INIT_AES_CCM_ENC:
+        case WP11_INIT_AES_ECB_ENC:
+        case WP11_INIT_AES_CTS_ENC:
+        case WP11_INIT_AES_CTR_ENC:
+        case WP11_INIT_RSA_X_509_ENC:
+        case WP11_INIT_RSA_PKCS_ENC:
+        case WP11_INIT_RSA_PKCS_OAEP_ENC:
+        case WP11_INIT_AES_KEYWRAP_ENC:
+            return WP11_OP_ENCRYPT;
+
+        case WP11_INIT_AES_CBC_DEC:
+        case WP11_INIT_AES_GCM_DEC:
+        case WP11_INIT_AES_CBC_PAD_DEC:
+        case WP11_INIT_AES_CCM_DEC:
+        case WP11_INIT_AES_ECB_DEC:
+        case WP11_INIT_AES_CTS_DEC:
+        case WP11_INIT_AES_CTR_DEC:
+        case WP11_INIT_RSA_X_509_DEC:
+        case WP11_INIT_RSA_PKCS_DEC:
+        case WP11_INIT_RSA_PKCS_OAEP_DEC:
+        case WP11_INIT_AES_KEYWRAP_DEC:
+            return WP11_OP_DECRYPT;
+
+        case WP11_INIT_DIGEST:
+            return WP11_OP_DIGEST;
+
+        case WP11_INIT_HMAC_SIGN:
+        case WP11_INIT_RSA_PKCS_SIGN:
+        case WP11_INIT_RSA_PKCS_PSS_SIGN:
+        case WP11_INIT_RSA_X_509_SIGN:
+        case WP11_INIT_ECDSA_SIGN:
+        case WP11_INIT_AES_CMAC_SIGN:
+        case WP11_INIT_TLS_MAC_SIGN:
+        case WP11_INIT_MLDSA_SIGN:
+            return WP11_OP_SIGN;
+
+        case WP11_INIT_HMAC_VERIFY:
+        case WP11_INIT_RSA_PKCS_VERIFY:
+        case WP11_INIT_RSA_PKCS_PSS_VERIFY:
+        case WP11_INIT_RSA_X_509_VERIFY:
+        case WP11_INIT_RSA_PKCS_VERIFY_RECOVER:
+        case WP11_INIT_RSA_X_509_VERIFY_RECOVER:
+        case WP11_INIT_ECDSA_VERIFY:
+        case WP11_INIT_AES_CMAC_VERIFY:
+        case WP11_INIT_TLS_MAC_VERIFY:
+        case WP11_INIT_MLDSA_VERIFY:
+#ifdef WOLFPKCS11_LMS
+        case WP11_INIT_HSS_VERIFY:
+#endif
+#ifdef WOLFPKCS11_XMSS
+        case WP11_INIT_XMSS_VERIFY:
+#endif
+            return WP11_OP_VERIFY;
+
+        default:
+            return -1;
+    }
+}
+
+/**
+ * Check whether the session has an active operation of the given category.
+ * Per PKCS#11 spec, only operations of the same type block re-initialization.
+ *
+ * @param  session     [in]  Session object.
+ * @param  opCategory  [in]  Operation category (WP11_OP_*).
+ * @return  1 when an operation of the same category is active.
+ *          0 otherwise.
+ */
+int WP11_Session_IsOpCategoryActive(WP11_Session* session, int opCategory)
+{
+    int currentInit;
+
+    if (session->init == 0)
+        return 0;
+
+    currentInit = session->init & ~WP11_INIT_DIGEST_MASK;
+    return wp11_init_get_op_category(currentInit) == opCategory;
+}
+
 int WP11_Session_UpdateData(WP11_Session *session, byte *data, word32 dataLen)
 {
     int ret = 0;
     byte* tmp;
+
+    /* Guard the cumulative word32 sum against silent wrap that would lead to
+     * a tiny allocation followed by an oversized XMEMCPY past it. */
+    if (dataLen > (word32)0xFFFFFFFFu - session->dataSz)
+        return MEMORY_E;
 
 #ifdef XREALLOC
     tmp = (byte*)XREALLOC(session->data, session->dataSz + dataLen, NULL,
@@ -7011,6 +9382,17 @@ WP11_Slot* WP11_Session_GetSlot(WP11_Session* session)
 }
 
 /**
+ * Get the slot id associated with the session.
+ *
+ * @param  session  [in]  Session object.
+ * @return  Slot id.
+ */
+CK_SLOT_ID WP11_Session_GetSlotId(WP11_Session* session)
+{
+    return session->slotId;
+}
+
+/**
  * Get the mechanism associated with the session.
  *
  * @param  session  [in]  Session object.
@@ -7034,7 +9416,7 @@ void WP11_Session_SetMechanism(WP11_Session* session,
 }
 
 #if !defined(NO_RSA) || !defined(WC_NO_RSA_OAEP) || defined(WC_RSA_PSS) || \
-    defined(WOLFPKCS11_HKDF)
+    defined(WOLFPKCS11_HKDF) || defined(WOLFPKCS11_MLDSA)
 /**
  * Convert the digest mechanism to a hash type for wolfCrypt.
  *
@@ -7069,6 +9451,11 @@ static int wp11_hash_type(CK_MECHANISM_TYPE hashMech,
         case CKM_SHA512_HMAC:
             *hashType = WC_HASH_TYPE_SHA512;
             break;
+    #ifndef WOLFSSL_NOSHA512_256
+        case CKM_SHA512_256:
+            *hashType = WC_HASH_TYPE_SHA512_256;
+            break;
+    #endif
         case CKM_SHA3_224:
             *hashType = WC_HASH_TYPE_SHA3_224;
             break;
@@ -7149,6 +9536,9 @@ int WP11_Session_SetOaepParams(WP11_Session* session, CK_MECHANISM_TYPE hashAlg,
     int ret;
     WP11_OaepParams* oaep = &session->params.oaep;
 
+    if (session->mechanism == CKM_RSA_PKCS_OAEP && oaep->label != NULL) {
+        XFREE(oaep->label, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+    }
     XMEMSET(oaep, 0, sizeof(*oaep));
     ret = wp11_hash_type(hashAlg, &oaep->hashType);
     if (ret == 0)
@@ -7201,6 +9591,86 @@ int WP11_Session_SetPssParams(WP11_Session* session, CK_MECHANISM_TYPE hashAlg,
 #endif /* WC_RSA_PSS */
 #endif /* !NO_RSA */
 
+#ifdef WOLFPKCS11_MLDSA
+/**
+ * Set the parameters to use for a ML-DSA operation.
+ *
+ * @param  session   [in]  Session object.
+ * @param  params    [in]  Pointer to the parameters (may be NULL).
+ * @param  paramsLen [in]  Length of parameters (may be 0).
+ * @return  BAD_FUNC_ARG when the parameters contain problems.
+ *          0 on success.
+ */
+int WP11_Session_SetMldsaParams(WP11_Session* session, CK_VOID_PTR params,
+                                CK_ULONG paramsLen)
+{
+    int ret = 0;
+    WP11_MldsaParams* mldsa = &session->params.mldsa;
+
+    XMEMSET(mldsa, 0, sizeof(*mldsa));
+
+    if (params != NULL) {
+        if (paramsLen == sizeof(CK_SIGN_ADDITIONAL_CONTEXT)) {
+            CK_SIGN_ADDITIONAL_CONTEXT* ctx =
+                                            (CK_SIGN_ADDITIONAL_CONTEXT*)params;
+
+            /* Copy context if present */
+            if (ctx->pContext != NULL && ctx->ulContextLen > 0) {
+                /* FIPS 204 limits the context length to 255 bytes */
+                if (ctx->ulContextLen > 255) {
+                    ret = BAD_FUNC_ARG;
+                }
+                if (ret == 0) {
+                    XMEMCPY(mldsa->ctx, ctx->pContext, ctx->ulContextLen);
+                    mldsa->ctxSz = ctx->ulContextLen;
+                }
+            }
+            else {
+                mldsa->ctxSz = 0;
+            }
+
+            mldsa->preHashType = WC_HASH_TYPE_NONE;
+            mldsa->hedgeType = (word32)ctx->hedgeVariant;
+        }
+        else if (paramsLen == sizeof(CK_HASH_SIGN_ADDITIONAL_CONTEXT)) {
+            CK_HASH_SIGN_ADDITIONAL_CONTEXT* ctx =
+                                       (CK_HASH_SIGN_ADDITIONAL_CONTEXT*)params;
+
+            /* Copy context if present */
+            if (ctx->pContext != NULL && ctx->ulContextLen > 0) {
+                /* FIPS 204 limits the context length to 255 bytes */
+                if (ctx->ulContextLen > 255) {
+                    ret = BAD_FUNC_ARG;
+                }
+                if (ret == 0) {
+                    XMEMCPY(mldsa->ctx, ctx->pContext, ctx->ulContextLen);
+                    mldsa->ctxSz = ctx->ulContextLen;
+                }
+            }
+            else {
+                mldsa->ctxSz = 0;
+            }
+
+            /* Get hash type */
+            if (ret == 0) {
+                ret = wp11_hash_type(ctx->hash, &mldsa->preHashType);
+            }
+            mldsa->hedgeType = (word32)ctx->hedgeVariant;
+        }
+        else {
+            ret = BAD_FUNC_ARG;
+        }
+    }
+    else {
+        mldsa->preHashType = WC_HASH_TYPE_NONE;
+        mldsa->hedgeType = CKH_HEDGE_PREFERRED;
+        mldsa->ctxSz = 0;
+    }
+
+    return ret;
+}
+#endif /* WOLFPKCS11_MLDSA */
+
 #ifndef NO_AES
 #ifdef HAVE_AES_CBC
 /**
@@ -7219,6 +9689,15 @@ int WP11_Session_SetCbcParams(WP11_Session* session, unsigned char* iv,
     int ret;
     WP11_CbcParams* cbc = &session->params.cbc;
     WP11_Data* key;
+
+    /* The session params union is shared by every mechanism and is only zeroed
+     * at allocation, so a prior operation can leave stale multi-part streaming
+     * state here. Reset it before use (as the other Set*Params routines do) so
+     * a fresh CBC operation cannot inherit a bogus partial-block count. */
+    cbc->partialSz = 0;
+    cbc->finalReady = 0;
+    XMEMSET(cbc->partial, 0, sizeof(cbc->partial));
+    XMEMSET(cbc->final, 0, sizeof(cbc->final));
 
     /* AES object on session. */
     ret = wc_AesInit(&cbc->aes, NULL, object->devId);
@@ -7265,6 +9744,7 @@ int WP11_Session_SetCtrParams(WP11_Session* session, CK_ULONG ulCounterBits,
     if (ulCounterBits > 128 || ulCounterBits == 0)
         return BAD_FUNC_ARG;
 
+    XMEMSET(ctr, 0, sizeof(*ctr));
     ret = wc_AesInit(&ctr->aes, NULL, object->devId);
     if (ret == 0) {
         if (object->onToken)
@@ -7273,6 +9753,10 @@ int WP11_Session_SetCtrParams(WP11_Session* session, CK_ULONG ulCounterBits,
         ret = wc_AesSetKey(&ctr->aes, key->data, key->len, cb, AES_ENCRYPTION);
         if (object->onToken)
             WP11_Lock_UnlockRO(object->lock);
+    }
+    if (ret == 0) {
+        XMEMCPY(ctr->counter, cb, sizeof(ctr->counter));
+        ctr->counterBits = (byte)ulCounterBits;
     }
 
     return ret;
@@ -7329,15 +9813,28 @@ int WP11_Session_SetGcmParams(WP11_Session* session, unsigned char* iv,
     int ret = 0;
     WP11_GcmParams* gcm = &session->params.gcm;
 
-    if (tagBits > 128 || ivSz > WP11_MAX_GCM_NONCE_SZ)
+    if (tagBits > 128 || ivSz < 0 || ivSz > WP11_MAX_GCM_NONCE_SZ)
+        ret = BAD_FUNC_ARG;
+    /* Caller-supplied IV pointer and length must agree: NULL pairs with 0
+     * and only with 0, and a non-NULL buffer must come with a positive
+     * length. Either mismatch is a contract bug. */
+    if (ret == 0 && (iv == NULL) != (ivSz == 0))
+        ret = BAD_FUNC_ARG;
+    /* A NULL AAD pointer must not carry a non-zero length. A non-NULL pointer
+     * with zero length is a valid no-AAD encoding. */
+    if (ret == 0 && aad == NULL && aadLen != 0)
         ret = BAD_FUNC_ARG;
 
     if (ret == 0) {
+        if (session->mechanism == CKM_AES_GCM && gcm->aad != NULL) {
+            XFREE(gcm->aad, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+        }
         XMEMSET(gcm, 0, sizeof(*gcm));
-        XMEMCPY(gcm->iv, iv, ivSz);
+        if (ivSz > 0)
+            XMEMCPY(gcm->iv, iv, ivSz);
         gcm->ivSz = ivSz;
         gcm->tagBits = tagBits;
-        if (aad != NULL) {
+        if (aadLen > 0) {
             gcm->aad = (unsigned char*)XMALLOC(aadLen, NULL,
                 DYNAMIC_TYPE_TMP_BUFFER);
             if (gcm->aad == NULL)
@@ -7376,15 +9873,28 @@ int WP11_Session_SetCcmParams(WP11_Session* session, int dataSz,
     int ret = 0;
     WP11_CcmParams* ccm = &session->params.ccm;
 
-    if (ivSz > WP11_MAX_GCM_NONCE_SZ)
+    if (ivSz < 0 || ivSz > WP11_MAX_GCM_NONCE_SZ)
+        ret = BAD_FUNC_ARG;
+    /* Caller-supplied IV pointer and length must agree: NULL pairs with 0
+     * and only with 0, and a non-NULL buffer must come with a positive
+     * length. Either mismatch is a contract bug. */
+    if (ret == 0 && (iv == NULL) != (ivSz == 0))
+        ret = BAD_FUNC_ARG;
+    /* A NULL AAD pointer must not carry a non-zero length. A non-NULL pointer
+     * with zero length is a valid no-AAD encoding. */
+    if (ret == 0 && aad == NULL && aadSz != 0)
         ret = BAD_FUNC_ARG;
 
     if (ret == 0) {
-        ccm->dataSz = dataSz;
+        if (session->mechanism == CKM_AES_CCM && ccm->aad != NULL) {
+            XFREE(ccm->aad, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+        }
         XMEMSET(ccm, 0, sizeof(*ccm));
-        XMEMCPY(ccm->iv, iv, ivSz);
+        ccm->dataSz = dataSz;
+        if (ivSz > 0)
+            XMEMCPY(ccm->iv, iv, ivSz);
         ccm->ivSz = ivSz;
-        if (aad != NULL) {
+        if (aadSz > 0) {
             ccm->aad = (unsigned char*)XMALLOC(aadSz, NULL,
                 DYNAMIC_TYPE_TMP_BUFFER);
             if (ccm->aad == NULL) {
@@ -7450,6 +9960,12 @@ int WP11_Session_AddObject(WP11_Session* session, int onToken,
     token = &session->slot->token;
     WP11_Lock_LockRW(&token->lock);
     if (onToken) {
+#ifndef WOLFPKCS11_NO_STORE
+        WP11_Object* oldHead = token->object;
+        int oldObjCnt = token->objCnt;
+        int oldNextObjId = token->nextObjId;
+#endif
+
         if (token->objCnt >= WP11_TOKEN_OBJECT_CNT_MAX)
             ret = OBJ_COUNT_E;
     #ifndef WOLFPKCS11_NO_STORE
@@ -7469,6 +9985,14 @@ int WP11_Session_AddObject(WP11_Session* session, int onToken,
     #ifndef WOLFPKCS11_NO_STORE
         if (ret == 0) {
             ret = wp11_Slot_Store(session->slot, (int)session->slotId);
+            if (ret != 0) {
+                token->object = oldHead;
+                token->objCnt = oldObjCnt;
+                token->nextObjId = oldNextObjId;
+                object->handle = CK_INVALID_HANDLE;
+                object->next = NULL;
+                object->lock = NULL;
+            }
         }
     #endif
     }
@@ -7492,51 +10016,122 @@ int WP11_Session_AddObject(WP11_Session* session, int onToken,
 }
 
 /**
- * Remove object to the session or token.
+ * Remove an object from its session or token list, addressing it by a
+ * caller-supplied onToken flag rather than by dereferencing the object.
  *
- * @param  session  [in]  Session object.
- * @param  object   [in]  Key Object object.
- * @return  -ve on failure.
- *          0 on success.
+ * Membership is established by pointer identity alone, so *object is never
+ * dereferenced until it is confirmed still linked (and therefore still alive).
+ * onToken must be derived from the handle (see WP11_Object_HandleOnToken), not
+ * from *object, so it stays valid even after a concurrent caller frees the
+ * object. This is the entry point for C_DestroyObject, where a second thread may
+ * be destroying the same shared token-object handle at the same time.
+ *
+ * Callers that hold the only reference to a live object should use the simpler
+ * WP11_Session_RemoveObject() wrapper instead: it derives onToken from the
+ * object itself and so cannot mismatch onToken against the wrong object.
+ *
+ * @param  session          [in]  Session performing the removal.
+ * @param  object           [in]  Object to remove, matched by pointer identity.
+ * @param  onToken          [in]  Non-zero if the handle names a token object.
+ *                                Derive from the handle, never from *object.
+ * @param  checkDestroyable [in]  Non-zero to honor CKA_DESTROYABLE and refuse to
+ *                                remove an object marked not destroyable.
+ * @return  WP11_OBJECT_ALREADY_REMOVED if the object was no longer linked, i.e.
+ *          a concurrent caller already removed it; the caller must not free it.
+ *          WP11_OBJECT_NOT_DESTROYABLE if checkDestroyable is set and the object
+ *          has CKA_DESTROYABLE = CK_FALSE; the object is left in place and must
+ *          not be freed.
+ *          -ve on a store failure after the object was unlinked.
+ *          0 on success; the caller now owns the object and must free it.
  */
-int WP11_Session_RemoveObject(WP11_Session* session, WP11_Object* object)
+int WP11_Session_RemoveObjectByHandle(WP11_Session* session,
+                                      WP11_Object* object, int onToken,
+                                      int checkDestroyable)
 {
     int ret = 0;
+    int found = 0;
     WP11_Object** curr;
-    WP11_Token* token;
-    int id;
+    WP11_Token* token = &session->slot->token;
+    WP11_Session* owner = session;
+    int id = 0;
 
+    /* The token lock guards every object list on the slot (session lists
+     * included). Take it before touching any list or the object. Token objects
+     * are shared across sessions, so two C_DestroyObject calls on the same
+     * handle can both pass the lock-free WP11_Object_Find and reach here with
+     * the same pointer; the loser must detect that the winner already unlinked
+     * (and is about to free) the object and bail out without a second free.
+     *
+     * Membership is established by pointer identity alone so that *object is
+     * never dereferenced until it is confirmed still linked (and therefore
+     * still alive). onToken comes from the handle, not from *object, so it is
+     * safe to trust even after the object has been freed. */
+    WP11_Lock_LockRW(&token->lock);
+
+    if (onToken) {
+        /* Token objects live on the shared token list. */
+        for (curr = &token->object; *curr != NULL; curr = &(*curr)->next) {
+            if (*curr == object) {
+                found = 1;
+                break;
+            }
+        }
+    }
+    else {
+        /* Session objects live on their owning session's list. Check the
+         * caller's own list first: it is the only possibility in the standard
+         * build and the common case under NSS, and needs no dereference of
+         * *object. */
+        for (curr = &owner->object; *curr != NULL; curr = &(*curr)->next) {
+            if (*curr == object) {
+                found = 1;
+                break;
+            }
+        }
 #ifdef WOLFPKCS11_NSS
-    if (object->session && (session != object->session))
-        session = object->session;
+        /* NSS makes objects visible across sessions, so the object may belong
+         * to a different session. Fall back to its recorded owner. This is
+         * reached only for a genuinely cross-session object - a freed object is
+         * normally caught as not-found above - and carries the same
+         * out-of-contract residual as a single-session concurrent misuse. */
+        if (!found && object->session != NULL && object->session != session) {
+            owner = object->session;
+            for (curr = &owner->object; *curr != NULL; curr = &(*curr)->next) {
+                if (*curr == object) {
+                    found = 1;
+                    break;
+                }
+            }
+        }
 #endif
+    }
 
-    /* Find the object in list and relink. */
-    if (object->onToken) {
-        WP11_Lock_LockRW(object->lock);
-        token = &session->slot->token;
+    if (!found) {
+        WP11_Lock_UnlockRW(&token->lock);
+        return WP11_OBJECT_ALREADY_REMOVED;
+    }
+
+    /* The object is confirmed linked, and therefore alive, so its fields may
+     * now be read safely under the lock. Enforce CKA_DESTROYABLE here rather
+     * than in the caller so the check cannot race a concurrent free. */
+    if (checkDestroyable && (object->opFlag & WP11_FLAG_NOT_DESTROYABLE)) {
+        WP11_Lock_UnlockRW(&token->lock);
+        return WP11_OBJECT_NOT_DESTROYABLE;
+    }
+
+    if (onToken) {
         token->objCnt--;
         /* Id of first object on token. */
         id = token->objCnt;
         curr = &token->object;
-    }
-    else {
-        session->objCnt--;
-        /* Id of first object in session. */
-        id = session->objCnt;
-        curr = &session->object;
-        WP11_Lock_LockRW(&session->slot->token.lock);
-    }
+        /* walk list to get id for object to remove */
+        while (*curr != NULL) {
+            if (*curr == object) {
+                *curr = object->next;
+                break;
+            }
 
-    /* walk list to get id for object to remove */
-    while (*curr != NULL) {
-        if (*curr == object) {
-            *curr = object->next;
-            break;
-        }
-
-    #ifndef WOLFPKCS11_NO_STORE
-        if (object->onToken) {
+        #ifndef WOLFPKCS11_NO_STORE
             /* remove any id's with higher value */
             ret = wp11_Object_Unstore(*curr, (int)session->slotId, id);
         #ifdef DEBUG_WOLFPKCS11
@@ -7545,16 +10140,14 @@ int WP11_Session_RemoveObject(WP11_Session* session, WP11_Object* object)
                     (int)session->slotId, id, ret);
             }
         #endif
+        #endif
+
+            curr = &(*curr)->next;
+            /* Id of next object as it isn't the one being removed. */
+            id--;
         }
-    #endif
 
-        curr = &(*curr)->next;
-        /* Id of next object as it isn't the one being removed. */
-        id--;
-    }
-
-    if (object->onToken) {
-#ifndef WOLFPKCS11_NO_STORE
+    #ifndef WOLFPKCS11_NO_STORE
         ret = wp11_Object_Unstore(object, (int)session->slotId, id);
     #ifdef DEBUG_WOLFPKCS11
         if (ret != 0) {
@@ -7570,14 +10163,95 @@ int WP11_Session_RemoveObject(WP11_Session* session, WP11_Object* object)
                 (int)session->slotId, ret);
         }
     #endif
-#endif
-        WP11_Lock_UnlockRW(object->lock);
+    #endif
     }
     else {
-        WP11_Lock_UnlockRW(&session->slot->token.lock);
+        owner->objCnt--;
+        for (curr = &owner->object; *curr != NULL; curr = &(*curr)->next) {
+            if (*curr == object) {
+                *curr = object->next;
+                break;
+            }
+        }
     }
+
+    WP11_Lock_UnlockRW(&token->lock);
     (void)id; /* set but not used with WOLFPKCS11_NO_STORE */
     return ret;
+}
+
+/**
+ * Remove a live, exclusively-owned object from its session or token list.
+ *
+ * Thin wrapper over WP11_Session_RemoveObjectByHandle() for cleanup paths that
+ * hold the only reference to the object (object-creation rollback, keygen
+ * failure). onToken is read from the object itself, which is safe because no
+ * other thread can be removing it, and supplying onToken this way removes any
+ * risk of passing the wrong object's onToken. CKA_DESTROYABLE is not enforced
+ * (internal cleanup is not a user destroy) and any store error is logged in the
+ * callee, so the return value is intentionally discarded.
+ *
+ * @param  session  [in]  Session performing the removal.
+ * @param  object   [in]  Object to remove; must be live and owned by the caller.
+ */
+void WP11_Session_RemoveObject(WP11_Session* session, WP11_Object* object)
+{
+    (void)WP11_Session_RemoveObjectByHandle(session, object, object->onToken, 0);
+}
+
+/**
+ * Drop any session reference to an object that is about to be freed.
+ *
+ * The active object pointer (session->curr) is a raw pointer cached when an
+ * operation is initialized. A token object can be the active object of more
+ * than one session.
+ *
+ * Symmetric operations (AES, HMAC/generic-secret, HKDF) copy the key into the
+ * operation context during their *Init and run to completion without referring
+ * to the object again, so a caller may legitimately destroy the key before
+ * finishing the operation (wolfCrypt's PKCS#11 layer does exactly this for
+ * multi-part HMAC). Those operations are left untouched.
+ *
+ * Asymmetric operations dereference the key object while running, so for those
+ * key types drop the active reference in every session that holds it and reset
+ * the operation state, ensuring a later step cannot use freed memory.
+ *
+ * @param  slot    [in]  Slot whose sessions are scanned.
+ * @param  object  [in]  Object being destroyed.
+ */
+void WP11_Slot_ClearActiveObject(WP11_Slot* slot, WP11_Object* object)
+{
+    WP11_Session* curr;
+    CK_KEY_TYPE keyType;
+
+    if (slot == NULL || object == NULL)
+        return;
+
+    keyType = WP11_Object_GetType(object);
+    if (keyType == CKK_AES || keyType == CKK_GENERIC_SECRET ||
+            keyType == CKK_HKDF)
+        return;
+
+    WP11_Lock_LockRW(&slot->lock);
+    for (curr = slot->session; curr != NULL; curr = curr->next) {
+        if (curr->curr == object) {
+#if !defined(NO_RSA) && !defined(WC_NO_RSA_OAEP)
+            /* Release the operation-owned RSA-OAEP label before dropping the
+             * operation state. Otherwise a later init for a different mechanism
+             * overwrites the params union and the label can no longer be
+             * freed. */
+            if (curr->mechanism == CKM_RSA_PKCS_OAEP &&
+                    curr->params.oaep.label != NULL) {
+                XFREE(curr->params.oaep.label, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+                curr->params.oaep.label = NULL;
+                curr->params.oaep.labelSz = 0;
+            }
+#endif
+            curr->curr = NULL;
+            curr->init = 0;
+        }
+    }
+    WP11_Lock_UnlockRW(&slot->lock);
 }
 
 /**
@@ -7616,9 +10290,17 @@ int WP11_Session_FindInit(WP11_Session* session)
     if (session->find.state != WP11_FIND_STATE_NULL)
         ret = BAD_STATE_E;
     if (ret == 0) {
+        session->find.found = (CK_OBJECT_HANDLE*)XMALLOC(
+            WP11_FIND_MAX * sizeof(*session->find.found), NULL,
+            DYNAMIC_TYPE_TMP_BUFFER);
+        if (session->find.found == NULL)
+            ret = MEMORY_E;
+    }
+    if (ret == 0) {
         session->find.state = WP11_FIND_STATE_INIT;
         session->find.count = 0;
         session->find.curr = 0;
+        session->find.capacity = WP11_FIND_MAX;
     }
 
     return ret;
@@ -7663,18 +10345,25 @@ static WP11_Object* wp11_Session_FindNext(WP11_Session* session, int onToken,
         }
    #endif
 
+#ifndef WOLFPKCS11_NSS
+        /* F-3835: a public session must not discover CKA_PRIVATE objects.
+         * An empty user PIN does not waive this - the caller can still
+         * authenticate with C_Login (empty PIN included). Skipped in NSS
+         * mode, which operates as the internal crypto module without calling
+         * C_Login and enumerates private keys (e.g. certutil) from a public
+         * session - matching the by-handle WP11_Object_Find check below. */
         if ((ret->opFlag & WP11_FLAG_PRIVATE) == WP11_FLAG_PRIVATE) {
             if (!onToken)
                 WP11_Lock_LockRO(&session->slot->token.lock);
-            if (!WP11_Slot_Has_Empty_Pin(session->slot) &&
-                (session->slot->token.loginState == WP11_APP_STATE_RW_PUBLIC ||
-                 session->slot->token.loginState == WP11_APP_STATE_RO_PUBLIC)) {
+            if (!wp11_LoginStateIsUser(
+                    session->slot->token.loginState)) {
                 object = ret;
                 ret = NULL;
             }
             if (!onToken)
                 WP11_Lock_UnlockRO(&session->slot->token.lock);
         }
+#endif
     }
 
     return ret;
@@ -7685,16 +10374,27 @@ static WP11_Object* wp11_Session_FindNext(WP11_Session* session, int onToken,
  *
  * @param  session  [in]  Session object.
  * @param  object   [in]  Object object to store reference to.
- * @return  FIND_FULL_E when the found list is full.
+ * @return  MEMORY_E when the found list cannot be grown.
  *          0 on success.
  */
 static int wp11_Session_FindMatched(WP11_Session* session, WP11_Object* object)
 {
     int ret = 0;
 
-    if (session->find.count == WP11_FIND_MAX)
-        ret = FIND_FULL_E;
-    else {
+    if (session->find.count == session->find.capacity) {
+        int capacity = session->find.capacity * 2;
+        CK_OBJECT_HANDLE* found = (CK_OBJECT_HANDLE*)XREALLOC(
+            session->find.found, capacity * sizeof(*found), NULL,
+            DYNAMIC_TYPE_TMP_BUFFER);
+
+        if (found == NULL)
+            ret = MEMORY_E;
+        else {
+            session->find.found = found;
+            session->find.capacity = capacity;
+        }
+    }
+    if (ret == 0) {
         session->find.found[session->find.count++] = object->handle;
         session->find.state = WP11_FIND_STATE_FOUND;
     }
@@ -7710,16 +10410,18 @@ static int wp11_Session_FindMatched(WP11_Session* session, WP11_Object* object)
  * @param  pTemplate  [in]  Array of attributes that must match.
  * @param  ulCount    [in]  Number of attributes in array.
  */
-void WP11_Session_Find(WP11_Session* session, int onToken,
-                       CK_ATTRIBUTE_PTR pTemplate, CK_ULONG ulCount)
+int WP11_Session_Find(WP11_Session* session, int onToken,
+                      CK_ATTRIBUTE_PTR pTemplate, CK_ULONG ulCount)
 {
     WP11_Object* obj = NULL;
+    int ret = 0;
     int i;
     CK_ATTRIBUTE* attr;
 
     if (onToken)
         WP11_Lock_LockRO(&session->slot->token.lock);
-    while ((obj = wp11_Session_FindNext(session, onToken, obj)) != NULL) {
+    while (ret == 0 &&
+           (obj = wp11_Session_FindNext(session, onToken, obj)) != NULL) {
         for (i = 0; i < (int)ulCount; i++) {
             attr = &pTemplate[i];
             if (!WP11_Object_MatchAttr(obj, attr->type, (byte*)attr->pValue,
@@ -7728,13 +10430,13 @@ void WP11_Session_Find(WP11_Session* session, int onToken,
             }
         }
 
-        if (i == (int)ulCount) {
-            if (wp11_Session_FindMatched(session, obj) == FIND_FULL_E)
-                break;
-        }
+        if (i == (int)ulCount)
+            ret = wp11_Session_FindMatched(session, obj);
     }
     if (onToken)
         WP11_Lock_UnlockRO(&session->slot->token.lock);
+
+    return ret;
 }
 
 /**
@@ -7772,7 +10474,26 @@ int WP11_Session_FindGet(WP11_Session* session, CK_OBJECT_HANDLE* handle)
  */
 void WP11_Session_FindFinal(WP11_Session* session)
 {
+    if (session->find.found != NULL) {
+        XFREE(session->find.found, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+        session->find.found = NULL;
+    }
+    session->find.count = 0;
+    session->find.curr = 0;
+    session->find.capacity = 0;
     session->find.state = WP11_FIND_STATE_NULL;
+}
+
+/**
+ * Check whether a find operation is active on the session.
+ *
+ * @param  session  [in]  Session object.
+ * @return  1 when a find operation is active.
+ *          0 when no find operation is active.
+ */
+int WP11_Session_IsFindActive(WP11_Session* session)
+{
+    return session->find.state != WP11_FIND_STATE_NULL;
 }
 
 
@@ -7787,6 +10508,27 @@ void WP11_Object_Free(WP11_Object* object)
 #ifdef WOLFPKCS11_TPM
     if (object->tpmKey != NULL) {
         wolfTPM2_UnloadHandle(&object->slot->tpmDev, &object->tpmKey->handle);
+        /* Drop crypto callback references to the key being freed so the
+         * callback cannot act on freed memory. */
+    #ifndef NO_RSA
+        if (object->slot->tpmCtx.rsaKey == (WOLFTPM2_KEY*)object->tpmKey)
+            object->slot->tpmCtx.rsaKey = NULL;
+        #ifdef WOLFSSL_KEY_GEN
+        if (object->slot->tpmCtx.rsaKeyGen == object->tpmKey)
+            object->slot->tpmCtx.rsaKeyGen = NULL;
+        #endif
+    #endif
+    #ifdef HAVE_ECC
+        #if defined(LIBWOLFTPM_VERSION_HEX) && LIBWOLFTPM_VERSION_HEX > 0x03009000
+        if (object->slot->tpmCtx.ecdsaKey == object->tpmKey)
+            object->slot->tpmCtx.ecdsaKey = NULL;
+        #else
+        if (object->slot->tpmCtx.eccKey == (WOLFTPM2_KEY*)object->tpmKey)
+            object->slot->tpmCtx.eccKey = NULL;
+        #endif
+        if (object->slot->tpmCtx.ecdhKey == (WOLFTPM2_KEY*)object->tpmKey)
+            object->slot->tpmCtx.ecdhKey = NULL;
+    #endif
         XFREE(object->tpmKey, NULL, DYNAMIC_TYPE_TMP_BUFFER);
     }
 #endif
@@ -7811,8 +10553,19 @@ void WP11_Object_Free(WP11_Object* object)
         certFreed = 1;
     }
     else if (object->objClass == CKO_DATA) {
+        /* A data object's value may hold keying material, so clear each
+         * payload buffer before releasing it. */
+        if (object->data.genericData.data != NULL)
+            wc_ForceZero(object->data.genericData.data,
+                         object->data.genericData.dataLen);
         XFREE(object->data.genericData.data, NULL, DYNAMIC_TYPE_CERT);
+        if (object->data.genericData.application != NULL)
+            wc_ForceZero(object->data.genericData.application,
+                         object->data.genericData.applicationLen);
         XFREE(object->data.genericData.application, NULL, DYNAMIC_TYPE_CERT);
+        if (object->data.genericData.objectId != NULL)
+            wc_ForceZero(object->data.genericData.objectId,
+                         object->data.genericData.objectIdLen);
         XFREE(object->data.genericData.objectId, NULL, DYNAMIC_TYPE_CERT);
     }
     else {
@@ -7830,17 +10583,59 @@ void WP11_Object_Free(WP11_Object* object)
             object->data.ecKey = NULL;
         }
     #endif
+    #ifdef WOLFPKCS11_MLDSA
+        if (object->type == CKK_ML_DSA && object->data.mldsaKey != NULL) {
+            wc_MlDsaKey_Free(object->data.mldsaKey);
+            XFREE(object->data.mldsaKey, NULL, DYNAMIC_TYPE_MLDSA);
+            object->data.mldsaKey = NULL;
+        }
+    #endif
     #ifndef NO_DH
         if (object->type == CKK_DH && object->data.dhKey != NULL) {
+            word32 zeroLen = object->data.dhKey->len;
             wc_FreeDhKey(&object->data.dhKey->params);
+            /* Clamp to the fixed buffer as a backstop against a length
+             * recorded larger than the buffer. */
+            if (zeroLen > sizeof(object->data.dhKey->key))
+                zeroLen = (word32)sizeof(object->data.dhKey->key);
+            wc_ForceZero(object->data.dhKey->key, zeroLen);
             XFREE(object->data.dhKey, NULL, DYNAMIC_TYPE_DH);
             object->data.dhKey = NULL;
         }
     #endif
+    #ifdef WOLFPKCS11_MLKEM
+        if (object->type == CKK_ML_KEM && object->data.mlKemKey != NULL) {
+            if (!object->encoded)
+                wc_MlKemKey_Free(object->data.mlKemKey);
+            XFREE(object->data.mlKemKey, NULL, DYNAMIC_TYPE_KEY);
+            object->data.mlKemKey = NULL;
+        }
+    #endif
+    #ifdef WOLFPKCS11_LMS
+        if (object->type == CKK_HSS && object->data.lmsKey != NULL) {
+            if (!object->encoded)
+                wc_LmsKey_Free(object->data.lmsKey);
+            XFREE(object->data.lmsKey, NULL, DYNAMIC_TYPE_KEY);
+            object->data.lmsKey = NULL;
+        }
+    #endif
+    #ifdef WOLFPKCS11_XMSS
+        if ((object->type == CKK_XMSS || object->type == CKK_XMSSMT) &&
+                object->data.xmssKey != NULL) {
+            if (!object->encoded)
+                wc_XmssKey_Free(object->data.xmssKey);
+            XFREE(object->data.xmssKey, NULL, DYNAMIC_TYPE_KEY);
+            object->data.xmssKey = NULL;
+        }
+    #endif
         if ((object->type == CKK_AES || object->type == CKK_GENERIC_SECRET ||
              object->type == CKK_HKDF) && object->data.symmKey != NULL) {
-            /* TODO: ForceZero */
-            XMEMSET(object->data.symmKey->data, 0, object->data.symmKey->len);
+            word32 zeroLen = object->data.symmKey->len;
+            /* Clamp to the fixed buffer as a backstop against a length
+             * recorded larger than the buffer. */
+            if (zeroLen > sizeof(object->data.symmKey->data))
+                zeroLen = (word32)sizeof(object->data.symmKey->data);
+            wc_ForceZero(object->data.symmKey->data, zeroLen);
             XFREE(object->data.symmKey, NULL, DYNAMIC_TYPE_AES);
             object->data.symmKey = NULL;
         }
@@ -7866,6 +10661,18 @@ void WP11_Object_Free(WP11_Object* object)
 CK_OBJECT_HANDLE WP11_Object_GetHandle(WP11_Object* object)
 {
     return object->handle;
+}
+
+/**
+ * Check whether the object is stored on the token.
+ *
+ * @param  object  [in]  Object object.
+ * @return  1 when object is on token.
+ *          0 when object is a session object.
+ */
+int WP11_Object_OnToken(WP11_Object* object)
+{
+    return object->onToken;
 }
 
 /**
@@ -7899,6 +10706,46 @@ CK_ULONG WP11_Object_GetDevId(WP11_Object* object)
 CK_OBJECT_CLASS WP11_Object_GetClass(WP11_Object* object)
 {
     return object->objClass;
+}
+
+/**
+ * Check whether the object is copyable.
+ *
+ * Reads the underlying WP11_FLAG_NOT_COPYABLE bit directly so the result is
+ * not affected by the WOLFPKCS11_LEGACY_COPYABLE_FALSE_DEFAULT macro that
+ * controls the C_GetAttributeValue view.
+ *
+ * @param  object  [in]  Object object.
+ * @return  1 when copyable, 0 when not.
+ */
+int WP11_Object_IsCopyable(WP11_Object* object)
+{
+    return (object->opFlag & WP11_FLAG_NOT_COPYABLE) == 0;
+}
+
+/**
+ * Check whether the object is destroyable.
+ *
+ * @param  object  [in]  Object object.
+ * @return  1 when destroyable, 0 when not.
+ */
+int WP11_Object_IsDestroyable(WP11_Object* object)
+{
+    return (object->opFlag & WP11_FLAG_NOT_DESTROYABLE) == 0;
+}
+
+/**
+ * Check whether the object is modifiable.
+ *
+ * PKCS#11 v2.40 sec 4.4.1: CKA_MODIFIABLE defaults to CK_TRUE; clear flag
+ * means modifiable.
+ *
+ * @param  object  [in]  Object object.
+ * @return  1 when modifiable, 0 when not.
+ */
+int WP11_Object_IsModifiable(WP11_Object* object)
+{
+    return (object->opFlag & WP11_FLAG_NOT_MODIFIABLE) == 0;
 }
 
 #if !defined(NO_RSA) || defined(HAVE_ECC)
@@ -8017,7 +10864,8 @@ static int ecc_lookup_curve(const byte* oid, word32 len)
 
     for (curve = DefinedCurves; curve->curve_id < ECC_CURVE_MAX; curve++)
     {
-        if (XMEMCMP(oid, curve->curve_oid, MIN(len, curve->curve_size)) == 0) {
+        if (len == curve->curve_size &&
+                XMEMCMP(oid, curve->curve_oid, len) == 0) {
             return curve->curve_id;
         }
     }
@@ -8168,6 +11016,154 @@ int WP11_Object_SetEcKey(WP11_Object* object, unsigned char** data,
 }
 #endif /* HAVE_ECC */
 
+#ifdef WOLFPKCS11_MLDSA
+/**
+ * Set the ML-DSA parameters based on provided data.
+ *
+ * @param  key    [in]  ML-DSA key object.
+ * @param  params [in]  Pointer to parameters structure.
+ * @param  len    [in]  Length of parameters.
+ * @return  BUFFER_E when len is too short.
+ *          ASN_PARSE_E when parameter is bad.
+ *          Other -ve on failure.
+ *          0 on success.
+ */
+static int mldsaSetParameters(wc_MlDsaKey* key,
+                              CK_ML_DSA_PARAMETER_SET_TYPE* params,
+                              int len)
+{
+    int ret = 0;
+
+    if (params == NULL || key == NULL)
+        return BAD_FUNC_ARG;
+
+    if (len != sizeof(CK_ML_DSA_PARAMETER_SET_TYPE))
+        return BUFFER_E;
+
+    /* Set ML-DSA level based on the parameter */
+    switch (*params) {
+        case CKP_ML_DSA_44:
+            ret = wc_MlDsaKey_SetParams(key, WC_ML_DSA_44);
+            break;
+        case CKP_ML_DSA_65:
+            ret = wc_MlDsaKey_SetParams(key, WC_ML_DSA_65);
+            break;
+        case CKP_ML_DSA_87:
+            ret = wc_MlDsaKey_SetParams(key, WC_ML_DSA_87);
+            break;
+        default:
+            ret = ASN_PARSE_E;
+            break;
+    }
+
+    return ret;
+}
+
+/**
+* Set the ML-DSA key data into the object.
+* Store the data in the wolfCrypt data structure.
+*
+* @param  object  [in]  Object object.
+* @param  data    [in]  Array of byte arrays.
+* @param  len     [in]  Array of lengths of byte arrays.
+* @return  -ve on failure.
+*          0 on success.
+*/
+int WP11_Object_SetMldsaKey(WP11_Object* object, unsigned char** data,
+                            CK_ULONG* len)
+{
+    int ret;
+    wc_MlDsaKey* key;
+    int seedUsed = 0;
+
+    if (object->onToken)
+        WP11_Lock_LockRW(object->lock);
+
+    key = object->data.mldsaKey;
+    ret = wc_MlDsaKey_Init(key, NULL, object->devId);
+
+    /* Set parameters */
+    if (ret == 0 && data[0] != NULL) {
+        ret = mldsaSetParameters(key,
+                                 (CK_ML_DSA_PARAMETER_SET_TYPE*)data[0],
+                                 (int)len[0]);
+    }
+
+    /* Set seed (only for private keys) */
+    if (ret == 0 && data[1] != NULL) {
+        if (object->objClass != CKO_PRIVATE_KEY) {
+            ret = BAD_FUNC_ARG;
+        }
+        else if (len[1] != MLDSA_SEED_SZ) {
+            ret = BAD_FUNC_ARG;
+        }
+        else {
+            ret = wc_MlDsaKey_MakeKeyFromSeed(key, data[1]);
+            seedUsed = 1;
+        }
+    }
+
+    /* Set key data */
+    if (ret == 0 && data[2] != NULL) {
+        if (seedUsed == 0) {
+            /* Import given public/private key data */
+            if (object->objClass == CKO_PUBLIC_KEY) {
+                ret = wc_MlDsaKey_ImportPubRaw(key, data[2],
+                                               (word32)len[2]);
+            }
+            else {
+                ret = wc_MlDsaKey_ImportPrivRaw(key, data[2],
+                                                (word32)len[2]);
+            }
+        }
+        else {
+            if (object->objClass == CKO_PUBLIC_KEY) {
+                /* Seed is only allowed for private keys */
+                ret = BAD_FUNC_ARG;
+            }
+            else {
+                /* Check if the provided expanded private key is identical
+                 * to the one generated from the seed */
+                byte* expandedKey = NULL;
+                word32 expandedKeyLen = 0;
+
+                expandedKeyLen = wc_MlDsaKey_Size(key);
+                if (expandedKeyLen != len[2]) {
+                    ret = BAD_FUNC_ARG;
+                }
+                if (ret == 0) {
+                    expandedKey = XMALLOC(expandedKeyLen, NULL,
+                                          DYNAMIC_TYPE_TMP_BUFFER);
+                    if (expandedKey == NULL) {
+                        ret = MEMORY_E;
+                    }
+                }
+                if (ret == 0) {
+                    ret = wc_MlDsaKey_ExportPrivRaw(key, expandedKey,
+                                                    &expandedKeyLen);
+                    if (ret == 0) {
+                        if (WP11_ConstantCompare(expandedKey, data[2],
+                                                    (int)expandedKeyLen) != 1) {
+                            ret = BAD_FUNC_ARG;
+                        }
+                    }
+                    wc_ForceZero(expandedKey, expandedKeyLen);
+                    XFREE(expandedKey, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+                }
+            }
+        }
+    }
+
+    if (ret != 0)
+        wc_MlDsaKey_Free(key);
+
+    if (object->onToken)
+        WP11_Lock_UnlockRW(object->lock);
+
+    return ret;
+}
+#endif /* WOLFPKCS11_MLDSA */
+
 #ifndef NO_DH
 /**
  * Set the DH key data into the object.
@@ -8215,6 +11211,120 @@ int WP11_Object_SetDhKey(WP11_Object* object, unsigned char** data,
 }
 #endif
 
+#ifdef WOLFPKCS11_MLKEM
+/**
+ * Set the ML-KEM key data into the object.
+ * Store the data in the wolfCrypt data structure.
+ *
+ * @param  object  [in]  Object object.
+ * @param  data    [in]  Array of byte arrays (data[0]=CKA_PARAMETER_SET,
+ *                       data[1]=optional CKA_SEED,
+ *                       data[2]=optional key bytes).
+ * @param  len     [in]  Array of lengths of byte arrays.
+ * @return  -ve on failure.
+ *          0 on success.
+ */
+int WP11_Object_SetMlKemKey(WP11_Object* object, unsigned char** data,
+                            CK_ULONG* len)
+{
+    int ret = 0;
+    MlKemKey* key = object->data.mlKemKey;
+    CK_ML_KEM_PARAMETER_SET_TYPE* params = NULL;
+    int seedUsed = 0;
+
+    if (data[0] == NULL)
+        return BAD_FUNC_ARG;
+
+    if (len[0] != sizeof(CK_ML_KEM_PARAMETER_SET_TYPE))
+        return BUFFER_E;
+
+    if (object->onToken)
+        WP11_Lock_LockRW(object->lock);
+
+    params = (CK_ML_KEM_PARAMETER_SET_TYPE*)data[0];
+
+    switch (*params) {
+        case CKP_ML_KEM_512:
+            ret = wc_MlKemKey_Init(key, WC_ML_KEM_512, NULL,
+                                    object->devId);
+            break;
+        case CKP_ML_KEM_768:
+            ret = wc_MlKemKey_Init(key, WC_ML_KEM_768, NULL,
+                                    object->devId);
+            break;
+        case CKP_ML_KEM_1024:
+            ret = wc_MlKemKey_Init(key, WC_ML_KEM_1024, NULL,
+                                    object->devId);
+            break;
+        default:
+            if (object->onToken)
+                WP11_Lock_UnlockRW(object->lock);
+            return ASN_PARSE_E;
+    }
+
+    /* Set seed (only for private keys). */
+    if (ret == 0 && data[1] != NULL) {
+        if (object->objClass != CKO_PRIVATE_KEY) {
+            ret = BAD_FUNC_ARG;
+        }
+        else if (len[1] != WC_ML_KEM_MAKEKEY_RAND_SZ) {
+            ret = BAD_FUNC_ARG;
+        }
+        else {
+            ret = wc_MlKemKey_MakeKeyWithRandom(key, data[1], (int)len[1]);
+            seedUsed = 1;
+        }
+    }
+
+    /* Set key data. */
+    if (ret == 0 && data[2] != NULL) {
+        if (object->objClass == CKO_PUBLIC_KEY) {
+            ret = wc_MlKemKey_DecodePublicKey(key, data[2], (word32)len[2]);
+        }
+        else if (seedUsed == 0) {
+            ret = wc_MlKemKey_DecodePrivateKey(key, data[2], (word32)len[2]);
+        }
+        else {
+            byte* expandedKey = NULL;
+            word32 expandedKeyLen = 0;
+
+            ret = wc_MlKemKey_PrivateKeySize(key, &expandedKeyLen);
+            if (ret == 0 && expandedKeyLen != len[2]) {
+                ret = BAD_FUNC_ARG;
+            }
+            if (ret == 0) {
+                expandedKey = XMALLOC(expandedKeyLen, NULL,
+                                      DYNAMIC_TYPE_TMP_BUFFER);
+                if (expandedKey == NULL)
+                    ret = MEMORY_E;
+            }
+            if (ret == 0) {
+                ret = wc_MlKemKey_EncodePrivateKey(key, expandedKey,
+                                                   expandedKeyLen);
+            }
+            if (ret == 0) {
+                if (WP11_ConstantCompare(expandedKey, data[2],
+                                         (int)expandedKeyLen) != 1) {
+                    ret = BAD_FUNC_ARG;
+                }
+            }
+            if (expandedKey != NULL) {
+                wc_ForceZero(expandedKey, expandedKeyLen);
+                XFREE(expandedKey, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+            }
+        }
+    }
+
+    if (ret != 0)
+        wc_MlKemKey_Free(key);
+
+    if (object->onToken)
+        WP11_Lock_UnlockRW(object->lock);
+
+    return ret;
+}
+#endif /* WOLFPKCS11_MLKEM */
+
 /**
  * Set the DH key data into the object.
  *
@@ -8232,33 +11342,47 @@ int WP11_Object_SetSecretKey(WP11_Object* object, unsigned char** data,
 {
     int ret = 0;
     WP11_Data* key;
+    CK_ULONG keyLen = 0;
 
     if (object->onToken)
         WP11_Lock_LockRW(object->lock);
 
     key = object->data.symmKey;
     key->len = 0;
-    XMEMSET(key->data, 0, sizeof(key->data));
+    wc_ForceZero(key->data, sizeof(key->data));
 
     /* First item is the key's length. */
     if (ret == 0 && data[0] != NULL && len[0] != (int)sizeof(CK_ULONG))
         ret = BAD_FUNC_ARG;
+    if (ret == 0 && data[0] != NULL) {
+        keyLen = *(CK_ULONG*)data[0];
+        /* Bound the requested length against the fixed key buffer before
+         * narrowing to word32. This rejects oversized values and values that
+         * would not fit a word32, neither of which may be stored in key->len
+         * as that drives copies and zeroization of key->data. */
+        if (keyLen > WP11_MAX_SYM_KEY_SZ)
+            ret = BUFFER_E;
+    }
 #if !defined(NO_AES) && !defined(WOLFPKCS11_NSS)
     if (ret == 0 && object->type == CKK_AES && data[0] != NULL) {
-        if (*(CK_ULONG*)data[0] != AES_128_KEY_SIZE &&
-            *(CK_ULONG*)data[0] != AES_192_KEY_SIZE &&
-            *(CK_ULONG*)data[0] != AES_256_KEY_SIZE) {
+        if (keyLen != AES_128_KEY_SIZE &&
+            keyLen != AES_192_KEY_SIZE &&
+            keyLen != AES_256_KEY_SIZE) {
             ret = BAD_FUNC_ARG;
         }
     }
 #endif
     if (ret == 0 && data[0] != NULL)
-        key->len = (word32)*(CK_ULONG*)data[0];
+        key->len = (word32)keyLen;
 
     /* Second item is the key data. */
     if (ret == 0 && data[1] != NULL) {
-        if (key->len == 0)
-            key->len = (word32)len[1];
+        if (key->len == 0) {
+            if (len[1] > WP11_MAX_SYM_KEY_SZ)
+                ret = BUFFER_E;
+            else
+                key->len = (word32)len[1];
+        }
         else if (len[1] != (CK_ULONG)key->len)
             ret = BUFFER_E;
     }
@@ -8266,6 +11390,11 @@ int WP11_Object_SetSecretKey(WP11_Object* object, unsigned char** data,
         ret = BUFFER_E;
     if (ret == 0 && data[1] != NULL)
         XMEMCPY(key->data, data[1], key->len);
+
+    /* On any error, record no length so later teardown does not zeroize or
+     * copy past the fixed key buffer. */
+    if (ret != 0)
+        key->len = 0;
 
     if (object->onToken)
         WP11_Lock_UnlockRW(object->lock);
@@ -8310,69 +11439,58 @@ int WP11_Object_SetTrust(WP11_Object* object, unsigned char** data,
 }
 #endif
 
-int WP11_Object_DataObject(WP11_Object* object, unsigned char** data,
-                           CK_ULONG* len)
+/* Update one generic-data field. An omitted attribute (present == 0) is left
+ * unchanged; a supplied attribute is replaced when it carries data, or cleared
+ * when it is empty. The old buffer may hold keying material, so it is zeroized
+ * before release. */
+static int wp11_SetGenericField(byte** field, word32* fieldLen, int present,
+                                unsigned char* data, CK_ULONG len)
 {
     int ret = 0;
+
+    if (!present)
+        return 0;
+
+    if (*field != NULL) {
+        wc_ForceZero(*field, *fieldLen);
+        XFREE(*field, NULL, DYNAMIC_TYPE_CERT);
+        *field = NULL;
+        *fieldLen = 0;
+    }
+
+    if (data != NULL && len > 0) {
+        *field = (byte*)XMALLOC(len, NULL, DYNAMIC_TYPE_CERT);
+        if (*field == NULL)
+            ret = MEMORY_E;
+        else {
+            XMEMCPY(*field, data, len);
+            *fieldLen = (word32)len;
+        }
+    }
+
+    return ret;
+}
+
+int WP11_Object_DataObject(WP11_Object* object, unsigned char** data,
+                           CK_ULONG* len, int* present)
+{
+    int ret;
 
     if (object->onToken)
         WP11_Lock_LockRW(object->lock);
 
-    if (data[0] != NULL && len[0] > 0) {
-        XFREE(object->data.genericData.data, NULL, DYNAMIC_TYPE_CERT);
-        object->data.genericData.data =
-            XMALLOC(len[0], NULL, DYNAMIC_TYPE_CERT);
-        if (object->data.genericData.data == NULL) {
-            ret = MEMORY_E;
-        }
-        else {
-            XMEMCPY(object->data.genericData.data, data[0], len[0]);
-            object->data.genericData.dataLen = (word32)len[0];
-        }
+    ret = wp11_SetGenericField(&object->data.genericData.data,
+                               &object->data.genericData.dataLen,
+                               present[0], data[0], len[0]);
+    if (ret == 0) {
+        ret = wp11_SetGenericField(&object->data.genericData.application,
+                                   &object->data.genericData.applicationLen,
+                                   present[1], data[1], len[1]);
     }
-    else if (data[0] == NULL) {
-        /* Clear data if not provided */
-        XFREE(object->data.genericData.data, NULL, DYNAMIC_TYPE_CERT);
-        object->data.genericData.data = NULL;
-        object->data.genericData.dataLen = 0;
-    }
-
-    if (ret == 0 && data[1] != NULL && len[1] > 0) {
-        XFREE(object->data.genericData.application, NULL, DYNAMIC_TYPE_CERT);
-        object->data.genericData.application =
-            XMALLOC(len[1], NULL, DYNAMIC_TYPE_CERT);
-        if (object->data.genericData.application == NULL) {
-            ret = MEMORY_E;
-        }
-        else {
-            XMEMCPY(object->data.genericData.application, data[1], len[1]);
-            object->data.genericData.applicationLen = (word32)len[1];
-        }
-    }
-    else if (ret == 0 && data[1] == NULL) {
-        /* Clear application if not provided */
-        XFREE(object->data.genericData.application, NULL, DYNAMIC_TYPE_CERT);
-        object->data.genericData.application = NULL;
-        object->data.genericData.applicationLen = 0;
-    }
-
-    if (ret == 0 && data[2] != NULL && len[2] > 0) {
-        XFREE(object->data.genericData.objectId, NULL, DYNAMIC_TYPE_CERT);
-        object->data.genericData.objectId =
-            XMALLOC(len[2], NULL, DYNAMIC_TYPE_CERT);
-        if (object->data.genericData.objectId == NULL) {
-            ret = MEMORY_E;
-        }
-        else {
-            XMEMCPY(object->data.genericData.objectId, data[2], len[2]);
-            object->data.genericData.objectIdLen = (word32)len[2];
-        }
-    }
-    else if (ret == 0 && data[2] == NULL) {
-        /* Clear object ID if not provided */
-        XFREE(object->data.genericData.objectId, NULL, DYNAMIC_TYPE_CERT);
-        object->data.genericData.objectId = NULL;
-        object->data.genericData.objectIdLen = 0;
+    if (ret == 0) {
+        ret = wp11_SetGenericField(&object->data.genericData.objectId,
+                                   &object->data.genericData.objectIdLen,
+                                   present[2], data[2], len[2]);
     }
 
     if (object->onToken)
@@ -8442,6 +11560,22 @@ int WP11_Object_SetClass(WP11_Object* object, CK_OBJECT_CLASS objClass)
 }
 
 /**
+ * Determine whether an object handle refers to a token object.
+ *
+ * The onToken bit is encoded in the handle value itself, so this is safe to
+ * call even when the WP11_Object has already been freed by another thread -
+ * useful when deciding which list a racing C_DestroyObject must consult.
+ *
+ * @param  handle  [in]  Object handle.
+ * @return  1 when the handle refers to a token object.
+ *          0 when the handle refers to a session object.
+ */
+int WP11_Object_HandleOnToken(CK_OBJECT_HANDLE handle)
+{
+    return OBJ_HANDLE_ON_TOKEN(handle);
+}
+
+/**
  * Find an object based on the handle.
  *
  * @param  session    [in]   Session object.
@@ -8461,6 +11595,18 @@ int WP11_Object_Find(WP11_Session* session, CK_OBJECT_HANDLE objHandle,
     int onToken = OBJ_HANDLE_ON_TOKEN(objHandle);
 
     if (!onToken) {
+#ifdef WOLFPKCS11_NSS
+        /* The NSS cross-session walk below needs the slot lock so a concurrent
+         * remove-session can't reclaim a session node. Acquire it before the
+         * token lock to match the global lock order (slot then token) used by
+         * WP11_Session_RemoveObjectByHandle / WP11_Slot_CloseSessions; acquiring
+         * them in the opposite order would risk an AB-BA deadlock. */
+        WP11_Lock_LockRO(&session->slot->lock);
+#endif
+        /* Hold the token lock across the session->object walk so a concurrent
+         * WP11_Session_RemoveObjectByHandle (which holds the same lock around
+         * the unlink) can't free a node we're stepping through. */
+        WP11_Lock_LockRO(&session->slot->token.lock);
         obj = session->object;
         while (obj != NULL) {
             if (obj->handle == objHandle) {
@@ -8471,10 +11617,6 @@ int WP11_Object_Find(WP11_Session* session, CK_OBJECT_HANDLE objHandle,
         }
 #ifdef WOLFPKCS11_NSS
         if (ret == BAD_FUNC_ARG) {
-            /* Token lock is needed in case remove object is run, slot lock is
-             * needed in case remove session is run */
-            WP11_Lock_LockRO(&session->slot->lock);
-            WP11_Lock_LockRO(&session->slot->token.lock);
             for (scan = session->slot->session; scan != NULL && ret != 0;
                  scan = scan->next) {
                 if (scan == session)
@@ -8486,9 +11628,11 @@ int WP11_Object_Find(WP11_Session* session, CK_OBJECT_HANDLE objHandle,
                     }
                 }
             }
-            WP11_Lock_UnlockRO(&session->slot->token.lock);
-            WP11_Lock_UnlockRO(&session->slot->lock);
         }
+#endif
+        WP11_Lock_UnlockRO(&session->slot->token.lock);
+#ifdef WOLFPKCS11_NSS
+        WP11_Lock_UnlockRO(&session->slot->lock);
 #endif
     }
     else {
@@ -8504,8 +11648,27 @@ int WP11_Object_Find(WP11_Session* session, CK_OBJECT_HANDLE objHandle,
         WP11_Lock_UnlockRO(&session->slot->token.lock);
     }
 
-    if (obj && (obj->handle == objHandle))
-        *object = obj;
+    if (ret == 0 && obj != NULL && (obj->handle == objHandle)) {
+#ifndef WOLFPKCS11_NSS
+        /* Enforce CKA_PRIVATE: reject private objects from public sessions.
+         * Skipped in NSS mode because NSS operates as the internal crypto
+         * module without calling C_Login. */
+        if ((obj->opFlag & WP11_FLAG_PRIVATE) == WP11_FLAG_PRIVATE) {
+            int loginState;
+            WP11_Lock_LockRO(&session->slot->lock);
+            loginState = session->slot->token.loginState;
+            /* F-3835: resolving a CKA_PRIVATE object requires a normal-user
+             * login even when the user PIN is empty. An SO login grants no
+             * access to private objects. */
+            if (!wp11_LoginStateIsUser(loginState)) {
+                ret = BAD_FUNC_ARG;
+            }
+            WP11_Lock_UnlockRO(&session->slot->lock);
+        }
+#endif
+        if (ret == 0)
+            *object = obj;
+    }
 
     return ret;
 }
@@ -8639,6 +11802,23 @@ static int GetData(byte* data, CK_ULONG dataLen, byte* out, CK_ULONG* outLen)
     return ret;
 }
 
+static int GetUniqueId(WP11_Object* object, byte* data, CK_ULONG* len)
+{
+    byte str[24];
+    unsigned long handle = (unsigned long)object->handle;
+    int i = (int)sizeof(str);
+
+    /* Decimal ASCII of the token-assigned object handle. The handle is drawn
+     * from a monotonic per-token counter and persisted, so the value is unique
+     * per object and stable across reload. */
+    do {
+        str[--i] = (byte)('0' + (handle % 10));
+        handle /= 10;
+    } while (handle != 0 && i > 0);
+
+    return GetData(str + i, (CK_ULONG)(sizeof(str) - i), data, len);
+}
+
 static int GetCertAttr(WP11_Object* object, CK_ATTRIBUTE_TYPE type, byte* data,
                        CK_ULONG* len)
 {
@@ -8727,30 +11907,23 @@ static int GetTrustAttr(WP11_Object* object, CK_ATTRIBUTE_TYPE type,
             if (data != NULL)
                 XMEMCPY(data, &object->data.trust.md5Hash, WC_MD5_DIGEST_SIZE);
             break;
+        /* GetULong/GetBool size-query and bounds-check *len themselves: they
+         * set it on a size query or success, and return BUFFER_E (leaving
+         * *len unchanged) when the buffer is too small. */
         case CKA_TRUST_SERVER_AUTH:
-            *len = sizeof(CK_ULONG);
-            if (data != NULL)
-                ret = GetULong(object->data.trust.serverAuth, data, len);
+            ret = GetULong(object->data.trust.serverAuth, data, len);
             break;
         case CKA_TRUST_CLIENT_AUTH:
-            *len = sizeof(CK_ULONG);
-            if (data != NULL)
-                ret = GetULong(object->data.trust.clientAuth, data, len);
+            ret = GetULong(object->data.trust.clientAuth, data, len);
             break;
         case CKA_TRUST_CODE_SIGNING:
-            *len = sizeof(CK_ULONG);
-            if (data != NULL)
-                ret = GetULong(object->data.trust.codeSigning, data, len);
+            ret = GetULong(object->data.trust.codeSigning, data, len);
             break;
         case CKA_TRUST_EMAIL_PROTECTION:
-            *len = sizeof(CK_ULONG);
-            if (data != NULL)
-                ret = GetULong(object->data.trust.emailProtection, data, len);
+            ret = GetULong(object->data.trust.emailProtection, data, len);
             break;
         case CKA_TRUST_STEP_UP_APPROVED:
-            *len = sizeof(CK_BBOOL);
-            if (data != NULL)
-                ret = GetBool(object->data.trust.stepUpApproved, data, len);
+            ret = GetBool(object->data.trust.stepUpApproved, data, len);
             break;
         case CKA_ISSUER:
             ret = GetData(object->issuer, object->issuerLen, data, len);
@@ -8798,38 +11971,50 @@ static int RsaObject_GetAttr(WP11_Object* object, CK_ATTRIBUTE_TYPE type,
             ret = GetMPIData(&object->data.rsaKey->n, data, len);
             break;
         case CKA_PRIVATE_EXPONENT:
-            if (noPriv)
+            if (noPriv) {
                 *len = CK_UNAVAILABLE_INFORMATION;
+                ret = CKR_ATTRIBUTE_SENSITIVE;
+            }
             else
                 ret = GetMPIData(&object->data.rsaKey->d, data, len);
             break;
         case CKA_PRIME_1:
-            if (noPriv)
+            if (noPriv) {
                 *len = CK_UNAVAILABLE_INFORMATION;
+                ret = CKR_ATTRIBUTE_SENSITIVE;
+            }
             else
                 ret = GetMPIData(&object->data.rsaKey->p, data, len);
             break;
         case CKA_PRIME_2:
-            if (noPriv)
+            if (noPriv) {
                 *len = CK_UNAVAILABLE_INFORMATION;
+                ret = CKR_ATTRIBUTE_SENSITIVE;
+            }
             else
                 ret = GetMPIData(&object->data.rsaKey->q, data, len);
             break;
         case CKA_EXPONENT_1:
-            if (noPriv)
+            if (noPriv) {
                 *len = CK_UNAVAILABLE_INFORMATION;
+                ret = CKR_ATTRIBUTE_SENSITIVE;
+            }
             else
                 ret = GetMPIData(&object->data.rsaKey->dP, data, len);
             break;
         case CKA_EXPONENT_2:
-            if (noPriv)
+            if (noPriv) {
                 *len = CK_UNAVAILABLE_INFORMATION;
+                ret = CKR_ATTRIBUTE_SENSITIVE;
+            }
             else
                 ret = GetMPIData(&object->data.rsaKey->dQ, data, len);
             break;
         case CKA_COEFFICIENT:
-            if (noPriv)
+            if (noPriv) {
                 *len = CK_UNAVAILABLE_INFORMATION;
+                ret = CKR_ATTRIBUTE_SENSITIVE;
+            }
             else
                 ret = GetMPIData(&object->data.rsaKey->u, data, len);
             break;
@@ -8921,8 +12106,11 @@ static int GetEcPoint(ecc_key* key, byte* data, CK_ULONG* len)
 
     if (data == NULL)
         *len = dataLen + 2 + longLen;
-    else if (*len < (CK_ULONG)dataLen)
+    else if (*len < (CK_ULONG)(dataLen + 2 + longLen)) {
+        /* Report the required size so the caller can resize and retry. */
+        *len = dataLen + 2 + longLen;
         ret = BUFFER_E;
+    }
     else {
         *len = dataLen + 2 + longLen;
         i = 0;
@@ -8968,8 +12156,10 @@ static int EcObject_GetAttr(WP11_Object* object, CK_ATTRIBUTE_TYPE type,
             ret = GetEcParams(object->data.ecKey, data, len);
             break;
         case CKA_VALUE:
-            if (noPriv)
+            if (noPriv) {
                 *len = CK_UNAVAILABLE_INFORMATION;
+                ret = CKR_ATTRIBUTE_SENSITIVE;
+            }
             else
 #if defined(HAVE_FIPS_VERSION) && (HAVE_FIPS_VERSION <= 5)
                 ret = GetMPIData(&object->data.ecKey->k, data, len);
@@ -8994,6 +12184,160 @@ static int EcObject_GetAttr(WP11_Object* object, CK_ATTRIBUTE_TYPE type,
     return ret;
 }
 #endif
+
+#ifdef WOLFPKCS11_MLDSA
+static int GetMldsaParams(wc_MlDsaKey* key, byte* data, CK_ULONG* len)
+{
+    int ret = 0;
+    CK_ML_DSA_PARAMETER_SET_TYPE params;
+
+    if (len == NULL)
+        return BUFFER_E;
+
+    switch (key->level) {
+        case WC_ML_DSA_44:
+            params = CKP_ML_DSA_44;
+            break;
+        case WC_ML_DSA_65:
+            params = CKP_ML_DSA_65;
+            break;
+        case WC_ML_DSA_87:
+            params = CKP_ML_DSA_87;
+            break;
+        default:
+            return ASN_PARSE_E;
+    }
+
+    if (data == NULL)
+        *len = sizeof(CK_ML_DSA_PARAMETER_SET_TYPE);
+    else if (*len < sizeof(CK_ML_DSA_PARAMETER_SET_TYPE))
+        ret = BUFFER_E;
+    else
+        XMEMCPY(data, &params, sizeof(CK_ML_DSA_PARAMETER_SET_TYPE));
+
+    return ret;
+}
+
+static int GetMldsaPublicKey(wc_MlDsaKey* key, byte* data, CK_ULONG* len)
+{
+    int ret = 0;
+    word32 dataLen = 0;
+    byte level = 0;
+
+    ret = wc_MlDsaKey_GetParams(key, &level);
+    if (ret != 0)
+        return ret;
+
+    if (level == WC_ML_DSA_44)
+        dataLen = WC_MLDSA_44_PUB_KEY_SIZE;
+    else if (level == WC_ML_DSA_65)
+        dataLen = WC_MLDSA_65_PUB_KEY_SIZE;
+    else if (level == WC_ML_DSA_87)
+        dataLen = WC_MLDSA_87_PUB_KEY_SIZE;
+    else
+        return ASN_PARSE_E;
+
+    if (data == NULL)
+        *len = dataLen;
+    else if (*len < dataLen)
+        ret = BUFFER_E;
+    else {
+        ret = wc_MlDsaKey_ExportPubRaw(key, data, &dataLen);
+        if (ret == 0)
+            *len = dataLen;
+    }
+
+    return ret;
+}
+
+static int GetMldsaPrivateKey(wc_MlDsaKey* key, byte* data, CK_ULONG* len)
+{
+    int ret = 0;
+    word32 dataLen = 0;
+    byte level = 0;
+
+    ret = wc_MlDsaKey_GetParams(key, &level);
+    if (ret != 0)
+        return ret;
+
+    if (level == WC_ML_DSA_44)
+        dataLen = WC_MLDSA_44_KEY_SIZE;
+    else if (level == WC_ML_DSA_65)
+        dataLen = WC_MLDSA_65_KEY_SIZE;
+    else if (level == WC_ML_DSA_87)
+        dataLen = WC_MLDSA_87_KEY_SIZE;
+    else
+        return ASN_PARSE_E;
+
+    if (data == NULL)
+        *len = dataLen;
+    else if (*len < dataLen)
+        ret = BUFFER_E;
+    else {
+        ret = wc_MlDsaKey_ExportPrivRaw(key, data, &dataLen);
+        if (ret == 0)
+            *len = dataLen;
+    }
+
+    return ret;
+}
+
+/**
+ * Get a ML-DSA object's data as an attribute.
+ *
+ * @param  object  [in]      Object object.
+ * @param  type    [in]      Attribute type.
+ * @param  data    [in]      Attribute data buffer.
+ * @param  len     [in,out]  On in, length of attribute data buffer in bytes.
+ *                           On out, length of attribute data in bytes.
+ * @return  BUFFER_E when buffer is too small for data.
+ *          NOT_AVAILABLE_E when attribute type is not supported.
+ *          0 on success.
+ */
+static int MldsaObject_GetAttr(WP11_Object* object, CK_ATTRIBUTE_TYPE type,
+                               byte* data, CK_ULONG* len)
+{
+    int ret = 0;
+    int noPriv = (((object->opFlag & WP11_FLAG_SENSITIVE) != 0) ||
+                  ((object->opFlag & WP11_FLAG_EXTRACTABLE) == 0));
+    int noPub = 0;
+
+    if (!object->data.mldsaKey->prvKeySet)
+        noPriv = 1;
+    if (!object->data.mldsaKey->pubKeySet)
+        noPub = 1;
+
+    switch (type) {
+        case CKA_PARAMETER_SET:
+            ret = GetMldsaParams(object->data.mldsaKey, data, len);
+            break;
+        case CKA_SEED:
+            *len = CK_UNAVAILABLE_INFORMATION;
+            break;
+        case CKA_VALUE:
+            if (object->objClass == CKO_PRIVATE_KEY) {
+                if (noPriv) {
+                    *len = CK_UNAVAILABLE_INFORMATION;
+                    ret = CKR_ATTRIBUTE_SENSITIVE;
+                }
+                else
+                    ret = GetMldsaPrivateKey(object->data.mldsaKey, data, len);
+            }
+            else if (object->objClass == CKO_PUBLIC_KEY) {
+                if (noPub)
+                    *len = CK_UNAVAILABLE_INFORMATION;
+                else
+                    ret = GetMldsaPublicKey(object->data.mldsaKey, data, len);
+            }
+            break;
+        default:
+            ret = NOT_AVAILABLE_E;
+            break;
+    }
+
+    return ret;
+}
+#endif /* WOLFPKCS11_MLDSA */
 
 #ifndef NO_DH
 /**
@@ -9030,8 +12374,10 @@ static int DhObject_GetAttr(WP11_Object* object, CK_ATTRIBUTE_TYPE type,
                 ret = GetData(object->data.dhKey->key, object->data.dhKey->len,
                                                                      data, len);
             }
-            else
+            else {
                 *len = CK_UNAVAILABLE_INFORMATION;
+                ret = CKR_ATTRIBUTE_SENSITIVE;
+            }
             break;
         case CKA_WRAP_TEMPLATE:
         case CKA_UNWRAP_TEMPLATE:
@@ -9044,6 +12390,141 @@ static int DhObject_GetAttr(WP11_Object* object, CK_ATTRIBUTE_TYPE type,
     return ret;
 }
 #endif /* !NO_DH */
+
+#ifdef WOLFPKCS11_MLKEM
+static int GetMlKemParams(MlKemKey* key, byte* data, CK_ULONG* len)
+{
+    CK_ML_KEM_PARAMETER_SET_TYPE params;
+
+    if (len == NULL)
+        return BUFFER_E;
+
+    switch (key->type) {
+        case WC_ML_KEM_512:
+            params = CKP_ML_KEM_512;
+            break;
+        case WC_ML_KEM_768:
+            params = CKP_ML_KEM_768;
+            break;
+        case WC_ML_KEM_1024:
+            params = CKP_ML_KEM_1024;
+            break;
+        default:
+            return ASN_PARSE_E;
+    }
+
+    if (data == NULL)
+        *len = sizeof(CK_ML_KEM_PARAMETER_SET_TYPE);
+    else if (*len < sizeof(CK_ML_KEM_PARAMETER_SET_TYPE))
+        return BUFFER_E;
+    else {
+        XMEMCPY(data, &params, sizeof(CK_ML_KEM_PARAMETER_SET_TYPE));
+        *len = sizeof(CK_ML_KEM_PARAMETER_SET_TYPE);
+    }
+
+    return 0;
+}
+
+static int GetMlKemPublicKey(MlKemKey* key, byte* data, CK_ULONG* len)
+{
+    int ret = 0;
+    word32 dataLen = 0;
+
+    ret = wc_MlKemKey_PublicKeySize(key, &dataLen);
+    if (ret != 0)
+        return ret;
+
+    if (data == NULL)
+        *len = dataLen;
+    else if (*len < dataLen)
+        ret = BUFFER_E;
+    else {
+        ret = wc_MlKemKey_EncodePublicKey(key, data, dataLen);
+        if (ret == 0)
+            *len = dataLen;
+    }
+
+    return ret;
+}
+
+static int GetMlKemPrivateKey(MlKemKey* key, byte* data, CK_ULONG* len)
+{
+    int ret = 0;
+    word32 dataLen = 0;
+
+    ret = wc_MlKemKey_PrivateKeySize(key, &dataLen);
+    if (ret != 0)
+        return ret;
+
+    if (data == NULL)
+        *len = dataLen;
+    else if (*len < dataLen)
+        ret = BUFFER_E;
+    else {
+        ret = wc_MlKemKey_EncodePrivateKey(key, data, dataLen);
+        if (ret == 0)
+            *len = dataLen;
+    }
+
+    return ret;
+}
+
+/**
+ * Get a ML-KEM object's data as an attribute.
+ *
+ * @param  object  [in]      Object object.
+ * @param  type    [in]      Attribute type.
+ * @param  data    [in]      Attribute data buffer.
+ * @param  len     [in,out]  On in, length of attribute data buffer in bytes.
+ *                           On out, length of attribute data in bytes.
+ * @return  BUFFER_E when buffer is too small for data.
+ *          NOT_AVAILABLE_E when attribute type is not supported.
+ *          0 on success.
+ */
+static int MlKemObject_GetAttr(WP11_Object* object, CK_ATTRIBUTE_TYPE type,
+                               byte* data, CK_ULONG* len)
+{
+    int ret = 0;
+    int noPriv = (((object->opFlag & WP11_FLAG_SENSITIVE) != 0) ||
+                               ((object->opFlag & WP11_FLAG_EXTRACTABLE) == 0));
+    int noPub = 0;
+
+    if (!(object->data.mlKemKey->flags & MLKEM_FLAG_PRIV_SET))
+        noPriv = 1;
+    if (!(object->data.mlKemKey->flags & MLKEM_FLAG_PUB_SET))
+        noPub = 1;
+
+    switch (type) {
+        case CKA_PARAMETER_SET:
+            ret = GetMlKemParams(object->data.mlKemKey, data, len);
+            break;
+        case CKA_SEED:
+            *len = CK_UNAVAILABLE_INFORMATION;
+            break;
+        case CKA_VALUE:
+            if (object->objClass == CKO_PRIVATE_KEY) {
+                if (noPriv) {
+                    *len = CK_UNAVAILABLE_INFORMATION;
+                    ret = CKR_ATTRIBUTE_SENSITIVE;
+                }
+                else
+                    ret = GetMlKemPrivateKey(object->data.mlKemKey, data, len);
+            }
+            else if (object->objClass == CKO_PUBLIC_KEY) {
+                if (noPub)
+                    *len = CK_UNAVAILABLE_INFORMATION;
+                else
+                    ret = GetMlKemPublicKey(object->data.mlKemKey, data, len);
+            }
+            break;
+        default:
+            ret = NOT_AVAILABLE_E;
+            break;
+    }
+
+    return ret;
+}
+#endif /* WOLFPKCS11_MLKEM */
 
 int WP11_Generic_SerializeKey(WP11_Object* object, byte* output, word32* poutsz)
 {
@@ -9133,10 +12614,11 @@ static int GetSha1CheckValue(const byte* dataIn, int inLen, byte* dataOut,
     }
 
     ret = wc_Hash(WC_HASH_TYPE_SHA, dataIn, inLen, hash, WC_SHA_DIGEST_SIZE);
-    if (ret == 0) {
-        XMEMCPY(dataOut, hash, PKCS11_CHECK_VALUE_SIZE);
-        *outLen = PKCS11_CHECK_VALUE_SIZE;
+    if (ret != 0) {
+        return CKR_FUNCTION_FAILED;
     }
+    XMEMCPY(dataOut, hash, PKCS11_CHECK_VALUE_SIZE);
+    *outLen = PKCS11_CHECK_VALUE_SIZE;
 
     return CKR_OK;
 }
@@ -9169,7 +12651,10 @@ static int GetEcbCheckValue(WP11_Object* secret, byte* dataOut,
     if (!hash)
         return MEMORY_E;
     input = XMALLOC(key->len, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-
+    if (input == NULL) {
+        XFREE(hash, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+        return MEMORY_E;
+    }
     inLen = key->len;
     XMEMSET(input, 0, inLen);
 
@@ -9183,6 +12668,9 @@ static int GetEcbCheckValue(WP11_Object* secret, byte* dataOut,
 
     XFREE(hash, NULL, DYNAMIC_TYPE_TMP_BUFFER);
     XFREE(input, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+
+    if (ret != 0)
+        return CKR_FUNCTION_FAILED;
 
     return CKR_OK;
 }
@@ -9215,6 +12703,9 @@ int WP11_Object_GetAttr(WP11_Object* object, CK_ATTRIBUTE_TYPE type, byte* data,
         case CKA_LABEL:
             ret = GetData(object->label, object->labelLen, data, len);
             break;
+        case CKA_UNIQUE_ID:
+            ret = GetUniqueId(object, data, len);
+            break;
         case CKA_TOKEN:
             ret = GetBool(object->onToken, data, len);
             break;
@@ -9230,8 +12721,10 @@ int WP11_Object_GetAttr(WP11_Object* object, CK_ATTRIBUTE_TYPE type, byte* data,
                                                                            len);
             break;
         case CKA_MODIFIABLE:
-            ret = GetOpFlagBool(object->opFlag, WP11_FLAG_MODIFIABLE, data,
-                                                                           len);
+            /* PKCS#11 default is CK_TRUE; inverted flag matches the
+             * NOT_COPYABLE/NOT_DESTROYABLE pattern. */
+            ret = GetBool(
+                !(object->opFlag & WP11_FLAG_NOT_MODIFIABLE), data, len);
             break;
         case CKA_ALWAYS_SENSITIVE:
             ret = GetOpFlagBool(object->opFlag, WP11_FLAG_ALWAYS_SENSITIVE,
@@ -9253,10 +12746,16 @@ int WP11_Object_GetAttr(WP11_Object* object, CK_ATTRIBUTE_TYPE type, byte* data,
             ret = GetOpFlagBool(object->opFlag, WP11_FLAG_TRUSTED, data, len);
             break;
         case CKA_COPYABLE:
+#ifdef WOLFPKCS11_LEGACY_COPYABLE_FALSE_DEFAULT
             ret = GetBool(CK_FALSE, data, len);
+#else
+            ret = GetBool(
+                !(object->opFlag & WP11_FLAG_NOT_COPYABLE), data, len);
+#endif
             break;
         case CKA_DESTROYABLE:
-            ret = GetBool(CK_TRUE, data, len);
+            ret = GetBool(
+                !(object->opFlag & WP11_FLAG_NOT_DESTROYABLE), data, len);
             break;
         case CKA_APPLICATION:
             if (object->objClass == CKO_DATA) {
@@ -9330,6 +12829,14 @@ int WP11_Object_GetAttr(WP11_Object* object, CK_ATTRIBUTE_TYPE type, byte* data,
         case CKA_DERIVE:
             ret = GetOpFlagBool(object->opFlag, WP11_FLAG_DERIVE, data, len);
             break;
+        case CKA_ENCAPSULATE:
+            ret = GetOpFlagBool(object->opFlag, WP11_FLAG_ENCAPSULATE, data,
+                                len);
+            break;
+        case CKA_DECAPSULATE:
+            ret = GetOpFlagBool(object->opFlag, WP11_FLAG_DECAPSULATE, data,
+                                len);
+            break;
         case CKA_CERTIFICATE_TYPE:
             if (object->objClass == CKO_CERTIFICATE)
                 ret = GetULong(object->data.cert.type, data, len);
@@ -9378,9 +12885,30 @@ int WP11_Object_GetAttr(WP11_Object* object, CK_ATTRIBUTE_TYPE type, byte* data,
                             ret = EcObject_GetAttr(object, type, data, len);
                             break;
 #endif
+#ifdef WOLFPKCS11_MLDSA
+                        case CKK_ML_DSA:
+                            ret = MldsaObject_GetAttr(object, type, data, len);
+                            break;
+#endif
 #ifndef NO_DH
                         case CKK_DH:
                             ret = DhObject_GetAttr(object, type, data, len);
+                            break;
+#endif
+#ifdef WOLFPKCS11_MLKEM
+                        case CKK_ML_KEM:
+                            ret = MlKemObject_GetAttr(object, type, data, len);
+                            break;
+#endif
+#ifdef WOLFPKCS11_LMS
+                        case CKK_HSS:
+                            ret = HssObject_GetAttr(object, type, data, len);
+                            break;
+#endif
+#ifdef WOLFPKCS11_XMSS
+                        case CKK_XMSS:
+                        case CKK_XMSSMT:
+                            ret = XmssObject_GetAttr(object, type, data, len);
                             break;
 #endif
 #ifndef NO_AES
@@ -9589,6 +13117,15 @@ int WP11_Object_SetAttr(WP11_Object* object, CK_ATTRIBUTE_TYPE type, byte* data,
         case CKA_DERIVE:
             WP11_Object_SetOpFlag(object, WP11_FLAG_DERIVE, *(CK_BBOOL*)data);
             break;
+        case CKA_COPYABLE:
+            /* Stored as the inverse: flag set when value is CK_FALSE. */
+            WP11_Object_SetOpFlag(object, WP11_FLAG_NOT_COPYABLE,
+                                  !*(CK_BBOOL*)data);
+            break;
+        case CKA_DESTROYABLE:
+            WP11_Object_SetOpFlag(object, WP11_FLAG_NOT_DESTROYABLE,
+                                  !*(CK_BBOOL*)data);
+            break;
         case CKA_ID:
             ret = WP11_Object_SetKeyId(object, data, (int)len);
             break;
@@ -9611,8 +13148,10 @@ int WP11_Object_SetAttr(WP11_Object* object, CK_ATTRIBUTE_TYPE type, byte* data,
                                                               *(CK_BBOOL*)data);
             break;
         case CKA_MODIFIABLE:
-            WP11_Object_SetOpFlag(object, WP11_FLAG_MODIFIABLE,
-                                  *(CK_BBOOL*)data);
+            /* Inverted: store the NOT_MODIFIABLE bit when caller wants
+             * CKA_MODIFIABLE=CK_FALSE. */
+            WP11_Object_SetOpFlag(object, WP11_FLAG_NOT_MODIFIABLE,
+                                  !(*(CK_BBOOL*)data));
             break;
         case CKA_ALWAYS_SENSITIVE:
             WP11_Object_SetOpFlag(object, WP11_FLAG_ALWAYS_SENSITIVE,
@@ -9696,8 +13235,21 @@ int WP11_Object_SetAttr(WP11_Object* object, CK_ATTRIBUTE_TYPE type, byte* data,
 #ifdef HAVE_ECC
                 case CKK_EC:
 #endif
+#ifdef WOLFPKCS11_MLDSA
+                case CKK_ML_DSA:
+#endif
+#ifdef WOLFPKCS11_LMS
+                case CKK_HSS:
+#endif
+#ifdef WOLFPKCS11_XMSS
+                case CKK_XMSS:
+                case CKK_XMSSMT:
+#endif
 #ifndef NO_DH
                 case CKK_DH:
+#endif
+#ifdef WOLFPKCS11_MLKEM
+                case CKK_ML_KEM:
 #endif
 #ifndef NO_AES
                 case CKK_AES:
@@ -9781,10 +13333,118 @@ int WP11_Object_SetAttr(WP11_Object* object, CK_ATTRIBUTE_TYPE type, byte* data,
                 ret = BAD_FUNC_ARG;
             }
             break;
-
+        case CKA_PARAMETER_SET:
+            switch (object->type) {
+#ifdef WOLFPKCS11_MLDSA
+            case CKK_ML_DSA:
+                break;
+#endif
+#ifdef WOLFPKCS11_MLKEM
+            case CKK_ML_KEM:
+                break;
+#endif
+#ifdef WOLFPKCS11_XMSS
+            /* CKA_PARAMETER_SET carries the XMSS/XMSS^MT OID. HSS (CKK_HSS)
+             * has no such attribute in the PKCS#11 profile, so it is not
+             * listed here and falls through to the default rejection. */
+            case CKK_XMSS:
+            case CKK_XMSSMT:
+                break;
+#endif
+            default:
+                ret = BAD_FUNC_ARG;
+                break;
+            }
+            break;
+        case CKA_SEED:
+            switch (object->type) {
+#ifdef WOLFPKCS11_MLDSA
+                case CKK_ML_DSA:
+                    break;
+#endif
+#ifdef WOLFPKCS11_MLKEM
+                case CKK_ML_KEM:
+                    break;
+#endif
+                default:
+                    ret = BAD_FUNC_ARG;
+                    break;
+            }
+            break;
+        case CKA_ENCAPSULATE:
+            switch (object->type) {
+#ifdef WOLFPKCS11_MLKEM
+                case CKK_ML_KEM:
+                    if (object->objClass == CKO_PUBLIC_KEY) {
+                        WP11_Object_SetOpFlag(object, WP11_FLAG_ENCAPSULATE,
+                                              *(CK_BBOOL*)data);
+                    }
+                    else {
+                        ret = BAD_FUNC_ARG;
+                    }
+                    break;
+#endif
+                default:
+                    ret = BAD_FUNC_ARG;
+                    break;
+            }
+            break;
+        case CKA_DECAPSULATE:
+            switch (object->type) {
+#ifdef WOLFPKCS11_MLKEM
+                case CKK_ML_KEM:
+                    if (object->objClass == CKO_PRIVATE_KEY) {
+                        WP11_Object_SetOpFlag(object, WP11_FLAG_DECAPSULATE,
+                                              *(CK_BBOOL*)data);
+                    }
+                    else {
+                        ret = BAD_FUNC_ARG;
+                    }
+                    break;
+#endif
+                default:
+                    ret = BAD_FUNC_ARG;
+                    break;
+            }
+            break;
         case CKA_WOLFSSL_DEVID:
             object->devId = (int)(*(CK_ULONG*)data);
             break;
+#ifdef WOLFPKCS11_LMS
+        case CKA_HSS_LEVELS:
+        case CKA_HSS_LMS_TYPE:
+        case CKA_HSS_LMOTS_TYPE:
+            /* Scalar HSS parameter attributes are key-derived and read-only.
+             * WP11_Object_SetHssKey validated any supplied value against the
+             * imported public key (rejecting a value-less or mismatched set
+             * with CKR_ATTRIBUTE_VALUE_INVALID) before this runs, so accept them
+             * as a no-op on an HSS object so recreating one from its own
+             * attributes is not rejected; a foreign key type is rejected. */
+            if (object->type != CKK_HSS)
+                ret = BAD_FUNC_ARG;
+            break;
+        case CKA_HSS_LMS_TYPES:
+        case CKA_HSS_LMOTS_TYPES:
+            /* Per-level type arrays are read-only and served uniformly by
+             * HssObject_GetAttr, but are not collected by the import pass, so a
+             * supplied array is validated against the key here: a malformed or
+             * mismatched one is rejected (CKR_ATTRIBUTE_VALUE_INVALID) rather
+             * than silently ignored, while a matching array read back from this
+             * key is accepted so recreating one from its own attributes works. */
+            if (object->type != CKK_HSS)
+                ret = BAD_FUNC_ARG;
+            else
+                ret = wp11_HssCheckTypesAttr(object, type, data, len);
+            break;
+        case CKA_HSS_KEYS_REMAINING:
+            /* Remaining-signature count is a private-key/state property that a
+             * verify-only build never exposes (HssObject_GetAttr reports it
+             * unavailable, so a read-back template never carries it). It is not
+             * a settable value; reject any attempt to supply one rather than
+             * accepting it as a no-op. */
+            ret = BAD_FUNC_ARG;
+            break;
+#endif
 
     #ifdef WOLFSSL_STM32U5_DHUK
         case CKA_WOLFSSL_DHUK_IV:
@@ -9805,6 +13465,19 @@ int WP11_Object_SetAttr(WP11_Object* object, CK_ATTRIBUTE_TYPE type, byte* data,
 }
 
 /**
+ * Mark an object as locally generated and record the mechanism used.
+ *
+ * @param  object     [in]  Object to update.
+ * @param  mechanism  [in]  Generation mechanism.
+ */
+void WP11_Object_SetKeyGeneration(WP11_Object* object,
+                                  CK_MECHANISM_TYPE mechanism)
+{
+    object->local = 1;
+    object->keyGenMech = mechanism;
+}
+
+/**
  * Check whether the attribute matches in the object.
  *
  * @param  object  [in]  Object object.
@@ -9821,6 +13494,11 @@ int WP11_Object_MatchAttr(WP11_Object* object, CK_ATTRIBUTE_TYPE type,
     byte attrData[8];
     byte* ptr;
     CK_ULONG attrLen = len;
+
+    /* A NULL search value with a non-zero length cannot match any stored
+     * attribute and must not be dereferenced by the comparison below. */
+    if (data == NULL && len != 0)
+        return 0;
 
     /* Get the attribute data into the stack buffer if big enough. */
     if (len <= (int)sizeof(attrData)) {
@@ -9893,6 +13571,9 @@ static int WP11_Object_WrapTpmKey(WP11_Object* object)
                         (word32)exponent, q, qSz, TPM_ALG_NULL, TPM_ALG_NULL);
                 }
                 (void)p;
+                wc_ForceZero(d, sizeof(d));
+                wc_ForceZero(p, sizeof(p));
+                wc_ForceZero(q, sizeof(q));
             #endif
                 if (ret == 0) {
                     /* set flag indicating this is TPM based key */
@@ -9975,6 +13656,7 @@ static int WP11_Object_WrapTpmKey(WP11_Object* object)
                         &object->slot->tpmSrk, object->tpmKey, curve_id,
                         qx, qxSz, qy, qySz, d, dSz);
                 }
+                wc_ForceZero(d, sizeof(d));
         #endif
                 if (ret == 0) {
                     /* set flag indicating this is TPM based key */
@@ -10506,6 +14188,9 @@ int WP11_Rsa_Sign(unsigned char* in, word32 inLen, unsigned char* sig,
     byte data[RSA_MAX_SIZE / 8];
     word32 keyLen;
 
+    if (priv->onToken)
+        WP11_Lock_LockRO(priv->lock);
+
     keyLen = wc_RsaEncryptSize(priv->data.rsaKey);
     if (inLen < keyLen) {
         XMEMSET(data, 0, keyLen - inLen);
@@ -10514,8 +14199,6 @@ int WP11_Rsa_Sign(unsigned char* in, word32 inLen, unsigned char* sig,
         inLen = keyLen;
     }
 
-    if (priv->onToken)
-        WP11_Lock_LockRO(priv->lock);
     ret = Rng_New(&slot->token.rng, &slot->token.rngLock, &rng);
     if (ret == 0) {
     #ifdef WOLFPKCS11_TPM
@@ -10562,44 +14245,65 @@ int WP11_Rsa_Verify_Recover(CK_MECHANISM_TYPE mechanism, unsigned char* sig,
 {
     int ret;
 
+    if (pub->onToken)
+        WP11_Lock_LockRO(pub->lock);
+
     switch (mechanism) {
         case CKM_RSA_PKCS:
             ret = wc_RsaSSL_Verify(sig, sigLen, out, (word32)*outLen,
                                          pub->data.rsaKey);
-            if (ret == RSA_BUFFER_E)
-                return CKR_BUFFER_TOO_SMALL;
-            if (ret < 0)
-                return CKR_FUNCTION_FAILED;
-
-            *outLen = ret;
+            if (ret == RSA_BUFFER_E) {
+                ret = CKR_BUFFER_TOO_SMALL;
+            }
+            else if (ret < 0) {
+                ret = CKR_FUNCTION_FAILED;
+            }
+            else {
+                *outLen = ret;
+                ret = CKR_OK;
+            }
             break;
 
         case CKM_RSA_X_509: {
             byte* data_out = NULL;
             byte* pos;
-            ret =  wc_RsaDirect(sig, sigLen, out, (word32*)outLen,
+            /* wc_RsaDirect writes a word32 through the length pointer. Use a
+             * local word32 rather than casting the CK_ULONG_PTR so that only
+             * the low word of *outLen is not partially updated; assign the
+             * result back on success. */
+            word32 tmpLen = (word32)*outLen;
+            ret =  wc_RsaDirect(sig, sigLen, out, &tmpLen,
                                 pub->data.rsaKey, RSA_PUBLIC_DECRYPT, NULL);
-            if (ret < 0)
-                return CKR_FUNCTION_FAILED;
-            /* Result is front padded with 0x00 */
-            for (pos = out; pos < out + *outLen; pos++) {
-                if (*pos != 0x00) {
-                    data_out = pos;
-                    break;
-                }
+            if (ret < 0) {
+                ret = CKR_FUNCTION_FAILED;
             }
-            if (data_out != NULL) {
-                *outLen = (out + *outLen) - data_out;
-                XMEMMOVE(out, data_out, *outLen);
+            else {
+                *outLen = tmpLen;
+                ret = CKR_OK;
+                /* Result is front padded with 0x00 */
+                for (pos = out; pos < out + *outLen; pos++) {
+                    if (*pos != 0x00) {
+                        data_out = pos;
+                        break;
+                    }
+                }
+                if (data_out != NULL) {
+                    *outLen = (CK_ULONG)((out + *outLen) - data_out);
+                    XMEMMOVE(out, data_out, *outLen);
+                }
             }
             break;
         }
         default:
             /* Should never happen */
-            return CKR_FUNCTION_FAILED;
+            ret = CKR_FUNCTION_FAILED;
+            break;
     }
 
-    return CKR_OK;
+    if (pub->onToken)
+        WP11_Lock_UnlockRO(pub->lock);
+
+    return ret;
 }
 
 /**
@@ -10626,8 +14330,12 @@ int WP11_Rsa_Verify(unsigned char* sig, word32 sigLen, unsigned char* in,
     if (pub->onToken)
         WP11_Lock_LockRO(pub->lock);
     decSigLen = wc_RsaEncryptSize(pub->data.rsaKey);
-    if (inLen > decSigLen)
+    if (inLen > decSigLen) {
+        if(pub->onToken)
+            WP11_Lock_UnlockRO(pub->lock);
         return BUFFER_E;
+    }
+
     ret = wc_RsaDirect(sig, sigLen, decSig, &decSigLen, pub->data.rsaKey,
                        RSA_PUBLIC_DECRYPT, NULL);
     if (pub->onToken)
@@ -10838,6 +14546,116 @@ int WP11_RsaPKCSPSS_Verify(unsigned char* sig, word32 sigLen,
 #endif /* !NO_RSA */
 
 #ifdef HAVE_ECC
+#ifdef WOLFPKCS11_TPM
+/**
+ * Generate an EC key pair on the TPM.
+ *
+ * The key is created under the storage key with capabilities matching the
+ * object's attributes: CKA_SIGN maps to the TPM sign attribute and CKA_DERIVE
+ * to the decrypt attribute, which TPM2_ECDH_ZGen requires. When both are set
+ * the null scheme is used, as the TPM mandates for sign+decrypt keys.
+ *
+ * @param  priv      [in]   Private key object.
+ * @param  slot      [in]   Slot operation is performed on.
+ * @param  genOnTpm  [out]  1 when the key was generated on the TPM, 0 when
+ *                          the curve is not supported and the key is to be
+ *                          generated in software.
+ * @return  -ve when key generation fails.
+ *          0 on success.
+ */
+static int EcGenerateTpmKey(WP11_Object* priv, WP11_Slot* slot, int* genOnTpm)
+{
+    int ret;
+    int curveId = 0;
+    int objAttrs;
+    CK_BBOOL isSign = CK_FALSE;
+    CK_BBOOL isDerive = CK_FALSE;
+    CK_ULONG len;
+    TPM_ALG_ID scheme;
+    TPMI_ALG_HASH hashAlg;
+    TPMT_PUBLIC publicTemplate;
+
+    *genOnTpm = 0;
+
+    len = sizeof(isSign);
+    ret = WP11_Object_GetAttr(priv, CKA_SIGN, &isSign, &len);
+    if (ret == 0) {
+        len = sizeof(isDerive);
+        ret = WP11_Object_GetAttr(priv, CKA_DERIVE, &isDerive, &len);
+    }
+
+    if (ret == 0) {
+        ret = TPM2_GetTpmCurve(priv->data.ecKey->dp->id);
+        if (ret < 0) {
+            /* Curve not known to the TPM - generate in software. */
+            return 0;
+        }
+        curveId = ret;
+        ret = 0;
+    }
+
+    if (ret == 0) {
+        objAttrs = TPMA_OBJECT_sensitiveDataOrigin | TPMA_OBJECT_userWithAuth |
+                                                              TPMA_OBJECT_noDA;
+        if (isSign)
+            objAttrs |= TPMA_OBJECT_sign;
+        if (isDerive || !isSign)
+            objAttrs |= TPMA_OBJECT_decrypt;
+        /* The TPM requires the null scheme when both sign and decrypt are
+         * set. Otherwise bind the key to its one scheme. */
+        if (isSign && isDerive)
+            scheme = TPM_ALG_NULL;
+        else if (isSign)
+            scheme = TPM_ALG_ECDSA;
+        else
+            scheme = TPM_ALG_ECDH;
+
+        ret = wolfTPM2_GetKeyTemplate_ECC(&publicTemplate,
+            (TPMA_OBJECT)objAttrs, (TPM_ECC_CURVE)curveId, scheme);
+    }
+    if (ret == 0) {
+        /* Match the name and scheme hash to the curve strength. The scheme
+         * may be ECDSA, ECDH or NULL, so set the hash through the common
+         * member the marshalling reads. */
+        if (curveId == TPM_ECC_NIST_P521)
+            hashAlg = TPM_ALG_SHA512;
+        else if (curveId == TPM_ECC_NIST_P384)
+            hashAlg = TPM_ALG_SHA384;
+        else
+            hashAlg = TPM_ALG_SHA256;
+        publicTemplate.nameAlg = hashAlg;
+        publicTemplate.parameters.eccDetail.scheme.details.any.hashAlg =
+            hashAlg;
+
+        ret = wolfTPM2_CreateKey(&slot->tpmDev, priv->tpmKey,
+            &slot->tpmSrk.handle, &publicTemplate, NULL, 0);
+        if (ret == 0) {
+            ret = wolfTPM2_LoadKey(&slot->tpmDev, priv->tpmKey,
+                &slot->tpmSrk.handle);
+        }
+        if (ret > 0 && (ret & RC_MAX_FMT1) == TPM_RC_CURVE) {
+            /* Curve not supported on this TPM - generate in software. */
+            priv->tpmKey->handle.hndl = TPM_RH_NULL;
+            return 0;
+        }
+    }
+    if (ret == 0) {
+        /* Export the public part into the wolf key. */
+        ret = wolfTPM2_EccKey_TpmToWolf(&slot->tpmDev,
+            (WOLFTPM2_KEY*)priv->tpmKey, priv->data.ecKey);
+        if (ret == 0) {
+            /* set flag indicating this is TPM based key */
+            priv->opFlag |= WP11_FLAG_TPM;
+            *genOnTpm = 1;
+        }
+        /* unload handle and reload when used */
+        wolfTPM2_UnloadHandle(&slot->tpmDev, &priv->tpmKey->handle);
+    }
+
+    return ret;
+}
+#endif /* WOLFPKCS11_TPM */
+
 /**
  * Generate an EC key pair.
  *
@@ -10852,43 +14670,44 @@ int WP11_Ec_GenerateKeyPair(WP11_Object* pub, WP11_Object* priv,
 {
     int ret = 0;
     WC_RNG rng;
+#ifdef WOLFPKCS11_TPM
+    int genOnTpm = 0;
+#endif
 
     ret = wc_ecc_init_ex(priv->data.ecKey, NULL, priv->devId);
     if (ret == 0) {
-    #ifdef WOLFPKCS11_TPM
-        CK_BBOOL isSign = CK_FALSE;
-        CK_ULONG len = sizeof(isSign);
-        ret = WP11_Object_GetAttr(priv, CKA_SIGN, &isSign, &len);
-        if (ret == 0 && isSign) {
-        #if defined(LIBWOLFTPM_VERSION_HEX) && LIBWOLFTPM_VERSION_HEX > 0x03009000
-            priv->slot->tpmCtx.ecdsaKey = priv->tpmKey;
-        #else
-            priv->slot->tpmCtx.eccKey = (WOLFTPM2_KEY*)priv->tpmKey;
-        #endif
-        }
-        else {
-            priv->slot->tpmCtx.ecdhKey = (WOLFTPM2_KEY*)priv->tpmKey;
-        }
-    #endif
-
         /* Copy parameters from public key into private key. */
         priv->data.ecKey->dp = pub->data.ecKey->dp;
 
-        /* Generate into the private key. */
-        ret = Rng_New(&slot->token.rng, &slot->token.rngLock, &rng);
-        if (ret == 0) {
-            ret = wc_ecc_make_key_ex(&rng, priv->data.ecKey->dp->size,
-                                    priv->data.ecKey, priv->data.ecKey->dp->id);
+    #ifdef WOLFPKCS11_TPM
+        /* Create the key on the TPM with capabilities matching the object's
+         * attributes. The crypto callback key generation is not used as it
+         * only creates signing keys, which the TPM refuses to use for ECDH,
+         * and the software copy of a TPM key holds no private scalar. */
+        ret = EcGenerateTpmKey(priv, slot, &genOnTpm);
+        if (ret == 0 && !genOnTpm)
+    #endif
+        {
         #ifdef WOLFPKCS11_TPM
-            if (ret == 0) {
-                /* set flag indicating this is TPM based key */
-                priv->opFlag |= WP11_FLAG_TPM;
-
-                /* unload handle and reload when used */
-                wolfTPM2_UnloadHandle(&slot->tpmDev, &priv->tpmKey->handle);
-            }
+            /* Curve not supported on the TPM - generate a software key.
+             * Clear the crypto callback key references so the callback
+             * yields to software instead of acting on a previous key. */
+            #if defined(LIBWOLFTPM_VERSION_HEX) && \
+                LIBWOLFTPM_VERSION_HEX > 0x03009000
+            slot->tpmCtx.ecdsaKey = NULL;
+            #else
+            slot->tpmCtx.eccKey = NULL;
+            #endif
+            slot->tpmCtx.ecdhKey = NULL;
         #endif
-            Rng_Free(&rng);
+
+            /* Generate into the private key. */
+            ret = Rng_New(&slot->token.rng, &slot->token.rngLock, &rng);
+            if (ret == 0) {
+                ret = wc_ecc_make_key_ex(&rng, priv->data.ecKey->dp->size,
+                                    priv->data.ecKey, priv->data.ecKey->dp->id);
+                Rng_Free(&rng);
+            }
         }
         if (ret == 0) {
             /* Copy the public part into public key. */
@@ -11195,6 +15014,9 @@ int WP11_EC_Derive(unsigned char* point, word32 pointLen, unsigned char* key,
     WC_RNG rng;
 #endif
 
+    if (priv->onToken)
+        WP11_Lock_LockRO(priv->lock);
+
     /* Check if the point data is DER-encoded (starts with OCTET STRING tag) */
     if (pointLen >= 3 && point[0] == ASN_OCTET_STRING) {
         /* Strip DER encoding - similar to EcSetPoint function */
@@ -11237,32 +15059,59 @@ int WP11_EC_Derive(unsigned char* point, word32 pointLen, unsigned char* key,
     (defined(HAVE_FIPS_VERSION) && (HAVE_FIPS_VERSION > 2)))
     if (ret == 0) {
         ret = Rng_New(&priv->slot->token.rng, &priv->slot->token.rngLock, &rng);
-        wc_ecc_set_rng(priv->data.ecKey, &rng);
+        if (ret == 0)
+            wc_ecc_set_rng(priv->data.ecKey, &rng);
     }
 #endif
     if (ret == 0) {
-        if (priv->onToken)
-            WP11_Lock_LockRO(priv->lock);
     #ifdef WOLFPKCS11_TPM
-        ret = WP11_Object_LoadTpmKey(priv);
-        if (ret == 0)
+        if (priv->opFlag & WP11_FLAG_TPM) {
+            /* The private scalar only exists inside the TPM (the software
+             * key holds just the public point), so the shared secret must
+             * be computed with TPM2_ECDH_ZGen. Falling through to software
+             * would derive from an empty scalar. */
+            TPM2B_ECC_POINT pubPoint;
+            int zSz = (int)*keyLen;
+
+            XMEMSET(&pubPoint, 0, sizeof(pubPoint));
+            if ((priv->tpmKey->pub.publicArea.objectAttributes &
+                                                  TPMA_OBJECT_decrypt) == 0) {
+                /* Key created without the decrypt attribute (a sign-only
+                 * key, for example from a store written before derive
+                 * support) - the TPM will not permit ECDH with it and
+                 * there is no software private key to fall back on. */
+                ret = BAD_FUNC_ARG;
+            }
+            if (ret == 0)
+                ret = WP11_Object_LoadTpmKey(priv);
+            if (ret == 0) {
+                ret = wolfTPM2_EccKey_WolfToPubPoint(&priv->slot->tpmDev,
+                    &pubKey, &pubPoint);
+                if (ret == 0) {
+                    ret = wolfTPM2_ECDHGenZ(&priv->slot->tpmDev,
+                        (WOLFTPM2_KEY*)priv->tpmKey, &pubPoint, key, &zSz);
+                }
+                if (ret == 0)
+                    *keyLen = (word32)zSz;
+                wolfTPM2_UnloadHandle(&priv->slot->tpmDev,
+                    &priv->tpmKey->handle);
+            }
+        }
+        else
     #endif
         {
             PRIVATE_KEY_UNLOCK();
             ret = wc_ecc_shared_secret(priv->data.ecKey, &pubKey, key, keyLen);
             PRIVATE_KEY_LOCK();
-
-        #ifdef WOLFPKCS11_TPM
-            wolfTPM2_UnloadHandle(&priv->slot->tpmDev, &priv->tpmKey->handle);
-        #endif
         }
-        if (priv->onToken)
-            WP11_Lock_UnlockRO(priv->lock);
 #if defined(ECC_TIMING_RESISTANT) && (!defined(HAVE_FIPS) || \
     (defined(HAVE_FIPS_VERSION) && (HAVE_FIPS_VERSION > 2)))
         Rng_Free(&rng);
 #endif
     }
+
+    if (priv->onToken)
+        WP11_Lock_UnlockRO(priv->lock);
 
     wc_ecc_free(&pubKey);
 
@@ -11270,16 +15119,231 @@ int WP11_EC_Derive(unsigned char* point, word32 pointLen, unsigned char* key,
 }
 #endif /* HAVE_ECC */
 
+#ifdef WOLFPKCS11_MLDSA
+/**
+ * Generate an ML-DSA key pair.
+ *
+ * @param  pub      [in]  Public key object.
+ * @param  priv     [in]  Private key object.
+ * @param  slot     [in]  Slot operation is performed on.
+ * @return  -ve when key generation fails.
+ *          0 on success.
+ */
+int WP11_Mldsa_GenerateKeyPair(WP11_Object* pub, WP11_Object* priv,
+                               WP11_Slot* slot)
+{
+    int ret = 0;
+    byte* pubKey = NULL;
+    word32 pubKeyLen = 0;
+    WC_RNG rng;
+    byte level = 0;
+
+    /* Both wc_MlDsaKey objects inside the pub and priv WP11_Objects are
+     * already initialized. The pub key is also set to a proper level
+     * within WP11_Object_SetMldsaKey() based on the given parameter
+     * set. */
+
+    /* Copy level from pub to priv */
+    ret = wc_MlDsaKey_GetParams(pub->data.mldsaKey, &level);
+    if (ret == 0) {
+        ret = wc_MlDsaKey_SetParams(priv->data.mldsaKey, level);
+    }
+
+    /* Generate into the private key. */
+    if (ret == 0) {
+        ret = Rng_New(&slot->token.rng, &slot->token.rngLock, &rng);
+        if (ret == 0) {
+            ret = wc_MlDsaKey_MakeKey(priv->data.mldsaKey, &rng);
+            Rng_Free(&rng);
+        }
+    }
+    if (ret == 0) {
+        ret = wc_MlDsaKey_GetPubLen(priv->data.mldsaKey, (int*)&pubKeyLen);
+    }
+    if (ret == 0) {
+        /* Allocate memory for the public key */
+        pubKey = XMALLOC(pubKeyLen, NULL, DYNAMIC_TYPE_PUBLIC_KEY);
+        if (pubKey == NULL) {
+            ret = MEMORY_E;
+        }
+    }
+    if (ret == 0) {
+        /* Export the public key */
+        ret = wc_MlDsaKey_ExportPubRaw(priv->data.mldsaKey, pubKey, &pubKeyLen);
+    }
+    if (ret == 0) {
+        /* Copy the public part into public key. */
+        ret = wc_MlDsaKey_ImportPubRaw(pub->data.mldsaKey, pubKey, pubKeyLen);
+    }
+    if (ret == 0) {
+        priv->local = 1;
+        pub->local = 1;
+        priv->keyGenMech = CKM_ML_DSA_KEY_PAIR_GEN;
+        pub->keyGenMech = CKM_ML_DSA_KEY_PAIR_GEN;
+    }
+
+    if (pubKey != NULL) {
+        XFREE(pubKey, NULL, DYNAMIC_TYPE_PUBLIC_KEY);
+    }
+
+    return ret;
+}
+
+/**
+* Return the length of a signature in bytes.
+*
+* @param  key  [in]  ML-DSA key object.
+* @return  Length of ML-DSA signature in bytes.
+*/
+int WP11_Mldsa_SigLen(WP11_Object* key)
+{
+    int len = 0;
+
+    if (wc_MlDsaKey_GetSigLen(key->data.mldsaKey, &len) != 0)
+        len = 0;
+
+    return len;
+}
+
+/**
+* ML-DSA sign data with private key.
+*
+* @param  data     [in]      Data to sign (message or hash).
+* @param  dataLen  [in]      Length of data in bytes.
+* @param  sig      [in]      Buffer to hold signature data.
+* @param  sigLen   [in,out]  On in, length of buffer.
+*                            On out, length data in buffer.
+* @param  priv     [in]      Private key object.
+* @param  session  [in]      Session object holding parameters.
+* @return  BUFFER_E when sigLen is too small.
+*          Other -ve when signing fails.
+*          0 on success.
+*/
+int WP11_Mldsa_Sign(unsigned char* data, word32 dataLen, unsigned char* sig,
+                    word32* sigLen, WP11_Object* priv, WP11_Session* session)
+{
+    int ret = 0;
+    WP11_Slot* slot = WP11_Session_GetSlot(session);
+    WP11_MldsaParams* params = &session->params.mldsa;
+    WC_RNG rng;
+
+    if (priv->onToken)
+        WP11_Lock_LockRO(priv->lock);
+
+    ret = Rng_New(&slot->token.rng, &slot->token.rngLock, &rng);
+    if (ret == 0) {
+        if (params->preHashType == WC_HASH_TYPE_NONE) {
+            if (params->hedgeType == CKH_HEDGE_PREFERRED ||
+                                      params->hedgeType == CKH_HEDGE_REQUIRED) {
+                ret = wc_MlDsaKey_SignCtx(priv->data.mldsaKey, params->ctx,
+                                        params->ctxSz, sig, sigLen, data,
+                                        dataLen, &rng);
+            }
+            else if (params->hedgeType == CKH_DETERMINISTIC_REQUIRED) {
+                /* FIPS 204: 32 zeros as seed for deterministic ML-DSA */
+                byte seed[32];
+                XMEMSET(seed, 0x00, sizeof(seed));
+                ret = wc_MlDsaKey_SignCtxWithSeed(priv->data.mldsaKey,
+                                                  params->ctx, params->ctxSz,
+                                                  sig, sigLen, data, dataLen,
+                                                  seed);
+            }
+            else {
+                ret = BAD_FUNC_ARG;
+            }
+        }
+        else {
+            if (params->hedgeType == CKH_HEDGE_PREFERRED ||
+                                      params->hedgeType == CKH_HEDGE_REQUIRED) {
+                ret = wc_MlDsaKey_SignCtxHash(priv->data.mldsaKey,
+                                              params->ctx, params->ctxSz,
+                                              sig, sigLen, data, dataLen,
+                                              params->preHashType, &rng);
+            }
+            else if (params->hedgeType == CKH_DETERMINISTIC_REQUIRED) {
+                /* FIPS 204: 32 zeros as seed for deterministic ML-DSA */
+                byte seed[32];
+                XMEMSET(seed, 0x00, sizeof(seed));
+                ret = wc_MlDsaKey_SignCtxHashWithSeed(priv->data.mldsaKey,
+                        params->ctx, params->ctxSz, sig, sigLen, data, dataLen,
+                        params->preHashType, seed);
+            }
+            else {
+                ret = BAD_FUNC_ARG;
+            }
+        }
+        Rng_Free(&rng);
+    }
+
+    params->ctxSz = 0;
+
+    if (priv->onToken)
+        WP11_Lock_UnlockRO(priv->lock);
+
+    return ret;
+}
+
+/**
+* ML-DSA verify signature for data with public key.
+*
+* @param  sig      [in]   Signature data.
+* @param  sigLen   [in]   Length of buffer in bytes.
+* @param  data     [in]   Data to verify.
+* @param  dataLen  [in]   Length of data in bytes.
+* @param  stat     [out]  Status of verification. 1 on success, otherwise 0.
+* @param  pub      [in]   Public key object.
+* @param  session  [in]   Session object holding parameters.
+* @return  -ve when verifying fails.
+*          0 on success.
+*/
+int WP11_Mldsa_Verify(unsigned char* sig, word32 sigLen, unsigned char* data,
+                      word32 dataLen, int* stat, WP11_Object* pub,
+                      WP11_Session* session)
+{
+    int ret = 0;
+    WP11_MldsaParams* params = &session->params.mldsa;
+
+    *stat = 0;
+    if (pub->onToken)
+        WP11_Lock_LockRO(pub->lock);
+
+    if (sigLen != (word32)WP11_Mldsa_SigLen(pub))
+        ret = BAD_FUNC_ARG;
+
+    if (ret == 0) {
+        if (params->preHashType == WC_HASH_TYPE_NONE) {
+            ret = wc_MlDsaKey_VerifyCtx(pub->data.mldsaKey, sig, sigLen,
+                                        params->ctx, params->ctxSz, data,
+                                        dataLen, stat);
+        }
+        else {
+            ret = wc_MlDsaKey_VerifyCtxHash(pub->data.mldsaKey, sig, sigLen,
+                    params->ctx, params->ctxSz, data, dataLen,
+                    params->preHashType, stat);
+        }
+    }
+
+    params->ctxSz = 0;
+
+    if (pub->onToken)
+        WP11_Lock_UnlockRO(pub->lock);
+
+    return ret;
+}
+#endif /* WOLFPKCS11_MLDSA */
+
 #if defined(WOLFPKCS11_HKDF) || !defined(NO_AES)
 /**
  * Generate a secret key.
  *
- * @param  secret  [in]  Secret object.
- * @param  slot    [in]  Slot operation is performed on.
+ * @param  secret     [in]  Secret object.
+ * @param  slot       [in]  Slot operation is performed on.
+ * @param  mechanism  [in]  Key generation mechanism.
  * @return  -ve on random number generation failure.
  *          0 on success.
  */
-int WP11_GenerateRandomKey(WP11_Object* secret, WP11_Slot* slot)
+int WP11_GenerateRandomKey(WP11_Object* secret, WP11_Slot* slot,
+                           CK_MECHANISM_TYPE mechanism)
 {
     int ret;
     WP11_Data* key = secret->data.symmKey;
@@ -11287,6 +15351,11 @@ int WP11_GenerateRandomKey(WP11_Object* secret, WP11_Slot* slot)
     WP11_Lock_LockRW(&slot->token.rngLock);
     ret = wc_RNG_GenerateBlock(&slot->token.rng, key->data, key->len);
     WP11_Lock_UnlockRW(&slot->token.rngLock);
+
+    if (ret == 0) {
+        secret->local = 1;
+        secret->keyGenMech = mechanism;
+    }
 
     return ret;
 }
@@ -11454,6 +15523,205 @@ int WP11_Dh_Derive(unsigned char* pub, word32 pubLen, unsigned char* key,
 }
 #endif /* !NO_DH */
 
+#ifdef WOLFPKCS11_MLKEM
+/**
+ * Generate an ML-KEM key pair.
+ *
+ * @param  pub   [in]  Public key object (already initialized with parameter set
+ *                     via WP11_Object_SetMlKemKey).
+ * @param  priv  [in]  Private key object (already initialized with parameter
+ *                     set via WP11_Object_SetMlKemKey).
+ * @param  slot  [in]  Slot object for RNG access.
+ * @return  0 on success.
+ * @return  -ve on failure.
+ */
+int WP11_MlKem_GenerateKeyPair(WP11_Object* pub, WP11_Object* priv,
+                               WP11_Slot* slot)
+{
+    int ret = 0;
+    byte* pubKeyBytes = NULL;
+    word32 pubKeyLen = 0;
+    WC_RNG rng;
+
+    /* Both public and private key are already initialized. */
+
+    ret = Rng_New(&slot->token.rng, &slot->token.rngLock, &rng);
+    if (ret == 0) {
+        ret = wc_MlKemKey_MakeKey(priv->data.mlKemKey, &rng);
+        Rng_Free(&rng);
+    }
+    if (ret == 0) {
+        ret = wc_MlKemKey_PublicKeySize(priv->data.mlKemKey, &pubKeyLen);
+    }
+    if (ret == 0) {
+        pubKeyBytes = (byte*)XMALLOC(pubKeyLen, NULL, DYNAMIC_TYPE_PUBLIC_KEY);
+        if (pubKeyBytes == NULL)
+            ret = MEMORY_E;
+    }
+    if (ret == 0) {
+        ret = wc_MlKemKey_EncodePublicKey(priv->data.mlKemKey, pubKeyBytes,
+                                          pubKeyLen);
+    }
+    if (ret == 0) {
+        /* Re-init the public key before decoding into it since it was
+         * already Init'd during NewObject -> WP11_Object_SetMlKemKey. */
+        wc_MlKemKey_Free(pub->data.mlKemKey);
+        ret = wc_MlKemKey_Init(pub->data.mlKemKey, priv->data.mlKemKey->type,
+                               NULL, pub->devId);
+    }
+    if (ret == 0) {
+        ret = wc_MlKemKey_DecodePublicKey(pub->data.mlKemKey, pubKeyBytes,
+                                          pubKeyLen);
+    }
+    if (ret == 0) {
+        priv->local = 1;
+        pub->local = 1;
+        priv->keyGenMech = CKM_ML_KEM_KEY_PAIR_GEN;
+        pub->keyGenMech = CKM_ML_KEM_KEY_PAIR_GEN;
+    }
+
+    if (pubKeyBytes != NULL)
+        XFREE(pubKeyBytes, NULL, DYNAMIC_TYPE_PUBLIC_KEY);
+
+    return ret;
+}
+
+/**
+ * Encapsulate: generate a shared secret and ciphertext using the public key.
+ *
+ * @param  pub              [in]      Public key object.
+ * @param  sharedSecret     [out]     Allocated buffer with shared secret.
+ * @param  ssLen            [out]     Length of shared secret in bytes.
+ * @param  pCiphertext      [out]     Buffer to hold ciphertext.
+ * @param  pulCiphertextLen [in,out]  On in, size of buffer. On out, ciphertext
+ *                                   length.
+ * @return  0 on success.
+ * @return  -ve on failure.
+ */
+int WP11_MlKem_Encapsulate(WP11_Object* pub, unsigned char** sharedSecret,
+                           word32* ssLen, CK_BYTE_PTR pCiphertext,
+                           CK_ULONG_PTR pulCiphertextLen)
+{
+    int ret;
+    int rngInit = 0;
+    WC_RNG rng;
+    MlKemKey* mlKemKey;
+    word32 ctLen = 0;
+
+    *sharedSecret = NULL;
+
+    if (WP11_Object_GetType(pub) != CKK_ML_KEM)
+        return CKR_KEY_TYPE_INCONSISTENT;
+    if ((pub->opFlag & WP11_FLAG_ENCAPSULATE) == 0)
+        return CKR_KEY_FUNCTION_NOT_PERMITTED;
+
+    if (pub->onToken)
+        WP11_Lock_LockRO(pub->lock);
+
+    mlKemKey = pub->data.mlKemKey;
+    ret = wc_MlKemKey_CipherTextSize(mlKemKey, &ctLen);
+    if (ret == 0) {
+        if (pCiphertext == NULL) {
+            *pulCiphertextLen = ctLen;
+            if (pub->onToken)
+                WP11_Lock_UnlockRO(pub->lock);
+            return CKR_OK;
+        }
+        else if (*pulCiphertextLen < ctLen) {
+            *pulCiphertextLen = ctLen;
+            if (pub->onToken)
+                WP11_Lock_UnlockRO(pub->lock);
+            return CKR_BUFFER_TOO_SMALL;
+        }
+        *pulCiphertextLen = ctLen;
+        ret = Rng_New(&pub->slot->token.rng, &pub->slot->token.rngLock, &rng);
+        if (ret == 0)
+            rngInit = 1;
+    }
+    if (ret == 0) {
+        ret = wc_MlKemKey_SharedSecretSize(mlKemKey, ssLen);
+    }
+    if (ret == 0) {
+        *sharedSecret = (unsigned char*)XMALLOC(*ssLen, NULL,
+                                                DYNAMIC_TYPE_TMP_BUFFER);
+        if (*sharedSecret == NULL)
+            ret = MEMORY_E;
+    }
+    if (ret == 0) {
+        ret = wc_MlKemKey_Encapsulate(mlKemKey, pCiphertext, *sharedSecret,
+                                      &rng);
+    }
+
+    if (rngInit)
+        Rng_Free(&rng);
+
+    if (ret != 0 && *sharedSecret != NULL) {
+        wc_ForceZero(*sharedSecret, *ssLen);
+        XFREE(*sharedSecret, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+        *sharedSecret = NULL;
+    }
+
+    if (pub->onToken)
+        WP11_Lock_UnlockRO(pub->lock);
+
+    return ret;
+}
+
+/**
+ * Decapsulate: recover the shared secret from the ciphertext using the private
+ * key.
+ *
+ * @param  priv            [in]   Private key object.
+ * @param  sharedSecret    [out]  Allocated buffer with shared secret.
+ * @param  ssLen           [out]  Length of shared secret in bytes.
+ * @param  pCiphertext     [in]   Ciphertext buffer.
+ * @param  ulCiphertextLen [in]   Length of ciphertext in bytes.
+ * @return  0 on success.
+ * @return  -ve on failure.
+ */
+int WP11_MlKem_Decapsulate(WP11_Object* priv, unsigned char** sharedSecret,
+                           word32* ssLen, CK_BYTE_PTR pCiphertext,
+                           CK_ULONG ulCiphertextLen)
+{
+    int ret;
+    MlKemKey* mlKemKey;
+
+    *sharedSecret = NULL;
+
+    if (WP11_Object_GetType(priv) != CKK_ML_KEM)
+        return CKR_KEY_TYPE_INCONSISTENT;
+    if ((priv->opFlag & WP11_FLAG_DECAPSULATE) == 0)
+        return CKR_KEY_FUNCTION_NOT_PERMITTED;
+
+    if (priv->onToken)
+        WP11_Lock_LockRO(priv->lock);
+
+    mlKemKey = priv->data.mlKemKey;
+    ret = wc_MlKemKey_SharedSecretSize(mlKemKey, ssLen);
+    if (ret == 0) {
+        *sharedSecret = (unsigned char*)XMALLOC(*ssLen, NULL,
+                                                DYNAMIC_TYPE_TMP_BUFFER);
+        if (*sharedSecret == NULL)
+            ret = MEMORY_E;
+    }
+    if (ret == 0) {
+        ret = wc_MlKemKey_Decapsulate(mlKemKey, *sharedSecret, pCiphertext,
+                                      (word32)ulCiphertextLen);
+    }
+
+    if (ret != 0 && *sharedSecret != NULL) {
+        wc_ForceZero(*sharedSecret, *ssLen);
+        XFREE(*sharedSecret, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+        *sharedSecret = NULL;
+    }
+
+    if (priv->onToken)
+        WP11_Lock_UnlockRO(priv->lock);
+
+    return ret;
+}
+#endif /* WOLFPKCS11_MLKEM */
+
 #ifndef NO_AES
 
 #ifdef HAVE_AES_CBC
@@ -11531,8 +15799,16 @@ int WP11_Tls12_Master_Key_Derive(CK_SSL3_RANDOM_DATA* random,
         return BAD_FUNC_ARG;
     }
 
+    /* Reject CK_ULONG additions that wrap or that wouldn't fit word32 when
+     * later passed to wc_PRF_TLS. TLS 1.2 random length is fixed at 32 bytes
+     * per RFC 5246, but the PKCS#11 API accepts arbitrary CK_ULONG lengths
+     * from the caller, so guard explicitly. */
+    if (random->ulClientRandomLen >
+            (CK_ULONG)0xFFFFFFFF - random->ulServerRandomLen) {
+        return CKR_MECHANISM_PARAM_INVALID;
+    }
     ulSeedLen = random->ulClientRandomLen + random->ulServerRandomLen;
-    if (ulSeedLen == 0) {
+    if (ulSeedLen == 0 || ulSeedLen > (CK_ULONG)0xFFFFFFFF) {
         return CKR_MECHANISM_PARAM_INVALID;
     }
     pSeed = (byte*)XMALLOC(ulSeedLen, NULL, DYNAMIC_TYPE_TMP_BUFFER);
@@ -11646,6 +15922,13 @@ int WP11_AesCbc_EncryptUpdate(unsigned char* plain, word32 plainSz,
     int sz = 0;
     int outSz = 0;
 
+    /* Serialize the read-modify-write of cbc->partial/partialSz. Without this
+     * two threads sharing one session handle can both read partialSz, both
+     * copy into cbc->partial and both add, driving partialSz past
+     * AES_BLOCK_SIZE so the next call computes a negative sz and overflows the
+     * 16-byte partial buffer (F-5764). No caller holds slot->lock here. */
+    WP11_Lock_LockRW(&session->slot->lock);
+
     if (cbc->partialSz > 0) {
         sz = AES_BLOCK_SIZE - cbc->partialSz;
         if (sz > (int)plainSz)
@@ -11679,6 +15962,7 @@ int WP11_AesCbc_EncryptUpdate(unsigned char* plain, word32 plainSz,
     if (ret == 0)
         *encSz = outSz;
 
+    WP11_Lock_UnlockRW(&session->slot->lock);
     return ret;
 }
 
@@ -11753,6 +16037,10 @@ int WP11_AesCbc_DecryptUpdate(unsigned char* enc, word32 encSz,
     int sz = 0;
     int outSz = 0;
 
+    /* Serialize the partial-block read-modify-write against a concurrent
+     * update on the same session (F-5764); see WP11_AesCbc_EncryptUpdate. */
+    WP11_Lock_LockRW(&session->slot->lock);
+
     if (cbc->partialSz > 0) {
         sz = AES_BLOCK_SIZE - cbc->partialSz;
         if (sz > (int)encSz)
@@ -11785,6 +16073,7 @@ int WP11_AesCbc_DecryptUpdate(unsigned char* enc, word32 encSz,
     if (ret == 0)
         *decSz = outSz;
 
+    WP11_Lock_UnlockRW(&session->slot->lock);
     return ret;
 }
 
@@ -11919,9 +16208,16 @@ int WP11_AesCbcPad_Decrypt(unsigned char* enc, word32 encSz, unsigned char* dec,
     if (ret == 0) {
         finalSz = *decSz - sz;
         ret = WP11_AesCbcPad_DecryptFinal(dec + sz, &finalSz, session);
-        if (ret == 0) {
+        if (ret == 0 || ret == BUFFER_E) {
+            /* On success this is the plaintext length; on BUFFER_E it is the
+             * total required size (data already produced plus the final
+             * block's need) for the caller to resize and retry. */
             *decSz = sz + finalSz;
         }
+    }
+    else if (ret == BUFFER_E) {
+        /* Update set sz to the size it needs. */
+        *decSz = sz;
     }
 
     return ret;
@@ -11946,8 +16242,13 @@ int WP11_AesCbcPad_DecryptUpdate(unsigned char* enc, word32 encSz,
 {
     int ret = 0;
     WP11_CbcParams* cbc = &session->params.cbc;
+    word32 bufSz = *decSz;
     int sz = 0;
     int outSz = 0;
+
+    /* Serialize the partial-block read-modify-write against a concurrent
+     * update on the same session (F-5764); see WP11_AesCbc_EncryptUpdate. */
+    WP11_Lock_LockRW(&session->slot->lock);
 
     if (cbc->partialSz > 0) {
         sz = AES_BLOCK_SIZE - cbc->partialSz;
@@ -11958,6 +16259,13 @@ int WP11_AesCbcPad_DecryptUpdate(unsigned char* enc, word32 encSz,
         enc += sz;
         encSz -= sz;
         if (cbc->partialSz == AES_BLOCK_SIZE && encSz > 0) {
+            /* Refuse to overflow caller's buffer; report the size needed so
+             * far and leave the operation active (CKR_BUFFER_TOO_SMALL). */
+            if ((word32)(outSz + AES_BLOCK_SIZE) > bufSz) {
+                *decSz = (word32)outSz + AES_BLOCK_SIZE;
+                WP11_Lock_UnlockRW(&session->slot->lock);
+                return BUFFER_E;
+            }
             ret = wc_AesCbcDecrypt(&cbc->aes, dec, cbc->partial,
                                                                 AES_BLOCK_SIZE);
             dec += AES_BLOCK_SIZE;
@@ -11969,6 +16277,11 @@ int WP11_AesCbcPad_DecryptUpdate(unsigned char* enc, word32 encSz,
         sz = encSz - (encSz & (AES_BLOCK_SIZE - 1));
         if (sz == (int)encSz)
             sz -= AES_BLOCK_SIZE;
+        if ((word32)(outSz + sz) > bufSz) {
+            *decSz = (word32)(outSz + sz);
+            WP11_Lock_UnlockRW(&session->slot->lock);
+            return BUFFER_E;
+        }
         ret = wc_AesCbcDecrypt(&cbc->aes, dec, enc, sz);
         outSz += sz;
         enc += sz;
@@ -11981,6 +16294,7 @@ int WP11_AesCbcPad_DecryptUpdate(unsigned char* enc, word32 encSz,
     if (ret == 0)
         *decSz = outSz;
 
+    WP11_Lock_UnlockRW(&session->slot->lock);
     return ret;
 }
 
@@ -12006,23 +16320,60 @@ int WP11_AesCbcPad_DecryptFinal(unsigned char* dec, word32* decSz,
     unsigned char* p = dec;
     size_t mask;
 
-    ret = wc_AesCbcDecrypt(&cbc->aes, cbc->partial, cbc->partial,
-                                                                cbc->partialSz);
+    if (!cbc->finalReady) {
+        ret = wc_AesCbcDecrypt(&cbc->aes, cbc->final, cbc->partial,
+                               cbc->partialSz);
+    }
+    if (ret == 0 && !cbc->finalReady) {
+        byte padBad;
+
+        padCnt = cbc->final[AES_BLOCK_SIZE-1];
+
+        /* Validate PKCS#7 padding in constant time:
+         * padCnt must be 1..AES_BLOCK_SIZE and all padding bytes must equal
+         * padCnt. */
+        padBad = (byte)(0 - (padCnt == 0));
+        padBad |= (byte)(0 - (padCnt > AES_BLOCK_SIZE));
+        for (i = 0; i < AES_BLOCK_SIZE; i++) {
+            /* inPad is 0xFF when i is in the padding region, 0x00 otherwise */
+            byte inPad = (byte)(0 -
+                ((unsigned)(AES_BLOCK_SIZE - 1 - i) < (unsigned)padCnt));
+            padBad |= inPad & (cbc->final[i] ^ padCnt);
+        }
+        if (padBad) {
+            ret = BAD_PADDING_E;
+        }
+        else {
+            cbc->finalReady = 1;
+        }
+    }
     if (ret == 0) {
-        padCnt = cbc->partial[AES_BLOCK_SIZE-1];
+        padCnt = cbc->final[AES_BLOCK_SIZE-1];
         outSz = AES_BLOCK_SIZE - (padCnt & (0 - (padCnt <= AES_BLOCK_SIZE)));
+        /* Refuse to overflow caller's buffer. Output size is 0..15 bytes;
+         * caller passes the remaining capacity in *decSz. On a too-small
+         * buffer report the required size and leave the operation active, per
+         * the PKCS#11 CKR_BUFFER_TOO_SMALL contract; the AES context is
+         * released when the operation is reinitialised or the session closes.
+         * A caller that first queried the output size never reaches this. */
+        if ((word32)outSz > *decSz) {
+            *decSz = outSz;
+            return BUFFER_E;
+        }
         for (i = 0; i < AES_BLOCK_SIZE; i++) {
             mask = (size_t)0 - (i != outSz);
             p = (unsigned char*)((size_t)p & mask);
             p = (unsigned char*)((size_t)p | ((size_t)tmp & (~mask)));
-            *p = cbc->partial[i];
+            *p = cbc->final[i];
             p++;
         }
         *decSz = outSz;
     }
 
     wc_AesFree(&cbc->aes);
+    wc_ForceZero(cbc->final, sizeof(cbc->final));
     cbc->partialSz = 0;
+    cbc->finalReady = 0;
     session->init = 0;
 
     return ret;
@@ -12030,6 +16381,60 @@ int WP11_AesCbcPad_DecryptFinal(unsigned char* dec, word32* decSz,
 #endif /* HAVE_AES_CBC */
 
 #ifdef HAVE_AESCTR
+/* Add to the least-significant counterBits bits of a big-endian counter. */
+static int wp11_AesCtr_Add(unsigned char* counter, byte counterBits,
+                           word32 add)
+{
+    int first = AES_BLOCK_SIZE - (counterBits + 7) / 8;
+    int i;
+    word32 carry = add;
+    byte mask = (counterBits & 7) == 0 ? 0xff :
+                (byte)((1U << (counterBits & 7)) - 1U);
+
+    for (i = AES_BLOCK_SIZE - 1; i >= first; i--) {
+        word32 value = counter[i];
+        word32 sum;
+
+        if (i == first)
+            value &= mask;
+        sum = value + (carry & 0xff);
+        carry = (carry >> 8) + (sum >> 8);
+        if (i == first) {
+            counter[i] = (counter[i] & (byte)~mask) | (byte)(sum & mask);
+            if (sum > mask)
+                carry = 1;
+        }
+        else {
+            counter[i] = (byte)sum;
+        }
+    }
+
+    return carry != 0;
+}
+
+/* Check that all counters needed for an update are still in range. */
+static int wp11_AesCtr_Check(WP11_CtrParams* ctr, word32 inSz,
+                             word32* newBlocks)
+{
+    unsigned char counter[AES_BLOCK_SIZE];
+    word32 available = ctr->offset == 0 ? 0 : AES_BLOCK_SIZE - ctr->offset;
+    word32 remaining = inSz > available ? inSz - available : 0;
+
+    *newBlocks = remaining / AES_BLOCK_SIZE;
+    if ((remaining & (AES_BLOCK_SIZE - 1)) != 0)
+        (*newBlocks)++;
+    if (*newBlocks == 0)
+        return 0;
+    if (ctr->exhausted)
+        return WP11_CTR_OVERFLOW_E;
+
+    XMEMCPY(counter, ctr->counter, sizeof(counter));
+    if (wp11_AesCtr_Add(counter, ctr->counterBits, *newBlocks - 1))
+        return WP11_CTR_OVERFLOW_E;
+
+    return 0;
+}
+
 /**
  * Encrypt or decrypt data with AES-CTR.
  * Output buffer must be large enough to hold all data.
@@ -12075,12 +16480,19 @@ int WP11_AesCtr_Update(unsigned char* in, word32 inSz, unsigned char* out,
 {
     int ret = 0;
     WP11_CtrParams* ctr = &session->params.ctr;
+    word32 newBlocks;
 
     if (*outSz < inSz)
         return BUFFER_E;
-    ret = wc_AesCtrEncrypt(&ctr->aes, out, in, inSz);
+    ret = wp11_AesCtr_Check(ctr, inSz, &newBlocks);
     if (ret == 0)
+        ret = wc_AesCtrEncrypt(&ctr->aes, out, in, inSz);
+    if (ret == 0) {
+        if (wp11_AesCtr_Add(ctr->counter, ctr->counterBits, newBlocks))
+            ctr->exhausted = 1;
+        ctr->offset = (byte)((ctr->offset + inSz) & (AES_BLOCK_SIZE - 1));
         *outSz = inSz;
+    }
 
     return ret;
 }
@@ -12196,16 +16608,113 @@ int WP11_AesGcm_Encrypt(unsigned char* plain, word32 plainSz,
  * @return  -ve on encryption failure.
  *          0 on success.
  */
+/**
+ * Append data to the GCM accumulation buffer (gcm->enc). Used to buffer
+ * plaintext for multi-part encrypt and ciphertext for multi-part decrypt.
+ *
+ * @param  gcm     [in]  GCM parameters holding the buffer.
+ * @param  data    [in]  Data to append.
+ * @param  dataSz  [in]  Length of data in bytes.
+ * @return  MEMORY_E on allocation failure.
+ *          0 on success.
+ */
+#ifndef WOLFSSL_AESGCM_STREAM
+static int wp11_AesGcm_BufferAppend(WP11_GcmParams* gcm, unsigned char* data,
+                                    word32 dataSz)
+{
+    unsigned char* newBuf;
+
+#ifdef XREALLOC
+    newBuf = (unsigned char*)XREALLOC(gcm->enc, gcm->encSz + dataSz, NULL,
+                                      DYNAMIC_TYPE_TMP_BUFFER);
+    if (newBuf == NULL)
+        return MEMORY_E;
+    gcm->enc = newBuf;
+    XMEMCPY(gcm->enc + gcm->encSz, data, dataSz);
+    gcm->encSz += dataSz;
+#else
+    newBuf = (unsigned char*)XMALLOC(gcm->encSz + dataSz, NULL,
+                                     DYNAMIC_TYPE_TMP_BUFFER);
+    if (newBuf == NULL)
+        return MEMORY_E;
+    if (gcm->enc != NULL)
+        XMEMCPY(newBuf, gcm->enc, gcm->encSz);
+    XFREE(gcm->enc, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+    gcm->enc = newBuf;
+    XMEMCPY(gcm->enc + gcm->encSz, data, dataSz);
+    gcm->encSz += dataSz;
+#endif
+
+    return 0;
+}
+#endif /* !WOLFSSL_AESGCM_STREAM */
+
 int WP11_AesGcm_EncryptUpdate(unsigned char* plain, word32 plainSz,
                               unsigned char* enc, word32* encSz,
                               WP11_Object* secret, WP11_Session* session)
 {
+    WP11_GcmParams* gcm = &session->params.gcm;
+#ifdef WOLFSSL_AESGCM_STREAM
+    int ret;
+    WP11_Data* key;
+
+    /* Stream the segment with wolfCrypt's GCM streaming API so the whole
+     * message need not be buffered. Each update emits its own ciphertext; the
+     * tag is produced at C_EncryptFinal. */
+    if (!gcm->streamInit) {
+        ret = wc_AesInit(&gcm->aes, NULL, secret->devId);
+        if (ret == 0) {
+            if (secret->onToken)
+                WP11_Lock_LockRO(secret->lock);
+            key = secret->data.symmKey;
+            ret = wc_AesGcmInit(&gcm->aes, key->data, key->len, gcm->iv,
+                                                                    gcm->ivSz);
+            if (secret->onToken)
+                WP11_Lock_UnlockRO(secret->lock);
+        }
+        if (ret != 0)
+            return ret;
+        gcm->streamInit = 1;
+    }
+
+    /* AAD is authenticated once, on the first update. */
+    ret = wc_AesGcmEncryptUpdate(&gcm->aes, enc, plain, plainSz, gcm->aad,
+                                                                   gcm->aadSz);
+    if (ret == 0) {
+        *encSz = plainSz;
+        if (gcm->aad != NULL) {
+            XFREE(gcm->aad, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+            gcm->aad = NULL;
+            gcm->aadSz = 0;
+        }
+    }
+
+    return ret;
+#else
     int ret;
     Aes aes;
     WP11_Data* key;
-    WP11_GcmParams* gcm = &session->params.gcm;
     word32 authTagSz = gcm->tagBits / 8;
-    unsigned char* authTag = gcm->authTag;
+    word32 oldSz = (word32)gcm->encSz;
+    unsigned char* fullEnc = NULL;
+
+    /* No streaming API available: buffer the plaintext and encrypt the whole
+     * accumulated message under the single IV. GCM is a stream cipher, so this
+     * segment's ciphertext is the tail of the accumulated ciphertext.
+     * Re-encrypting each update keeps the tag over the full message and the
+     * AAD authenticated until C_EncryptFinal, matching the single-shot
+     * result. */
+    ret = wp11_AesGcm_BufferAppend(gcm, plain, plainSz);
+    if (ret != 0)
+        return ret;
+    if (gcm->encSz == 0) {
+        *encSz = 0;
+        return 0;
+    }
+
+    fullEnc = (unsigned char*)XMALLOC(gcm->encSz, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+    if (fullEnc == NULL)
+        return MEMORY_E;
 
     ret = wc_AesInit(&aes, NULL, secret->devId);
     if (ret == 0) {
@@ -12217,21 +16726,21 @@ int WP11_AesGcm_EncryptUpdate(unsigned char* plain, word32 plainSz,
             WP11_Lock_UnlockRO(secret->lock);
 
         if (ret == 0)
-            ret = wc_AesGcmEncrypt(&aes, enc, plain, plainSz, gcm->iv,
-                                        gcm->ivSz, authTag, authTagSz, gcm->aad,
-                                        gcm->aadSz);
-        if (ret == 0)
+            ret = wc_AesGcmEncrypt(&aes, fullEnc, gcm->enc, (word32)gcm->encSz,
+                                        gcm->iv, gcm->ivSz, gcm->authTag,
+                                        authTagSz, gcm->aad, gcm->aadSz);
+        if (ret == 0) {
+            XMEMCPY(enc, fullEnc + oldSz, plainSz);
             *encSz = plainSz;
-
-        if (gcm->aad != NULL) {
-            XFREE(gcm->aad, NULL, DYNAMIC_TYPE_TMP_BUFFER);
-            gcm->aad = NULL;
         }
 
         wc_AesFree(&aes);
     }
 
+    XFREE(fullEnc, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+
     return ret;
+#endif /* WOLFSSL_AESGCM_STREAM */
 }
 
 /**
@@ -12246,18 +16755,90 @@ int WP11_AesGcm_EncryptUpdate(unsigned char* plain, word32 plainSz,
  *          0 on success.
  */
 int WP11_AesGcm_EncryptFinal(unsigned char* enc, word32* encSz,
-                             WP11_Session* session)
+                             WP11_Object* secret, WP11_Session* session)
 {
     int ret = 0;
     WP11_GcmParams* gcm = &session->params.gcm;
     word32 authTagSz = gcm->tagBits / 8;
 
     if (*encSz < authTagSz)
-        ret = BUFFER_E;
-    if (ret == 0) {
+        return BUFFER_E;
+
+#ifdef WOLFSSL_AESGCM_STREAM
+    {
+        WP11_Data* key;
+
+        if (!gcm->streamInit) {
+            /* No update was issued: produce the tag over the empty message. */
+            ret = wc_AesInit(&gcm->aes, NULL, secret->devId);
+            if (ret == 0) {
+                if (secret->onToken)
+                    WP11_Lock_LockRO(secret->lock);
+                key = secret->data.symmKey;
+                ret = wc_AesGcmInit(&gcm->aes, key->data, key->len, gcm->iv,
+                                                                    gcm->ivSz);
+                if (secret->onToken)
+                    WP11_Lock_UnlockRO(secret->lock);
+            }
+            if (ret == 0) {
+                gcm->streamInit = 1;
+                ret = wc_AesGcmEncryptUpdate(&gcm->aes, NULL, NULL, 0, gcm->aad,
+                                                                   gcm->aadSz);
+            }
+        }
+        if (ret == 0)
+            ret = wc_AesGcmEncryptFinal(&gcm->aes, enc, authTagSz);
+        if (ret == 0)
+            *encSz = authTagSz;
+
+        if (gcm->streamInit) {
+            wc_AesFree(&gcm->aes);
+            gcm->streamInit = 0;
+        }
+    }
+#else
+    if (gcm->encSz > 0) {
+        /* The final EncryptUpdate computed the tag over the whole message. */
         XMEMCPY(enc, gcm->authTag, authTagSz);
         *encSz = authTagSz;
     }
+    else {
+        /* No data buffered: the tag is over the empty message and the AAD. */
+        Aes aes;
+        WP11_Data* key;
+
+        ret = wc_AesInit(&aes, NULL, secret->devId);
+        if (ret == 0) {
+            if (secret->onToken)
+                WP11_Lock_LockRO(secret->lock);
+            key = secret->data.symmKey;
+            ret = wc_AesGcmSetKey(&aes, key->data, key->len);
+            if (secret->onToken)
+                WP11_Lock_UnlockRO(secret->lock);
+
+            if (ret == 0)
+                ret = wc_AesGcmEncrypt(&aes, enc, NULL, 0, gcm->iv, gcm->ivSz,
+                                            enc, authTagSz, gcm->aad,
+                                            gcm->aadSz);
+            if (ret == 0)
+                *encSz = authTagSz;
+
+            wc_AesFree(&aes);
+        }
+    }
+
+    if (gcm->enc != NULL) {
+        XFREE(gcm->enc, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+        gcm->enc = NULL;
+    }
+    gcm->encSz = 0;
+#endif /* WOLFSSL_AESGCM_STREAM */
+
+    if (gcm->aad != NULL) {
+        XFREE(gcm->aad, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+        gcm->aad = NULL;
+    }
+    gcm->aadSz = 0;
 
     return ret;
 }
@@ -12645,6 +17226,7 @@ int WP11_AesKeyWrap_Encrypt(unsigned char* plain, word32 plainSz,
 
     ret = wc_AesKeyWrap_ex(&wrap->aes, plain, plainSz, enc, *encSz,
             wrap->ivSz != 0 ? wrap->iv : NULL);
+    wc_AesFree(&wrap->aes);
     session->init = 0;
     if (ret < 0)
         return ret;
@@ -12660,11 +17242,245 @@ int WP11_AesKeyWrap_Decrypt(unsigned char* enc, word32 encSz,
 
     ret = wc_AesKeyUnWrap_ex(&wrap->aes, enc, encSz, dec, *decSz,
             wrap->ivSz != 0 ? wrap->iv : NULL);
+    wc_AesFree(&wrap->aes);
     session->init = 0;
     if (ret < 0)
         return ret;
     *decSz = ret;
     return 0;
+}
+
+/* Single-block AES encrypt/decrypt. FIPS modules before v5.3 declare
+ * wc_AesEncryptDirect/wc_AesDecryptDirect as returning void, so no result is
+ * available there. The v5.2.3 and v5.2.4 modules return int for ARM assembly
+ * builds. */
+#if (!defined(HAVE_FIPS) || FIPS_VERSION_GE(5, 3))
+    #define WP11_AES_DIRECT_RETURNS_INT
+#elif defined(WOLFSSL_ARMASM) && defined(FIPS_VERSION3_GE)
+    #if FIPS_VERSION3_GE(5, 2, 3)
+        #define WP11_AES_DIRECT_RETURNS_INT
+    #endif
+#endif
+
+static int wp11_AesEncryptDirect(Aes* aes, byte* out, const byte* in)
+{
+#ifdef WP11_AES_DIRECT_RETURNS_INT
+    return wc_AesEncryptDirect(aes, out, in);
+#else
+    wc_AesEncryptDirect(aes, out, in);
+    return 0;
+#endif
+}
+
+static int wp11_AesDecryptDirect(Aes* aes, byte* out, const byte* in)
+{
+#ifdef WP11_AES_DIRECT_RETURNS_INT
+    return wc_AesDecryptDirect(aes, out, in);
+#else
+    wc_AesDecryptDirect(aes, out, in);
+    return 0;
+#endif
+}
+
+/**
+ * RFC 3394 key unwrap core that returns the recovered integrity register A
+ * instead of verifying it, so RFC 5649 can inspect the AIV (which encodes the
+ * length being recovered). Mirrors wc_AesKeyUnWrap_ex. The padded plaintext
+ * (inSz - 8 bytes) is written to out and the recovered A to aOut.
+ */
+static int wp11_AesKeyUnwrapRaw(Aes* aes, const unsigned char* in, word32 inSz,
+        unsigned char* out, unsigned char* aOut)
+{
+    unsigned char a[KEYWRAP_BLOCK_SIZE];
+    unsigned char t[KEYWRAP_BLOCK_SIZE];
+    unsigned char tmp[2 * KEYWRAP_BLOCK_SIZE];
+    unsigned char* r;
+    word32 n = (inSz / KEYWRAP_BLOCK_SIZE) - 1;
+    word32 i;
+    word32 cnt = 6 * n;
+    int j, k;
+    int ret = 0;
+
+    XMEMCPY(a, in, KEYWRAP_BLOCK_SIZE);
+    XMEMCPY(out, in + KEYWRAP_BLOCK_SIZE, inSz - KEYWRAP_BLOCK_SIZE);
+
+    /* t = 6n as a big-endian 64-bit counter. */
+    XMEMSET(t, 0, sizeof(t));
+    t[7] = (unsigned char)(cnt);
+    t[6] = (unsigned char)(cnt >> 8);
+    t[5] = (unsigned char)(cnt >> 16);
+    t[4] = (unsigned char)(cnt >> 24);
+
+    for (j = 5; j >= 0; j--) {
+        for (i = n; i >= 1; i--) {
+            /* A ^= t */
+            for (k = 0; k < KEYWRAP_BLOCK_SIZE; k++)
+                a[k] ^= t[k];
+            /* t-- */
+            for (k = KEYWRAP_BLOCK_SIZE - 1; k >= 0; k--) {
+                t[k]--;
+                if (t[k] != 0xFF)
+                    break;
+            }
+            r = out + (i - 1) * KEYWRAP_BLOCK_SIZE;
+            XMEMCPY(tmp, a, KEYWRAP_BLOCK_SIZE);
+            XMEMCPY(tmp + KEYWRAP_BLOCK_SIZE, r, KEYWRAP_BLOCK_SIZE);
+            ret = wp11_AesDecryptDirect(aes, tmp, tmp);
+            if (ret != 0)
+                break;
+            XMEMCPY(a, tmp, KEYWRAP_BLOCK_SIZE);
+            XMEMCPY(r, tmp + KEYWRAP_BLOCK_SIZE, KEYWRAP_BLOCK_SIZE);
+        }
+        if (ret != 0)
+            break;
+    }
+
+    XMEMCPY(aOut, a, KEYWRAP_BLOCK_SIZE);
+    wc_ForceZero(tmp, sizeof(tmp));
+    return ret;
+}
+
+/* RFC 5649 AIV fixed prefix. */
+static const unsigned char wp11_kwp_aiv[4] = { 0xA6, 0x59, 0x59, 0xA6 };
+
+/**
+ * AES Key Wrap with Padding (RFC 5649) - wrap direction.
+ * Wraps plainSz (>= 1) bytes from plain into enc. On success *encSz is set to
+ * the wrapped length, roundup8(plainSz) + 8 bytes.
+ */
+int WP11_AesKeyWrapPad_Encrypt(unsigned char* plain, word32 plainSz,
+        unsigned char* enc, word32* encSz, WP11_Session* session)
+{
+    int ret = 0;
+    WP11_KeyWrapParams *wrap = &session->params.kw;
+    word32 padded = (plainSz + KEYWRAP_BLOCK_SIZE - 1) &
+                    ~(word32)(KEYWRAP_BLOCK_SIZE - 1);
+    word32 outLen = padded + KEYWRAP_BLOCK_SIZE;
+    unsigned char aiv[KEYWRAP_BLOCK_SIZE];
+    unsigned char* buf = NULL;
+
+    if (plainSz == 0)
+        ret = BAD_FUNC_ARG;
+    if (ret == 0 && *encSz < outLen)
+        ret = BUFFER_E;
+    if (ret == 0) {
+        buf = (unsigned char*)XMALLOC(padded, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+        if (buf == NULL)
+            ret = MEMORY_E;
+    }
+    if (ret == 0) {
+        /* AIV = A65959A6 || MLI (big-endian 32-bit plaintext length). */
+        XMEMCPY(aiv, wp11_kwp_aiv, sizeof(wp11_kwp_aiv));
+        aiv[4] = (unsigned char)(plainSz >> 24);
+        aiv[5] = (unsigned char)(plainSz >> 16);
+        aiv[6] = (unsigned char)(plainSz >> 8);
+        aiv[7] = (unsigned char)(plainSz);
+
+        XMEMCPY(buf, plain, plainSz);
+        XMEMSET(buf + plainSz, 0, padded - plainSz);
+
+        if (padded == KEYWRAP_BLOCK_SIZE) {
+            /* Single semiblock: ECB-encrypt AIV || padded plaintext. */
+            unsigned char block[2 * KEYWRAP_BLOCK_SIZE];
+            XMEMCPY(block, aiv, KEYWRAP_BLOCK_SIZE);
+            XMEMCPY(block + KEYWRAP_BLOCK_SIZE, buf, KEYWRAP_BLOCK_SIZE);
+            ret = wp11_AesEncryptDirect(&wrap->aes, enc, block);
+            wc_ForceZero(block, sizeof(block));
+        }
+        else {
+            /* Multi-block: RFC 3394 wrap with the AIV as the initial value. */
+            ret = wc_AesKeyWrap_ex(&wrap->aes, buf, padded, enc, *encSz, aiv);
+            if (ret >= 0)
+                ret = 0;
+        }
+        if (ret == 0)
+            *encSz = outLen;
+    }
+
+    if (buf != NULL) {
+        wc_ForceZero(buf, padded);
+        XFREE(buf, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+    }
+    wc_AesFree(&wrap->aes);
+    session->init = 0;
+    return ret;
+}
+
+/**
+ * AES Key Wrap with Padding (RFC 5649) - unwrap direction.
+ * Recovers the original plaintext from enc into dec. On success *decSz is set to
+ * the recovered plaintext length.
+ */
+int WP11_AesKeyWrapPad_Decrypt(unsigned char* enc, word32 encSz,
+        unsigned char* dec, word32* decSz, WP11_Session* session)
+{
+    int ret = 0;
+    WP11_KeyWrapParams *wrap = &session->params.kw;
+    unsigned char aiv[KEYWRAP_BLOCK_SIZE];
+    unsigned char* padBuf = NULL;
+    word32 paddedSz = encSz - KEYWRAP_BLOCK_SIZE;
+    word32 mli = 0;
+    word32 i;
+    int bad = 0;
+
+    if (encSz < 2 * KEYWRAP_BLOCK_SIZE || (encSz % KEYWRAP_BLOCK_SIZE) != 0)
+        return BUFFER_E;
+
+    padBuf = (unsigned char*)XMALLOC(paddedSz, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+    if (padBuf == NULL)
+        return MEMORY_E;
+
+    if (encSz == 2 * KEYWRAP_BLOCK_SIZE) {
+        /* Single semiblock: ECB-decrypt to AIV || padded plaintext. */
+        unsigned char block[2 * KEYWRAP_BLOCK_SIZE];
+        ret = wp11_AesDecryptDirect(&wrap->aes, block, enc);
+        if (ret == 0) {
+            XMEMCPY(aiv, block, KEYWRAP_BLOCK_SIZE);
+            XMEMCPY(padBuf, block + KEYWRAP_BLOCK_SIZE, KEYWRAP_BLOCK_SIZE);
+        }
+        wc_ForceZero(block, sizeof(block));
+    }
+    else {
+        /* Multi-block: RFC 3394 unwrap recovering the AIV. */
+        ret = wp11_AesKeyUnwrapRaw(&wrap->aes, enc, encSz, padBuf, aiv);
+    }
+
+    if (ret == 0) {
+        /* Verify the AIV prefix and recover the message length indicator. */
+        if (XMEMCMP(aiv, wp11_kwp_aiv, sizeof(wp11_kwp_aiv)) != 0)
+            bad = 1;
+        mli = ((word32)aiv[4] << 24) | ((word32)aiv[5] << 16) |
+              ((word32)aiv[6] << 8) | (word32)aiv[7];
+        /* roundup8(mli) must equal paddedSz: paddedSz-8 < mli <= paddedSz. */
+        if (mli > paddedSz || mli + KEYWRAP_BLOCK_SIZE <= paddedSz)
+            bad = 1;
+        if (!bad) {
+            /* Padding octets must be zero. */
+            for (i = mli; i < paddedSz; i++) {
+                if (padBuf[i] != 0)
+                    bad = 1;
+            }
+        }
+        if (bad)
+            ret = BAD_KEYWRAP_IV_E;
+        else if (mli > *decSz) {
+            /* Report the required plaintext length to the caller. */
+            *decSz = mli;
+            ret = BUFFER_E;
+        }
+        else {
+            XMEMCPY(dec, padBuf, mli);
+            *decSz = mli;
+        }
+    }
+
+    wc_ForceZero(padBuf, paddedSz);
+    XFREE(padBuf, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+    if (ret != BUFFER_E) {
+        wc_AesFree(&wrap->aes);
+        session->init = 0;
+    }
+    return ret;
 }
 #endif /* HAVE_AES_KEYWRAP */
 
@@ -13024,8 +17840,8 @@ int WP11_Digest_Init(CK_MECHANISM_TYPE mechanism, WP11_Session* session)
     ret = wp11_digest_hash_type(mechanism, &hashType);
 
     if (ret == 0) {
-        digest->hashType = hashType;
-        ret = wc_HashInit(&digest->hash, hashType);
+        digest->hashType = (enum wc_HashType)hashType;
+        ret = wc_HashInit(&digest->hash, (enum wc_HashType)hashType);
     }
 
     return ret;
@@ -13130,8 +17946,13 @@ int WP11_Digest_Single(unsigned char* data, word32 dataLen,
     WP11_Digest* digest = &session->params.digest;
 
     blockLen = wc_HashGetDigestSize(digest->hashType);
+    if (blockLen < 0) {
+        wc_HashFree(&digest->hash, digest->hashType);
+        session->init = 0;
+        return CKR_FUNCTION_FAILED;
+    }
 
-    if (data == NULL) {
+    if (dataOut == NULL) {
         *dataOutLen = (word32)blockLen;
         return CKR_OK;
     }
@@ -13139,6 +17960,7 @@ int WP11_Digest_Single(unsigned char* data, word32 dataLen,
         return BUFFER_E;
     }
     ret = wc_Hash(digest->hashType, data, dataLen, dataOut, *dataOutLen);
+    *dataOutLen = (word32)blockLen;
 
     wc_HashFree(&digest->hash, digest->hashType);
 
@@ -13705,8 +18527,9 @@ int WP11_SetOperationState(WP11_Session* session, unsigned char* stateData,
     if (ret != CKR_OK)
         return ret;
 
-    session->params.digest.hashType = hashType;
-    ret = wc_HashInit(&session->params.digest.hash, hashType);
+    session->params.digest.hashType = (enum wc_HashType)hashType;
+    ret = wc_HashInit(&session->params.digest.hash,
+        (enum wc_HashType)hashType);
 
     if (ret != CKR_OK)
         return ret;
@@ -13716,6 +18539,8 @@ int WP11_SetOperationState(WP11_Session* session, unsigned char* stateData,
     #else
         hashAlg = &session->params.digest.hash.alg;
     #endif
+
+    session->init = WP11_INIT_DIGEST;
 
     switch (session->mechanism) {
 #ifndef NO_MD5

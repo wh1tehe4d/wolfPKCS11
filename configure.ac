@@ -1,13 +1,13 @@
 # configure.ac
 #
-# Copyright (C) 2023 wolfSSL Inc.
-# All right reserved.
+# Copyright (C) 2006-2026 wolfSSL Inc.
+# All rights reserved.
 #
 # This file is part of wolfPKCS11.
 #
-AC_COPYRIGHT([Copyright (C) 2014-2023 wolfSSL Inc.])
+AC_COPYRIGHT([Copyright (C) 2006-2026 wolfSSL Inc.])
 AC_PREREQ([2.63])
-AC_INIT([wolfpkcs11],[2.0.0],[https://github.com/wolfssl/wolfpkcs11/issues],[wolfpkcs11],[http://www.wolfssl.com])
+AC_INIT([wolfpkcs11],[2.1.0],[https://github.com/wolfssl/wolfpkcs11/issues],[wolfpkcs11],[http://www.wolfssl.com])
 AC_CONFIG_AUX_DIR([build-aux])
 
 # The following sets CFLAGS to empty if unset on command line.
@@ -195,7 +195,7 @@ else
 fi
 
 AC_ARG_ENABLE([dh],
-    [AS_HELP_STRING([--enable-dh],[Enable RSA (default: enabled)])],
+    [AS_HELP_STRING([--enable-dh],[Enable DH (default: enabled)])],
     [ ENABLED_DH=$enableval ],
     [ ENABLED_DH=yes ]
     )
@@ -516,6 +516,115 @@ then
     AM_CFLAGS="$AM_CFLAGS -DWOLFPKCS11_PKCS11_V3_2"
 fi
 
+AC_ARG_ENABLE([mldsa],
+    [AS_HELP_STRING([--enable-mldsa],[Enable ML-DSA (default: disabled)])],
+    [ ENABLED_MLDSA=$enableval ],
+    [ ENABLED_MLDSA=no ]
+    )
+
+if test "$ENABLED_SHA3" = "no"
+then
+    echo "ML-DSA requires SHA-3 support (disabled), disabling ML-DSA"
+    ENABLED_MLDSA=no
+fi
+
+if test "$ENABLED_MLDSA" = "yes"
+then
+    if test "$ENABLED_PKCS11V3_2" = "no"; then
+        ENABLED_PKCS11V3_2=yes
+        AM_CFLAGS="$AM_CFLAGS -DWOLFPKCS11_PKCS11_V3_2"
+        if test "$ENABLED_PKCS11V3_0" = "no"; then
+            ENABLED_PKCS11V3_0=yes
+            AM_CFLAGS="$AM_CFLAGS -DWOLFPKCS11_PKCS11_V3_0"
+        fi
+    fi
+    AM_CFLAGS="$AM_CFLAGS -DWOLFPKCS11_MLDSA"
+fi
+
+AC_ARG_ENABLE([mlkem],
+    [AS_HELP_STRING([--enable-mlkem],[Enable ML-KEM (default: disabled)])],
+    [ ENABLED_MLKEM=$enableval ],
+    [ ENABLED_MLKEM=no ]
+    )
+
+if test "$ENABLED_SHA3" = "no"
+then
+    echo "ML-KEM requires SHA-3 support (disabled), disabling ML-KEM"
+    ENABLED_MLKEM=no
+fi
+
+if test "$ENABLED_MLKEM" = "yes"
+then
+    if test "$ENABLED_PKCS11V3_2" = "no"; then
+        ENABLED_PKCS11V3_2=yes
+        AM_CFLAGS="$AM_CFLAGS -DWOLFPKCS11_PKCS11_V3_2"
+        if test "$ENABLED_PKCS11V3_0" = "no"; then
+            ENABLED_PKCS11V3_0=yes
+            AM_CFLAGS="$AM_CFLAGS -DWOLFPKCS11_PKCS11_V3_0"
+        fi
+    fi
+    AM_CFLAGS="$AM_CFLAGS -DWOLFPKCS11_MLKEM"
+fi
+
+# LMS/HSS (RFC 8554) verification and public-key import. Requires wolfSSL
+# built with --enable-lms (WOLFSSL_HAVE_LMS). Sign/keygen are a separate,
+# later feature; this flag provides verify + public-key import only.
+AC_ARG_ENABLE([lms],
+    [AS_HELP_STRING([--enable-lms],[Enable LMS/HSS verification and public-key import (default: disabled)])],
+    [ ENABLED_LMS=$enableval ],
+    [ ENABLED_LMS=no ]
+    )
+
+if test "$ENABLED_SHA256" = "no"
+then
+    if test "$ENABLED_LMS" = "yes"; then
+        echo "LMS/HSS requires SHA-256 support (disabled), disabling LMS/HSS"
+    fi
+    ENABLED_LMS=no
+fi
+
+if test "$ENABLED_LMS" = "yes"
+then
+    if test "$ENABLED_PKCS11V3_2" = "no"; then
+        ENABLED_PKCS11V3_2=yes
+        AM_CFLAGS="$AM_CFLAGS -DWOLFPKCS11_PKCS11_V3_2"
+        if test "$ENABLED_PKCS11V3_0" = "no"; then
+            ENABLED_PKCS11V3_0=yes
+            AM_CFLAGS="$AM_CFLAGS -DWOLFPKCS11_PKCS11_V3_0"
+        fi
+    fi
+    AM_CFLAGS="$AM_CFLAGS -DWOLFPKCS11_LMS"
+fi
+
+# XMSS/XMSS^MT (RFC 8391) verification and public-key import. Requires wolfSSL
+# built with --enable-xmss (WOLFSSL_HAVE_XMSS). Verify + public-key import only.
+AC_ARG_ENABLE([xmss],
+    [AS_HELP_STRING([--enable-xmss],[Enable XMSS/XMSS^MT verification and public-key import (default: disabled)])],
+    [ ENABLED_XMSS=$enableval ],
+    [ ENABLED_XMSS=no ]
+    )
+
+if test "$ENABLED_SHA256" = "no"
+then
+    if test "$ENABLED_XMSS" = "yes"; then
+        echo "XMSS requires SHA-256 support (disabled), disabling XMSS"
+    fi
+    ENABLED_XMSS=no
+fi
+
+if test "$ENABLED_XMSS" = "yes"
+then
+    if test "$ENABLED_PKCS11V3_2" = "no"; then
+        ENABLED_PKCS11V3_2=yes
+        AM_CFLAGS="$AM_CFLAGS -DWOLFPKCS11_PKCS11_V3_2"
+        if test "$ENABLED_PKCS11V3_0" = "no"; then
+            ENABLED_PKCS11V3_0=yes
+            AM_CFLAGS="$AM_CFLAGS -DWOLFPKCS11_PKCS11_V3_0"
+        fi
+    fi
+    AM_CFLAGS="$AM_CFLAGS -DWOLFPKCS11_XMSS"
+fi
+
 
 AM_CONDITIONAL([BUILD_STATIC],[test "x$enable_shared" = "xno"])
 
@@ -573,7 +682,7 @@ rm -f $OPTION_FILE
 echo "/* wolfpkcs11 options.h" > $OPTION_FILE
 echo " * generated from configure options" >> $OPTION_FILE
 echo " *" >> $OPTION_FILE
-echo " * Copyright (C) 2006-2023 wolfSSL Inc." >> $OPTION_FILE
+echo " * Copyright (C) 2006-2026 wolfSSL Inc." >> $OPTION_FILE
 echo " *" >> $OPTION_FILE
 echo " * * This file is part of wolfPKCS11." >> $OPTION_FILE
 echo " *" >> $OPTION_FILE
@@ -703,6 +812,10 @@ echo "   * RSA-PSS:                    $ENABLED_RSAPSS"
 echo "   * DH:                         $ENABLED_DH"
 echo "   * ECC:                        $ENABLED_ECC"
 echo "   * HKDF:                       $ENABLED_HKDF"
+echo "   * ML-DSA:                     $ENABLED_MLDSA"
+echo "   * ML-KEM:                     $ENABLED_MLKEM"
+echo "   * LMS/HSS verify:             $ENABLED_LMS"
+echo "   * XMSS/XMSS^MT verify:        $ENABLED_XMSS"
 echo "   * NSS modifications:          $ENABLED_NSS"
 echo "   * Default token path:         $WOLFPKCS11_DEFAULT_TOKEN_PATH"
 echo "   * PKCS#11 Version 3.0:        $ENABLED_PKCS11V3_0"

@@ -54,6 +54,28 @@ configure step.
 WARNING: ECB (Electronic Code Book) mode AES is generally considered to be
 insecure. Please consider using a different mode of AES.
 
+### Optional: PQC ML-DSA Support
+
+To have ML-DSA support in wolfPKCS11, configure wolfSSL with ML-DSA support
+enabled, either by adding `--enable-mldsa` to `./configure` or by setting
+`WOLFSSL_MLDSA` to `yes` in CMake. wolfPKCS11 uses the canonical
+`wc_MlDsaKey` API and `WC_MLDSA_*` sizing macros (FIPS 204 spelling) and
+therefore requires a wolfSSL build that incorporate these.
+
+As ML-DSA is a feature of PKCS#11 version 3.2, support for that is required,
+too. Hence, to enable all in wolfPKCS11, add `--enable-pkcs11v32 --enable-mldsa`
+during the configure step.
+
+### Optional: PQC ML-KEM Support
+
+To have ML-KEM support in wolfPKCS11, configure wolfSSL with ML-KEM (FIPS 203)
+support enabled, either by adding `--enable-mlkem` to `./configure` or by
+setting `WOLFPKCS11_MLKEM` to `yes` in CMake.
+
+As ML-KEM is a feature of PKCS#11 version 3.2, support for that is required,
+too. Hence, to enable all in wolfPKCS11, add `--enable-pkcs11v32 --enable-mlkem`
+during the configure step.
+
 ### Build options and defines
 
 #### Define WOLFPKCS11_TPM_STORE
@@ -76,6 +98,60 @@ See wolfpkcs11/store.h for prototypes of functions to implement.
 #### Define WOLFPKCS11_KEYPAIR_GEN_COMMON_LABEL
 
 Sets the private key's label against the public key when generating key pairs.
+
+#### Define WOLFPKCS11_LEGACY_COPYABLE_FALSE_DEFAULT
+
+Restores the pre-fix behavior where `C_GetAttributeValue(CKA_COPYABLE)` always
+reports `CK_FALSE`, regardless of whether the attribute was explicitly set.
+The default (without this flag) reports `CK_TRUE` for new objects and reflects
+the stored value for objects whose `CKA_COPYABLE` was explicitly set, matching
+the PKCS#11 specification. Define this only if your application or stored
+tokens depend on the old read-back behavior. The `C_CopyObject` enforcement
+consults the stored copyable flag directly via `WP11_Object_IsCopyable`, so
+this macro does not change which objects can be copied; objects created with
+`CKA_COPYABLE=CK_TRUE` (the default) remain copyable, and objects created
+with `CKA_COPYABLE=CK_FALSE` are still rejected by `C_CopyObject` with
+`CKR_ACTION_PROHIBITED`.
+
+### Behavior changes for PKCS#11 spec compliance
+
+Several pre-existing gaps were closed; applications upgrading from earlier
+versions may need to update templates or error-handling:
+
+- `C_DeriveKey` now enforces `CKA_DERIVE` on the base key. Keys that do not
+  set `CKA_DERIVE=CK_TRUE` at creation are rejected with
+  `CKR_KEY_TYPE_INCONSISTENT`. RSA, EC, and ML-DSA private keys default
+  `CKA_DERIVE` to `CK_FALSE`, so applications doing ECDH or other key
+  derivation must now set `CKA_DERIVE=CK_TRUE` explicitly in the key
+  template. The check is skipped on `--enable-nss` builds because NSS
+  generates ephemeral ECDHE keys without setting `CKA_DERIVE` and relies on
+  the historic permissive behavior; non-NSS builds get the spec-compliant
+  enforcement.
+- `C_CopyObject` enforces `CKA_COPYABLE` (returns `CKR_ACTION_PROHIBITED`
+  on `CK_FALSE`).
+- `C_DestroyObject` enforces `CKA_DESTROYABLE` (returns
+  `CKR_ACTION_PROHIBITED` on `CK_FALSE`).
+- `C_EncapsulateKey`/`C_DecapsulateKey` enforce `CKA_ENCAPSULATE` /
+  `CKA_DECAPSULATE` and return `CKR_KEY_FUNCTION_NOT_PERMITTED` when the
+  flag is `CK_FALSE`.
+- `C_SetAttributeValue` rejects flipping `CKA_COPYABLE` or
+  `CKA_DESTROYABLE` from `CK_FALSE` back to `CK_TRUE`, returning
+  `CKR_ATTRIBUTE_READ_ONLY` per spec section 4.4.1.
+- `C_Login(CKU_SO, ...)` against a token whose SO PIN has not been set
+  now returns `CKR_USER_PIN_NOT_INITIALIZED` regardless of the PIN
+  length, closing an empty-PIN bypass where the zero-length constant
+  compare against the unset stored PIN returned equal. NSS builds
+  (`--enable-nss`) keep the empty-PIN probe accepted on uninitialized
+  tokens because `PK11_InitPin` bootstraps an empty-password NSS
+  database that way; non-empty PINs are still rejected.
+- On `--enable-nss` builds `WP11_MIN_PIN_LEN` defaults to `0`, permitting a
+  zero-length user PIN. An empty user PIN intentionally disables PIN-based
+  authentication: `C_GetTokenInfo` clears `CKF_LOGIN_REQUIRED` and all
+  private/token objects are decoded and accessible at token load without
+  `C_Login`. This is required for NSS tools (`certutil`, `PK11_InitPin`) that
+  bootstrap empty-password databases. Integrators who require an enforced
+  minimum can opt in at build time with `C_EXTRA_FLAGS="-DWP11_MIN_PIN_LEN=N"`
+  (`N>0`); non-NSS builds already default to `4`.
 
 #### Analog Devices, Inc. MAXQ10xx Secure Elements ([MAXQ1065](https://www.analog.com/en/products/maxq1065.html)/MAXQ1080)
 
@@ -116,7 +192,8 @@ cmake -DCMAKE_INSTALL_PREFIX=/usr/local \
     -DWOLFSSL_SHA=yes -DWOLFSSL_SHA224=yes -DWOLFSSL_SHA3=yes \
     -DWOLFSSL_SHA384=yes -DWOLFSSL_SHA512=yes \
     -DWOLFSSL_SP_MATH_ALL=yes -DWOLFSSL_PUBLIC_MP=yes \
-    -DWOLFSSL_WC_RSA_DIRECT=yes -DCMAKE_BUILD_TYPE=Release \
+    -DWOLFSSL_WC_RSA_DIRECT=yes -DWOLFSSL_DILITHIUM=yes \
+    -DCMAKE_BUILD_TYPE=Release \
     ..
 cmake --build .
 sudo cmake --install .
@@ -147,6 +224,8 @@ cmake -DWOLFPKCS11_DEBUG=yes \
     -DWOLFPKCS11_AESCTS=yes \
     -DWOLFPKCS11_AESCMAC=yes \
     -DWOLFPKCS11_PBKDF2=yes \
+    -DWOLFPKCS11_PKCS11_V3_2=yes \
+    -DWOLFPKCS11_MLDSA=yes \
     ..
 cmake --build .
 ctest
@@ -194,6 +273,8 @@ cmake -DCMAKE_PREFIX_PATH=/path/to/wolfssl/install ..
 | `WOLFPKCS11_NSS` | `no` | NSS-specific modifications |
 | `WOLFPKCS11_PKCS11_V3_0` | `yes` | PKCS#11 v3.0 support |
 | `WOLFPKCS11_PKCS11_V3_2` | `no` | PKCS#11 v3.2 support |
+| `WOLFPKCS11_MLDSA` | `no` | ML-DSA support |
+| `WOLFPKCS11_MLKEM` | `no` | ML-KEM support |
 | `WOLFPKCS11_EXAMPLES` | `yes` | Build examples |
 | `WOLFPKCS11_TESTS` | `yes` | Build and register tests |
 | `WOLFPKCS11_COVERAGE` | `no` | Code coverage support |
@@ -223,6 +304,100 @@ Set to any value to stop storage of token data.
 
 
 ## Release Notes
+
+### wolfPKCS11 Release 2.1 (Jun 25, 2026)
+
+**Summary**
+
+This release adds post-quantum cryptography support (ML-DSA and ML-KEM), CMake
+build support, and Doxygen API documentation. It also closes a large number of
+PKCS#11 specification compliance gaps and bugs found through static and
+negative analysis, hardens memory safety in response to external security
+reports, and improves CI and interoperability testing.
+
+**Compatibility with 2.0 behavior**
+
+Several PKCS#11 attribute defaults were corrected to match the specification.
+These changes can affect applications and stored tokens created with 2.0. The
+following build defines restore the pre-2.1 (2.0) behavior if needed:
+
+* `WOLFPKCS11_LEGACY_COPYABLE_FALSE_DEFAULT` - restore the old behavior where an
+  unset `CKA_COPYABLE` reads back as `CK_FALSE` (the PKCS#11 default is
+  `CK_TRUE`).
+* `WOLFPKCS11_LEGACY_PRIVATE_FALSE_DEFAULT` - restore the old behavior where an
+  unset `CKA_PRIVATE` reads back as `CK_FALSE` for `CKO_PRIVATE_KEY` /
+  `CKO_SECRET_KEY` (the PKCS#11 default is `CK_TRUE`). Also disables the
+  matching login-state check on object creation.
+* `WOLFPKCS11_LEGACY_WRAP_TRUE_DEFAULT` - restore the old behavior where an
+  unset `CKA_WRAP` / `CKA_UNWRAP` defaults to `CK_TRUE` (the PKCS#11 default is
+  `CK_FALSE`).
+
+See the "Behavior changes for PKCS#11 spec compliance" section above for the
+related `C_DeriveKey`, `C_CopyObject`, `C_DestroyObject`, encapsulation and
+`C_Login` enforcement changes.
+
+**Detail**
+
+* Added ML-DSA (Dilithium) support, including `CKA_SEED` private key import.
+  (PR #161)
+* Added ML-KEM support. (PR #175)
+* Added preparation work for post-quantum cryptography support. (PR #157)
+* Renamed ML-DSA mechanisms/identifiers to the final naming. (PR #188)
+* Added CMake build support. (PR #156)
+* Added PKCS#11 Doxygen API documentation. (PR #144)
+* Added support for `CKR_OPERATION_ACTIVE`. (PR #176)
+* Use the DHUK to wrap/unwrap the seed value used for the token. (PR #159)
+* Added file storage safety to wolfPKCS11. (PR #150)
+* Fixed empty PIN handling for FIPS. (PR #143)
+* Fixed loading a token with an empty PIN. (PR #158)
+* Fixed SHA-512 truncated forms (SHA-512/224 and SHA-512/256). (PR #147)
+* Fixed `C_WrapKey` not checking `CKA_EXTRACTABLE` on the key being wrapped.
+  (PR #165)
+* Fixed `falseVal` initialized to `CK_TRUE` instead of `CK_FALSE`. (PR #162)
+* Fixed a read-only lock not being released on an early return. (PR #163)
+* Added a missing NULL check. (PR #166)
+* Fixed a typo in an `#ifndef` macro. (PR #167)
+* Fixed a typo in `configure.ac`. (PR #164)
+* Fixed resource leaks and ensured secure buffer erasing. (PR #172)
+* Fixed numerous PKCS#11 compliance and static analysis findings from Fenrir.
+  (PR #168, PR #169, PR #171, PR #173, PR #178, PR #185, PR #186, PR #187,
+  PR #189, PR #194, PR #196, PR #197, PR #198)
+* Hardened memory safety across several operations in response to external
+  security reports: bounded the RSA verify-recover output length and validated
+  the mechanism and key type before use, bounded secret-key length handling and
+  the HKDF derive output length, guarded against length underflow when decoding
+  stored symmetric keys, clamped key zeroization, and dropped the active object
+  reference on `C_DestroyObject` so completing an operation can no longer read
+  freed memory. (PR #201)
+* Added negative testing and validation for wolfPKCS11. (PR #179)
+* Added Fenrir findings fixes and test additions. (PR #177)
+* Added a multi-call HMAC regression test. (PR #181)
+* Added a `C_VerifyRecover` test and fixed test attributes. (PR #184)
+* Fixed ML-KEM templates in tests. (PR #183)
+* Fixed a couple of failing tests. (PR #145)
+* Added an interoperability test against wolfSSL master. (PR #148)
+* Added a wolfBoot integration test to intercept regressions. (PR #170)
+* Reduced the wolfBoot integration test flow (unstable emulator). (PR #174)
+* Removed `--enable-cryptocb` usage. (PR #149)
+* Fixed CI failures from upstream dependency drift. (PR #180)
+* Fixed CI issues. (PR #182)
+* Fixed the Firefox Dockerfile. (PR #160)
+* Fixed Debian rules for the documentation. (PR #153)
+* Fixed `CK_ULONG` length truncation in `C_GenerateRandom` and `C_SeedRandom`.
+  (PR #199)
+* Fixed the wolfSSL interoperability build by defining
+  `WOLFPKCS11_USER_SETTINGS`. (PR #200)
+* Updated copyright years and fixed the `configure.ac` start year. (PR #191)
+* Shipped the CMake package configuration in the Debian `-dev` package.
+  (PR #192)
+* Used FIPS-compliant length user PINs across the test suite. (PR #193)
+* Added per-job timeouts to all CI workflows. (PR #195)
+* Added CI coverage for C++ builds. (PR #190)
+* Thanks to Denis Mingulov for contributing the `C_GenerateRandom` /
+  `C_SeedRandom` length-truncation fix (PR #199) and for reporting several of
+  the memory-safety issues fixed in PR #201 (oversized `CKA_VALUE_LEN`
+  handling, the RSA verify-recover output-length type-punning, and the
+  use-after-free of an active object on `C_DestroyObject`).
 
 ### wolfPKCS11 Release 2.0 (August 26, 2025)
 

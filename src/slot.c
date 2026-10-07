@@ -154,7 +154,7 @@ static CK_RV checkPinLen(CK_ULONG pinLen)
 #else
     if (pinLen > WP11_MAX_PIN_LEN)
 #endif
-        return CKR_PIN_INCORRECT;
+        return CKR_PIN_LEN_RANGE;
     return CKR_OK;
 }
 
@@ -328,7 +328,7 @@ static CK_MECHANISM_TYPE mechanismList[] = {
 #ifdef WC_RSA_PSS
     CKM_RSA_PKCS_PSS,
 #ifndef NO_SHA
-    CKM_SHA1_RSA_PKCS,
+    CKM_SHA1_RSA_PKCS_PSS,
 #endif
 #ifdef WOLFSSL_SHA224
     CKM_SHA224_RSA_PKCS_PSS,
@@ -364,6 +364,11 @@ static CK_MECHANISM_TYPE mechanismList[] = {
 #endif
     CKM_ECDH1_DERIVE,
 #endif
+#ifdef WOLFPKCS11_MLDSA
+    CKM_ML_DSA_KEY_PAIR_GEN,
+    CKM_ML_DSA,
+    CKM_HASH_ML_DSA,
+#endif
 #ifdef WOLFPKCS11_HKDF
     CKM_HKDF_DERIVE,
     CKM_HKDF_DATA,
@@ -373,9 +378,20 @@ static CK_MECHANISM_TYPE mechanismList[] = {
     CKM_DH_PKCS_KEY_PAIR_GEN,
     CKM_DH_PKCS_DERIVE,
 #endif
+#ifdef WOLFPKCS11_MLKEM
+    CKM_ML_KEM_KEY_PAIR_GEN,
+    CKM_ML_KEM,
+#endif
+#ifdef WOLFPKCS11_LMS
+    CKM_HSS,
+#endif
+#ifdef WOLFPKCS11_XMSS
+    CKM_XMSS,
+    CKM_XMSSMT,
+#endif
 #ifndef NO_AES
     CKM_AES_KEY_GEN,
-#ifdef HAVE_AES_KEY_WRAP
+#ifdef HAVE_AES_KEYWRAP
     CKM_AES_KEY_WRAP,
     CKM_AES_KEY_WRAP_PAD,
 #endif
@@ -458,7 +474,7 @@ static CK_MECHANISM_TYPE mechanismList[] = {
 #endif
 #endif
 #ifdef WOLFPKCS11_NSS
-    /* Only advertise CKM_SSL3_MASTER_KEY_DERIVE. Not implemented. */
+    /* NSS uses this as a target-key marker when unwrapping TLS secrets. */
     CKM_SSL3_MASTER_KEY_DERIVE,
     CKM_NSS_PKCS12_PBE_SHA224_HMAC_KEY_GEN,
     CKM_NSS_PKCS12_PBE_SHA256_HMAC_KEY_GEN,
@@ -530,6 +546,9 @@ CK_RV C_GetMechanismList(CK_SLOT_ID slotID,
         return rv;
     }
     else if (*pulCount < (CK_ULONG)mechanismCnt) {
+        /* PKCS#11: on CKR_BUFFER_TOO_SMALL *pulCount must be set to the
+         * required count so the two-call (size-query then fetch) idiom works. */
+        *pulCount = mechanismCnt;
         rv = CKR_BUFFER_TOO_SMALL;
         WOLFPKCS11_LEAVE("C_GetMechanismList", rv);
         return rv;
@@ -571,14 +590,12 @@ static CK_MECHANISM_INFO rsaOaepMechInfo = {
 #ifdef WC_RSA_PSS
 /* Info on RSA PKCS#1 PSS mechanism. */
 static CK_MECHANISM_INFO rsaPssMechInfo = {
-    256, 521, CKF_SIGN | CKF_VERIFY
-};
-#endif
-#ifndef NO_SHA256
-static CK_MECHANISM_INFO shaRsaPkcsMechInfo = {
     1024, 4096, CKF_SIGN | CKF_VERIFY
 };
 #endif
+static CK_MECHANISM_INFO shaRsaPkcsMechInfo = {
+    1024, 4096, CKF_SIGN | CKF_VERIFY
+};
 #endif
 #ifdef HAVE_ECC
 /* Info on EC key generation mechanism. */
@@ -619,6 +636,34 @@ static CK_MECHANISM_INFO ecdhMechInfo = {
     256, 521, CKF_DERIVE
 };
 #endif
+#ifdef WOLFPKCS11_MLDSA
+/* Info on ML-DSA key generation mechanism. */
+static CK_MECHANISM_INFO mldsaKgMechInfo = {
+    WC_MLDSA_44_PUB_KEY_SIZE,
+    WC_MLDSA_87_PUB_KEY_SIZE,
+    CKF_GENERATE_KEY_PAIR
+};
+/* Info on ML-DSA mechanism (also for pre-hash variant). */
+static CK_MECHANISM_INFO mldsaMechInfo = {
+    WC_MLDSA_44_PUB_KEY_SIZE,
+    WC_MLDSA_87_PUB_KEY_SIZE,
+    CKF_SIGN | CKF_VERIFY
+};
+#endif
+#ifdef WOLFPKCS11_LMS
+/* Info on the HSS (LMS) verify mechanism. PKCS#11 does not define a key-size
+ * semantics for stateful hash-based signatures (bits vs bytes), so report the
+ * "not applicable" 0..0 envelope. Verify-only: no CKF_SIGN. */
+static CK_MECHANISM_INFO hssMechInfo = {
+    0, 0, CKF_VERIFY
+};
+#endif
+#ifdef WOLFPKCS11_XMSS
+/* Info on the XMSS / XMSS^MT verify mechanisms. 0..0 envelope, verify-only. */
+static CK_MECHANISM_INFO xmssMechInfo = {
+    0, 0, CKF_VERIFY
+};
+#endif
 #ifdef WOLFPKCS11_HKDF
 static CK_MECHANISM_INFO hkdfMechInfo = {
     1, 16320, CKF_DERIVE
@@ -638,6 +683,16 @@ static CK_MECHANISM_INFO dhKgMechInfo = {
 /* Info on DH key derivation mechanism. */
 static CK_MECHANISM_INFO dhPkcsMechInfo = {
     1024, 4096, CKF_DERIVE
+};
+#endif
+#ifdef WOLFPKCS11_MLKEM
+/* Info on ML-KEM key generation mechanism. */
+static CK_MECHANISM_INFO mlKemKgMechInfo = {
+    800, 1568, CKF_GENERATE_KEY_PAIR
+};
+/* Info on ML-KEM mechanism. */
+static CK_MECHANISM_INFO mlKemMechInfo = {
+    800, 1568, CKF_ENCAPSULATE | CKF_DECAPSULATE
 };
 #endif
 #ifndef NO_KDF
@@ -669,12 +724,13 @@ static CK_MECHANISM_INFO nssPkcs12PbeSha384HmacKeyGenMechInfo = {
 static CK_MECHANISM_INFO nssPkcs12PbeSha512HmacKeyGenMechInfo = {
     512, 512, CKF_GENERATE
 };
-#endif
-#endif
-#ifdef WOLFPKCS11_NSS
-static CK_MECHANISM_INFO ssl3MasterKeyDeriveInfo = {
-    48, 48, CKF_DERIVE
+/* NSS requires this mechanism identifier when selecting the slot used to
+ * unwrap cached TLS secrets. C_DeriveKey does not implement the mechanism, so
+ * do not advertise CKF_DERIVE. */
+static CK_MECHANISM_INFO ssl3MasterKeyTargetInfo = {
+    48, 48, 0
 };
+#endif
 #endif
 #ifdef WOLFSSL_HAVE_PRF
 static CK_MECHANISM_INFO tlsMacMechInfo = {
@@ -685,7 +741,7 @@ static CK_MECHANISM_INFO tlsMacMechInfo = {
 static CK_MECHANISM_INFO aesKeyGenMechInfo = {
     16, 32, CKF_GENERATE
 };
-#ifdef HAVE_AES_KEY_WRAP
+#ifdef HAVE_AES_KEYWRAP
 static CK_MECHANISM_INFO aesKeyWrapMechInfo = {
     16, 32, CKF_ENCRYPT | CKF_DECRYPT | CKF_WRAP | CKF_UNWRAP
 };
@@ -958,6 +1014,26 @@ CK_RV C_GetMechanismInfo(CK_SLOT_ID slotID, CK_MECHANISM_TYPE type,
             XMEMCPY(pInfo, &ecdhMechInfo, sizeof(CK_MECHANISM_INFO));
             break;
 #endif
+#ifdef WOLFPKCS11_MLDSA
+        case CKM_ML_DSA_KEY_PAIR_GEN:
+            XMEMCPY(pInfo, &mldsaKgMechInfo, sizeof(CK_MECHANISM_INFO));
+            break;
+        case CKM_HASH_ML_DSA:
+        case CKM_ML_DSA:
+            XMEMCPY(pInfo, &mldsaMechInfo, sizeof(CK_MECHANISM_INFO));
+            break;
+#endif
+#ifdef WOLFPKCS11_LMS
+        case CKM_HSS:
+            XMEMCPY(pInfo, &hssMechInfo, sizeof(CK_MECHANISM_INFO));
+            break;
+#endif
+#ifdef WOLFPKCS11_XMSS
+        case CKM_XMSS:
+        case CKM_XMSSMT:
+            XMEMCPY(pInfo, &xmssMechInfo, sizeof(CK_MECHANISM_INFO));
+            break;
+#endif
 #ifdef WOLFPKCS11_HKDF
         case CKM_HKDF_DERIVE:
             XMEMCPY(pInfo, &hkdfMechInfo, sizeof(CK_MECHANISM_INFO));
@@ -977,11 +1053,19 @@ CK_RV C_GetMechanismInfo(CK_SLOT_ID slotID, CK_MECHANISM_TYPE type,
             XMEMCPY(pInfo, &dhPkcsMechInfo, sizeof(CK_MECHANISM_INFO));
             break;
 #endif
+#ifdef WOLFPKCS11_MLKEM
+        case CKM_ML_KEM_KEY_PAIR_GEN:
+            XMEMCPY(pInfo, &mlKemKgMechInfo, sizeof(CK_MECHANISM_INFO));
+            break;
+        case CKM_ML_KEM:
+            XMEMCPY(pInfo, &mlKemMechInfo, sizeof(CK_MECHANISM_INFO));
+            break;
+#endif
 #ifndef NO_AES
         case CKM_AES_KEY_GEN:
             XMEMCPY(pInfo, &aesKeyGenMechInfo, sizeof(CK_MECHANISM_INFO));
             break;
-#ifdef HAVE_AES_KEY_WRAP
+#ifdef HAVE_AES_KEYWRAP
         case CKM_AES_KEY_WRAP:
         case CKM_AES_KEY_WRAP_PAD:
             XMEMCPY(pInfo, &aesKeyWrapMechInfo, sizeof(CK_MECHANISM_INFO));
@@ -1153,14 +1237,11 @@ CK_RV C_GetMechanismInfo(CK_SLOT_ID slotID, CK_MECHANISM_TYPE type,
             XMEMCPY(pInfo, &nssPkcs12PbeSha512HmacKeyGenMechInfo,
                     sizeof(CK_MECHANISM_INFO));
             break;
-#endif
-#endif
-#ifdef WOLFPKCS11_NSS
-        /* Only advertise CKM_SSL3_MASTER_KEY_DERIVE. Not implemented. */
         case CKM_SSL3_MASTER_KEY_DERIVE:
-            XMEMCPY(pInfo, &ssl3MasterKeyDeriveInfo,
+            XMEMCPY(pInfo, &ssl3MasterKeyTargetInfo,
                     sizeof(CK_MECHANISM_INFO));
             break;
+#endif
 #endif
 #ifdef WOLFSSL_HAVE_PRF
         case CKM_TLS_MAC:
@@ -1229,20 +1310,29 @@ CK_RV C_InitToken(CK_SLOT_ID slotID, CK_UTF8CHAR_PTR pPin,
         return rv;
     }
 
-    if (checkPinLen(ulPinLen) != CKR_OK) {
-        rv = CKR_PIN_INCORRECT;
+    rv = checkPinLen(ulPinLen);
+    if (rv != CKR_OK) {
+        WOLFPKCS11_LEAVE("C_InitToken", rv);
+        return rv;
+    }
+
+    /* PKCS#11: an open session on the token must fail C_InitToken with
+     * CKR_SESSION_EXISTS regardless of whether the token is already
+     * initialized. Check this unconditionally before any token-reset logic. */
+    if (WP11_Slot_HasSession(slot)) {
+        rv = CKR_SESSION_EXISTS;
         WOLFPKCS11_LEAVE("C_InitToken", rv);
         return rv;
     }
 
     if (WP11_Slot_IsTokenInitialized(slot)) {
-        if (WP11_Slot_HasSession(slot)) {
-            rv = CKR_SESSION_EXISTS;
-            WOLFPKCS11_LEAVE("C_InitToken", rv);
-            return rv;
-        }
         if (WP11_Slot_SOPin_IsSet(slot)) {
-            ret = WP11_Slot_CheckSOPin(slot, (char*)pPin, (int)ulPinLen);
+            /* Verify the SO PIN with the failed-login lockout applied, so this
+             * path cannot be used to brute-force the SO PIN (Fenrir F-4632).
+             * Use the lockout check rather than WP11_Slot_SOLogin: C_InitToken
+             * must not log in or set loginState, and it rejects open sessions
+             * earlier so the SOLogin read-only-session check is not wanted. */
+            ret = WP11_Slot_CheckSOPinLockout(slot, (char*)pPin, (int)ulPinLen);
             if (ret != 0) {
                 rv = CKR_PIN_INCORRECT;
                 WOLFPKCS11_LEAVE("C_InitToken", rv);
@@ -1313,8 +1403,8 @@ CK_RV C_InitPIN(CK_SESSION_HANDLE hSession, CK_UTF8CHAR_PTR pPin,
         return rv;
     }
 
-    if (checkPinLen(ulPinLen) != CKR_OK) {
-        rv = CKR_PIN_INCORRECT;
+    rv = checkPinLen(ulPinLen);
+    if (rv != CKR_OK) {
         WOLFPKCS11_LEAVE("C_InitPIN", rv);
         return rv;
     }
@@ -1388,8 +1478,8 @@ CK_RV C_SetPIN(CK_SESSION_HANDLE hSession, CK_UTF8CHAR_PTR pOldPin,
         WOLFPKCS11_LEAVE("C_SetPIN", rv);
         return rv;
     }
-    if (checkPinLen(ulNewLen) != CKR_OK) {
-        rv = CKR_PIN_INCORRECT;
+    rv = checkPinLen(ulNewLen);
+    if (rv != CKR_OK) {
         WOLFPKCS11_LEAVE("C_SetPIN", rv);
         return rv;
     }
@@ -1639,6 +1729,7 @@ CK_RV C_GetSessionInfo(CK_SESSION_HANDLE hSession,
         return rv;
     }
 
+    pInfo->slotID = WP11_Session_GetSlotId(session);
     pInfo->state = WP11_Session_GetState(session);
     pInfo->flags = CKF_SERIAL_SESSION;
     if (WP11_Session_IsRW(session))
@@ -1770,7 +1861,10 @@ CK_RV C_SetOperationState(CK_SESSION_HANDLE hSession,
  *          and a read-only session is open.
  *          CKR_USER_PIN_NOT_INITIALIZED when PIN is not initialized for user
  *          type.
- *          CKR_PIN_INCORRECT when PIN is wrong length or does not verify.
+ *          CKR_USER_ANOTHER_ALREADY_LOGGED_IN when a different user type is
+ *          already logged in.
+ *          CKR_PIN_LEN_RANGE when the PIN length is out of range.
+ *          CKR_PIN_INCORRECT when the PIN does not verify.
  *          CKR_OPERATION_NOT_INITIALIZED when using user type
  *          CKU_CONTEXT_SPECIFIC - user type not supported.
  *          CKR_USER_TYPE_INVALID when other user type is specified.
@@ -1808,8 +1902,8 @@ CK_RV C_Login(CK_SESSION_HANDLE hSession, CK_USER_TYPE userType,
         return rv;
     }
 
-    if (checkPinLen(ulPinLen) != CKR_OK) {
-        rv = CKR_PIN_INCORRECT;
+    rv = checkPinLen(ulPinLen);
+    if (rv != CKR_OK) {
         WOLFPKCS11_LEAVE("C_Login", rv);
         return rv;
     }
@@ -1835,6 +1929,9 @@ CK_RV C_Login(CK_SESSION_HANDLE hSession, CK_USER_TYPE userType,
     switch (ret) {
         case LOGGED_IN_E:
             rv = CKR_USER_ALREADY_LOGGED_IN;
+            break;
+        case LOGGED_IN_ANOTHER_E:
+            rv = CKR_USER_ANOTHER_ALREADY_LOGGED_IN;
             break;
         case PIN_NOT_SET_E:
             rv = CKR_USER_PIN_NOT_INITIALIZED;
@@ -1903,6 +2000,13 @@ CK_RV C_Logout(CK_SESSION_HANDLE hSession)
     }
 
     slot = WP11_Session_GetSlot(session);
+
+    if (!WP11_Slot_IsLoggedIn(slot)) {
+        rv = CKR_USER_NOT_LOGGED_IN;
+        WOLFPKCS11_LEAVE("C_Logout", rv);
+        return rv;
+    }
+
     WP11_Slot_Logout(slot);
 
     rv = CKR_OK;
@@ -2006,12 +2110,23 @@ CK_RV C_WaitForSlotEvent(CK_FLAGS flags, CK_SLOT_ID_PTR pSlot,
         WOLFPKCS11_LEAVE("C_WaitForSlotEvent", rv);
         return rv;
     }
+    /* PKCS#11: pSlot is an output parameter, pReserved must be NULL, and
+     * only the CKF_DONT_BLOCK bit is defined for flags. Reject malformed
+     * callers before returning the supported non-blocking result. */
+    if (pSlot == NULL || pReserved != NULL ||
+                                            (flags & ~CKF_DONT_BLOCK) != 0) {
+        rv = CKR_ARGUMENTS_BAD;
+        WOLFPKCS11_LEAVE("C_WaitForSlotEvent", rv);
+        return rv;
+    }
 
-    (void)pSlot;
-    (void)flags;
-    (void)pReserved;
-
-    rv = CKR_FUNCTION_NOT_SUPPORTED;
+    /* wolfPKCS11 has no removable slots, so no slot event ever occurs. For a
+     * non-blocking query the spec answer is CKR_NO_EVENT; blocking calls
+     * would deadlock forever, so report unsupported. */
+    if ((flags & CKF_DONT_BLOCK) != 0)
+        rv = CKR_NO_EVENT;
+    else
+        rv = CKR_FUNCTION_NOT_SUPPORTED;
     WOLFPKCS11_LEAVE("C_WaitForSlotEvent", rv);
     return rv;
 }
